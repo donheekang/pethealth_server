@@ -1,189 +1,234 @@
-import os, uuid, time
-from typing import Optional, List, Dict
-from datetime import datetime
-from fastapi import FastAPI, HTTPException, Form, Query
+# main.py
+import os, base64, re, json, datetime
+import requests
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import boto3
-from botocore.client import Config
+from typing import List, Dict, Any, Optional
 
-# ----------------------------
-# Env (Render "Environment"에 이미 넣은 값들 자동 읽음)
-# ----------------------------
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+# ========= FastAPI 기본 =========
+app = FastAPI(title="PetHealth+ OCR/Analyze API")
 
-if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
-    # Render Logs에서 보라고 메시지 남겨두기
-    print("[WARN] AWS env 미설정: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / S3_BUCKET_NAME 확인 필요")
-
-# ----------------------------
-# S3 client (v4 서명)
-# ----------------------------
-s3 = boto3.client(
-    "s3",
-    region_name=AWS_REGION,
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    config=Config(signature_version="s3v4"),
-)
-
-# ----------------------------
-# FastAPI 기본 세팅
-# ----------------------------
-app = FastAPI(title="PetHealth+ API", version="0.2.0")
-
-# MVP: 어디서든 호출 허용 (운영 시 특정 도메인으로 제한 권장)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 운영 전 도메인 제한 권장
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------
-# In-memory 저장소 (MVP)
-# 운영 전환 시 DB로 교체 (PostgreSQL/Supabase)
-# ----------------------------
-_CERTS: List[Dict] = []  # {id, file_key, file_name, hospital, issued_at}
-_RECORDS: List[Dict] = [
-    {"date": "2025-11-01", "hospital": "행복동물병원", "title": "예방접종(DHPPL) 4차"},
-    {"date": "2025-10-20", "hospital": "다온동물병원", "title": "정기검진"},
-]
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY")  # ★ Render 환경변수에 넣기
 
-# ----------------------------
-# 모델
-# ----------------------------
-class CertOut(BaseModel):
-    id: str
-    hospital: str
-    file_name: str
-    file_key: str
-    issued_at: str   # ISO string
-    download_url: Optional[str] = None  # presign GET (요청 시 생성)
-
-# ----------------------------
-# 헬스 체크
-# ----------------------------
 @app.get("/")
 def home():
-    return {"message": "PetHealth+ 서버 연결 성공 ✅", "time": int(time.time())}
+    return {"message": "PetHealth+ 서버 연결 성공 ✅", "ocr": bool(GOOGLE_VISION_API_KEY)}
 
-# ----------------------------
-# 1) Records (샘플)
-# ----------------------------
-@app.get("/api/records")
-def list_records():
-    return _RECORDS
+# ========= 유틸: 간단 파서/정규화 =========
 
-# ----------------------------
-# 2) S3 업로드용 Presigned URL 발급
-# ----------------------------
-@app.get("/api/upload/presign")
-def presign_upload(
-    file_name: str = Query(..., description="원본 파일명, 예: vaccine_2025-09-20.pdf"),
-    content_type: str = Query("application/pdf", description="기본값 PDF"),
-):
+VACCINE_MAP = {
+    "dhppl": "종합백신(DHPPL)", "dhpp": "종합백신(DHPP)", "dhlpp": "종합백신(DHLPP)",
+    "ra": "광견병백신", "rabies": "광견병백신",
+    "corona": "코로나백신", "influenza": "켄넬코프/기관지염 백신",
+}
+KEYWORDS = {
+    "surgery": ["수술", "중성화", "슬개골", "제거술", "봉합", "절제"],
+    "vaccine": ["백신", "접종", "dhppl", "dhpp", "dhlpp", "ra", "rabies", "코로나", "인플루엔자", "켄넬"],
+    "exam": ["진찰", "진료", "검진", "재진", "초진", "상담", "처치"],
+    "lab": ["검사", "혈액", "x-ray", "엑스레이", "초음파", "feca", "대변", "소변"],
+    "drug": ["약", "항생제", "소염제", "진통제", "연고", "정", "mL", "mg"],
+    "treatment": ["주사", "수액", "처치", "처방", "치료"],
+}
+
+def normalize_date(text: str) -> Optional[str]:
     """
-    iOS 앱이 업로드 전에 호출:
-    1) GET /api/upload/presign?file_name=xxx.pdf
-    2) 반환된 upload_url 로 'PUT' 업로드
-    3) 업로드 완료 후 /api/certificates 로 등록
+    한국형 날짜 포맷을 YYYY-MM-DD로 정규화
     """
-    if not S3_BUCKET_NAME:
-        raise HTTPException(status_code=500, detail="S3 bucket 미설정")
+    # 2025.09.24 / 2025-09-24
+    m = re.search(r"(20\d{2})[.\-\/년 ]\s*(\d{1,2})[.\-\/월 ]\s*(\d{1,2})", text)
+    if m:
+        y, mon, d = m.group(1), m.group(2), m.group(3)
+        try:
+            dt = datetime.date(int(y), int(mon), int(d))
+            return dt.isoformat()
+        except:
+            pass
+    return None
 
-    # 버킷 내부 키 규칙 (중복 방지)
-    unique = uuid.uuid4().hex[:12]
-    file_key = f"certificates/{unique}_{file_name}"
-
-    try:
-        url = s3.generate_presigned_url(
-            ClientMethod="put_object",
-            Params={
-                "Bucket": S3_BUCKET_NAME,
-                "Key": file_key,
-                "ContentType": content_type,
-            },
-            ExpiresIn=300,  # 5분
-        )
-        return {
-            "upload_url": url,
-            "file_key": file_key,
-            "expires_in": 300,
-            "bucket": S3_BUCKET_NAME,
-            "region": AWS_REGION,
-        }
-    except Exception as e:
-        print("[ERROR] presign_upload:", e)
-        raise HTTPException(status_code=500, detail="presign 생성 실패")
-
-# ----------------------------
-# 3) 업로드 완료 후, 서버에 '등록'
-# ----------------------------
-@app.post("/api/certificates")
-def register_certificate(
-    file_key: str = Form(..., description="S3 객체 키 (presign 응답의 file_key)"),
-    file_name: str = Form(..., description="표시용 파일명"),
-    hospital: str = Form(..., description="발급 병원명"),
-):
+def detect_price(line: str) -> Optional[int]:
     """
-    iOS 앱 흐름:
-      - presign 응답 수신 → PUT 업로드 성공
-      - 그 다음 이 API로 메타데이터 등록
+    금액 숫자 추출: 30,000원 / 15000 / 15,000 등
     """
-    cert_id = uuid.uuid4().hex
-    item = {
-        "id": cert_id,
-        "hospital": hospital,
-        "file_name": file_name,
-        "file_key": file_key,
-        "issued_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s*원?", line.replace(" ", ""))
+    if m:
+        val = m.group(1).replace(",", "")
+        try:
+            return int(val)
+        except:
+            return None
+    return None
+
+def classify_item(line: str) -> str:
+    low = line.lower()
+    # 백신 정규화(키워드 우선)
+    for k, v in VACCINE_MAP.items():
+        if k in low or v.replace("백신", "").lower() in low:
+            return "vaccine"
+    # 카테고리 매칭
+    for t, keys in KEYWORDS.items():
+        for kw in keys:
+            if kw.lower() in low:
+                return t
+    # 기본값
+    return "other"
+
+def normalize_item_name(line: str) -> str:
+    low = line.lower()
+    # 백신 약어 매핑
+    for k, v in VACCINE_MAP.items():
+        if k in low or v.replace("백신","").lower() in low:
+            return v
+    # 흔한 축약/영문 대체
+    repl = {
+        "x-ray": "X-ray",
+        "dhppl": "종합백신(DHPPL)",
+        "dhpp": "종합백신(DHPP)",
+        "dhlpp": "종합백신(DHLPP)",
+        "ra": "광견병백신",
+        "rabies": "광견병백신",
     }
-    _CERTS.append(item)
-    return {"status": "ok", "id": cert_id}
+    for k, v in repl.items():
+        if k in low:
+            return v
+    # 기타는 원문 trim
+    return line.strip()
 
-# ----------------------------
-# 4) 증명서 목록
-# ----------------------------
-@app.get("/api/certificates", response_model=List[CertOut])
-def list_certificates(with_download_url: bool = False, expires_in: int = 300):
+def extract_hospital(text: str) -> Optional[str]:
+    # ‘동물병원’, ‘의료센터’ 등 키워드
+    for line in text.splitlines():
+        if any(w in line for w in ["동물병원", "동물 메디컬", "애니멀", "의료센터", "동물병원원"]):
+            return line.strip()
+    # 상단 첫 줄에 병원명 있는 경우도 꽤 있음
+    top = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return top[0] if top else None
+
+def parse_receipt_text(ocr_text: str) -> Dict[str, Any]:
     """
-    with_download_url=true 로 호출하면, 각 항목에 presigned GET URL 추가
+    OCR 텍스트 → 우리 스키마로 구조화
     """
-    result: List[CertOut] = []
-    for c in _CERTS:
-        download_url = None
-        if with_download_url:
-            try:
-                download_url = s3.generate_presigned_url(
-                    ClientMethod="get_object",
-                    Params={"Bucket": S3_BUCKET_NAME, "Key": c["file_key"]},
-                    ExpiresIn=expires_in,
-                )
-            except Exception as e:
-                print("[WARN] presign_get 실패:", e)
-                download_url = None
-        result.append(CertOut(**c, download_url=download_url))
+    lines = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
+    joined = "\n".join(lines)
+
+    hospital = extract_hospital(joined)
+    visit_date = normalize_date(joined)
+
+    items: List[Dict[str, Any]] = []
+    total_price: Optional[int] = None
+
+    for ln in lines:
+        if any(k in ln for k in ["합계", "총액", "총합계", "Total", "TOTAL"]):
+            total_price = detect_price(ln)
+            continue
+        # 진료 항목 후보 라인
+        if any(kw in ln for kws in KEYWORDS.values() for kw in kws) or detect_price(ln):
+            items.append({
+                "type": classify_item(ln),
+                "name": normalize_item_name(ln),
+                "price": detect_price(ln)
+            })
+
+    result = {
+        "hospital": hospital,
+        "visit_date": visit_date,
+        "items": items,
+        "total": total_price,
+        "notes": None  # 필요하면 LLM 요약으로 보강 가능
+    }
     return result
 
-# ----------------------------
-# 5) 단건 다운로드 URL (옵션)
-# ----------------------------
-@app.get("/api/files/presign_get")
-def presign_get(file_key: str, expires_in: int = 300):
-    if not S3_BUCKET_NAME:
-        raise HTTPException(status_code=500, detail="S3 bucket 미설정")
+# ========= 추천 엔진 (MVP: 룰기반) =========
+
+def recommend_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    항목 키워드 기반 사료/영양제/보험 간단 추천 (MVP 룰)
+    """
+    low_text = " ".join([i.get("name","") or "" for i in items]).lower()
+    rec_food, rec_supp, rec_ins = [], [], []
+
+    # 수술/관절
+    if any(k in low_text for k in ["수술", "슬개골", "봉합", "절제"]):
+        rec_supp += ["관절: 글루코사민", "관절: 콘드로이틴", "관절: MSM"]
+        rec_food += ["회복기 고단백 저지방 포뮬러"]
+    # 피부/알러지
+    if any(k in low_text for k in ["피부", "알러지", "소양", "피부염"]):
+        rec_supp += ["오메가3(DHA/EPA)", "비오틴"]
+        rec_food += ["가수분해 단백질 사료", "단일 단백질 레시피(닭 제외 가능)"]
+    # 장트러블
+    if any(k in low_text for k in ["설사", "장염", "구토"]):
+        rec_supp += ["프로바이오틱스", "프리바이오틱스"]
+        rec_food += ["저지방 장케어 포뮬러"]
+    # 백신/예방
+    if "백신" in low_text or "접종" in low_text:
+        rec_ins += ["예방형 플랜(자기부담 20%) 추천", "노령 전 특약 최소화"]
+
+    # 기본 추천 (아무것도 매칭되지 않을 때)
+    if not rec_food:
+        rec_food = ["기본 소화기 건강 포뮬러"]
+    if not rec_supp:
+        rec_supp = ["기본 종합영양(오메가3 권장)"]
+    if not rec_ins:
+        rec_ins = ["표준 플랜(자기부담 20%, 연간보장 1,000만원 가정)"]
+
+    return {
+        "foods": list(dict.fromkeys(rec_food))[:3],
+        "supplements": list(dict.fromkeys(rec_supp))[:3],
+        "insurance": list(dict.fromkeys(rec_ins))[:3]
+    }
+
+# ========= Google OCR 호출 & 전체 파이프라인 =========
+
+def google_ocr_bytes(image_bytes: bytes, mime: str) -> str:
+    if not GOOGLE_VISION_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY not set")
+
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    body = {
+        "requests": [{
+            "image": {"content": b64},
+            "features": [{"type": "TEXT_DETECTION"}]
+        }]
+    }
+    headers = {"Content-Type": "application/json"}
+    res = requests.post(url, headers=headers, json=body, timeout=20)
+
+    if res.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Vision API error: {res.text[:200]}")
+
+    data = res.json()
     try:
-        url = s3.generate_presigned_url(
-            ClientMethod="get_object",
-            Params={"Bucket": S3_BUCKET_NAME, "Key": file_key},
-            ExpiresIn=expires_in,
-        )
-        return {"download_url": url, "expires_in": expires_in}
-    except Exception as e:
-        print("[ERROR] presign_get:", e)
-        raise HTTPException(status_code=500, detail="download url 생성 실패")
+        text = data["responses"][0]["fullTextAnnotation"]["text"]
+    except KeyError:
+        text = data["responses"][0].get("textAnnotations", [{}])[0].get("description", "")
+    return text or ""
+
+@app.post("/api/ocr_analyze")
+async def ocr_analyze(file: UploadFile = File(...)):
+    """
+    보호자가 영수증/명세서 사진을 업로드하면:
+    1) Google OCR로 텍스트 추출
+    2) 텍스트 → 진료 JSON 구조화
+    3) JSON 기반 추천(사료/영양제/보험) 반환
+    """
+    content = await file.read()
+    mime = file.content_type or "image/jpeg"
+
+    # (PDF도 Vision API가 처리 가능하지만, 첫 MVP는 이미지 권장)
+    ocr_text = google_ocr_bytes(content, mime)
+
+    record = parse_receipt_text(ocr_text)
+    recos = recommend_from_items(record["items"])
+
+    return {
+        "ocr_text": ocr_text,    # 디버깅/확인용
+        "record": record,        # 진료 JSON
+        "recommendations": recos # 추천 JSON
+    }
