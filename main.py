@@ -1,234 +1,288 @@
-# main.py
-import os, base64, re, json, datetime
-import requests
+# -- coding: utf-8 --
+"""
+PetHealth+ FastAPI MVP (Render 배포용)
+•⁠  ⁠업로드: /ocr/upload (S3)
+•⁠  ⁠분석:   /ocr/analyze (RapidOCR)
+•⁠  ⁠기록:   /records (GET/POST)
+•⁠  ⁠추천:   /recommend (룰 기반)
+•⁠  ⁠상태:   /health
+"""
+import os, io, json, time, uuid
+from pathlib import Path
+from typing import List, Optional
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
+from PIL import Image
 
-# ========= FastAPI 기본 =========
-app = FastAPI(title="PetHealth+ OCR/Analyze API")
+# ===== S3 =====
+import boto3
+
+# ===== OCR =====
+from rapidocr_onnxruntime import RapidOCR
+
+# ---------- 환경변수 ----------
+AWS_KEY      = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET   = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION   = os.getenv("AWS_REGION", "ap-northeast-2")
+S3_BUCKET    = os.getenv("S3_BUCKET_NAME", "pethealthplus-files")
+
+# 로컬 저장 위치(간이 DB)
+DATA_DIR = Path(_file_).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+RECORDS_JSON = DATA_DIR / "records.json"
+UPLOADS_DIR = DATA_DIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+# ---------- S3 클라이언트 ----------
+def s3_client():
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_KEY,
+        aws_secret_access_key=AWS_SECRET,
+        region_name=AWS_REGION,
+    )
+
+# ---------- 모델 ----------
+class MedicalItem(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    category: str = "others"   # exam/medication/vaccine/others
+    quantity: Optional[float] = None
+    unit: Optional[str] = None
+    price: Optional[int] = None
+
+class MedicalRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    petId: str
+    clinicName: str
+    visitDate: str            # ISO date string
+    items: List[MedicalItem] = []
+    notes: Optional[str] = None
+    totalAmount: Optional[int] = None
+
+class OCRAnalyzeRequest(BaseModel):
+    receipt_id: str
+
+class OCRResult(BaseModel):
+    clinicName: Optional[str] = None
+    visitDate: Optional[str] = None
+    items: List[MedicalItem] = []
+    notes: Optional[str] = None
+    totalAmount: Optional[int] = None
+
+class RecommendRequest(BaseModel):
+    profile: dict
+    recentRecords: List[MedicalRecord] = []
+
+class Recommendation(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    type: str   # food/supplement/insurance
+    title: str
+    subtitle: Optional[str] = None
+    reasons: List[str] = []
+    tags: List[str] = []
+    deeplink: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    receipt_id: str
+
+# ---------- 간이 저장소 ----------
+def load_records() -> List[dict]:
+    if RECORDS_JSON.exists():
+        return json.loads(RECORDS_JSON.read_text("utf-8"))
+    return []
+
+def save_records(lst: List[dict]):
+    RECORDS_JSON.write_text(json.dumps(lst, ensure_ascii=False, indent=2), "utf-8")
+
+# ---------- OCR ----------
+_ocr = RapidOCR()
+
+def run_ocr(image_bytes: bytes) -> List[str]:
+    """RapidOCR 실행 후 줄 단위 텍스트 리스트 반환"""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    # RapidOCR -> (result, time)
+    res, _ = _ocr(img)
+    # res: [[text, score, [box]], ...]
+    lines = [r[0] for r in res] if res else []
+    return lines
+
+def parse_receipt_to_ocrresult(lines: List[str]) -> OCRResult:
+    """
+    매우 단순 파서 (MVP): 
+    - 병원명: '동물병원' 포함 줄
+    - 날짜: yyyy-mm-dd / yyyy.mm.dd / yyyy/mm/dd
+    - 금액: '원' 또는 숫자 4자리 이상
+    - 항목: '주사','처방','진료','백신' 등 키워드 매칭
+    """
+    import re
+    clinic = next((l for l in lines if "동물병원" in l or "동물 병원" in l or "애견병원" in l), None)
+
+    date_pat = re.compile(r"(20\d{2}[-./](0?[1-9]|1[0-2])[-./](0?[1-9]|[12]\d|3[01]))")
+    date = None
+    for l in lines:
+        m = date_pat.search(l)
+        if m:
+            date = m.group(1).replace(".", "-").replace("/", "-")
+            break
+
+    total = None
+    for l in lines[::-1]:
+        if "원" in l:
+            nums = re.findall(r"\d{2,}", l.replace(",", ""))
+            if nums:
+                total = int(nums[-1])
+                break
+
+    items: List[MedicalItem] = []
+    keywords = {
+        "vaccine": ["백신", "접종"],
+        "exam": ["검사", "진료"],
+        "medication": ["처방", "주사", "약"],
+    }
+    for l in lines:
+        for cat, keys in keywords.items():
+            if any(k in l for k in keys):
+                # 가격 추출
+                price = None
+                m2 = re.search(r"(\d[\d,]{2,})\s*원?", l)
+                if m2:
+                    price = int(m2.group(1).replace(",", ""))
+                items.append(MedicalItem(name=l[:40], category=cat, price=price))
+                break
+
+    return OCRResult(
+        clinicName=clinic or "동물병원",
+        visitDate=date or time.strftime("%Y-%m-%d"),
+        items=items or [MedicalItem(name="진료", category="exam", price=total)],
+        notes=None,
+        totalAmount=total
+    )
+
+# ---------- FastAPI ----------
+app = FastAPI(title="PetHealth+ API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 운영 전 도메인 제한 권장
+    allow_origins=["*"],           # 운영 시 도메인으로 제한 권장
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY")  # ★ Render 환경변수에 넣기
+# ---------- 엔드포인트 ----------
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": time.time()}
 
-@app.get("/")
-def home():
-    return {"message": "PetHealth+ 서버 연결 성공 ✅", "ocr": bool(GOOGLE_VISION_API_KEY)}
+# 1) 업로드: S3 저장 후 receipt_id 반환
+@app.post("/ocr/upload", response_model=UploadResponse)
+async def upload_image(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(400, "이미지 파일만 업로드해주세요.")
+    data = await file.read()
 
-# ========= 유틸: 간단 파서/정규화 =========
-
-VACCINE_MAP = {
-    "dhppl": "종합백신(DHPPL)", "dhpp": "종합백신(DHPP)", "dhlpp": "종합백신(DHLPP)",
-    "ra": "광견병백신", "rabies": "광견병백신",
-    "corona": "코로나백신", "influenza": "켄넬코프/기관지염 백신",
-}
-KEYWORDS = {
-    "surgery": ["수술", "중성화", "슬개골", "제거술", "봉합", "절제"],
-    "vaccine": ["백신", "접종", "dhppl", "dhpp", "dhlpp", "ra", "rabies", "코로나", "인플루엔자", "켄넬"],
-    "exam": ["진찰", "진료", "검진", "재진", "초진", "상담", "처치"],
-    "lab": ["검사", "혈액", "x-ray", "엑스레이", "초음파", "feca", "대변", "소변"],
-    "drug": ["약", "항생제", "소염제", "진통제", "연고", "정", "mL", "mg"],
-    "treatment": ["주사", "수액", "처치", "처방", "치료"],
-}
-
-def normalize_date(text: str) -> Optional[str]:
-    """
-    한국형 날짜 포맷을 YYYY-MM-DD로 정규화
-    """
-    # 2025.09.24 / 2025-09-24
-    m = re.search(r"(20\d{2})[.\-\/년 ]\s*(\d{1,2})[.\-\/월 ]\s*(\d{1,2})", text)
-    if m:
-        y, mon, d = m.group(1), m.group(2), m.group(3)
-        try:
-            dt = datetime.date(int(y), int(mon), int(d))
-            return dt.isoformat()
-        except:
-            pass
-    return None
-
-def detect_price(line: str) -> Optional[int]:
-    """
-    금액 숫자 추출: 30,000원 / 15000 / 15,000 등
-    """
-    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s*원?", line.replace(" ", ""))
-    if m:
-        val = m.group(1).replace(",", "")
-        try:
-            return int(val)
-        except:
-            return None
-    return None
-
-def classify_item(line: str) -> str:
-    low = line.lower()
-    # 백신 정규화(키워드 우선)
-    for k, v in VACCINE_MAP.items():
-        if k in low or v.replace("백신", "").lower() in low:
-            return "vaccine"
-    # 카테고리 매칭
-    for t, keys in KEYWORDS.items():
-        for kw in keys:
-            if kw.lower() in low:
-                return t
-    # 기본값
-    return "other"
-
-def normalize_item_name(line: str) -> str:
-    low = line.lower()
-    # 백신 약어 매핑
-    for k, v in VACCINE_MAP.items():
-        if k in low or v.replace("백신","").lower() in low:
-            return v
-    # 흔한 축약/영문 대체
-    repl = {
-        "x-ray": "X-ray",
-        "dhppl": "종합백신(DHPPL)",
-        "dhpp": "종합백신(DHPP)",
-        "dhlpp": "종합백신(DHLPP)",
-        "ra": "광견병백신",
-        "rabies": "광견병백신",
-    }
-    for k, v in repl.items():
-        if k in low:
-            return v
-    # 기타는 원문 trim
-    return line.strip()
-
-def extract_hospital(text: str) -> Optional[str]:
-    # ‘동물병원’, ‘의료센터’ 등 키워드
-    for line in text.splitlines():
-        if any(w in line for w in ["동물병원", "동물 메디컬", "애니멀", "의료센터", "동물병원원"]):
-            return line.strip()
-    # 상단 첫 줄에 병원명 있는 경우도 꽤 있음
-    top = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return top[0] if top else None
-
-def parse_receipt_text(ocr_text: str) -> Dict[str, Any]:
-    """
-    OCR 텍스트 → 우리 스키마로 구조화
-    """
-    lines = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
-    joined = "\n".join(lines)
-
-    hospital = extract_hospital(joined)
-    visit_date = normalize_date(joined)
-
-    items: List[Dict[str, Any]] = []
-    total_price: Optional[int] = None
-
-    for ln in lines:
-        if any(k in ln for k in ["합계", "총액", "총합계", "Total", "TOTAL"]):
-            total_price = detect_price(ln)
-            continue
-        # 진료 항목 후보 라인
-        if any(kw in ln for kws in KEYWORDS.values() for kw in kws) or detect_price(ln):
-            items.append({
-                "type": classify_item(ln),
-                "name": normalize_item_name(ln),
-                "price": detect_price(ln)
-            })
-
-    result = {
-        "hospital": hospital,
-        "visit_date": visit_date,
-        "items": items,
-        "total": total_price,
-        "notes": None  # 필요하면 LLM 요약으로 보강 가능
-    }
-    return result
-
-# ========= 추천 엔진 (MVP: 룰기반) =========
-
-def recommend_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    항목 키워드 기반 사료/영양제/보험 간단 추천 (MVP 룰)
-    """
-    low_text = " ".join([i.get("name","") or "" for i in items]).lower()
-    rec_food, rec_supp, rec_ins = [], [], []
-
-    # 수술/관절
-    if any(k in low_text for k in ["수술", "슬개골", "봉합", "절제"]):
-        rec_supp += ["관절: 글루코사민", "관절: 콘드로이틴", "관절: MSM"]
-        rec_food += ["회복기 고단백 저지방 포뮬러"]
-    # 피부/알러지
-    if any(k in low_text for k in ["피부", "알러지", "소양", "피부염"]):
-        rec_supp += ["오메가3(DHA/EPA)", "비오틴"]
-        rec_food += ["가수분해 단백질 사료", "단일 단백질 레시피(닭 제외 가능)"]
-    # 장트러블
-    if any(k in low_text for k in ["설사", "장염", "구토"]):
-        rec_supp += ["프로바이오틱스", "프리바이오틱스"]
-        rec_food += ["저지방 장케어 포뮬러"]
-    # 백신/예방
-    if "백신" in low_text or "접종" in low_text:
-        rec_ins += ["예방형 플랜(자기부담 20%) 추천", "노령 전 특약 최소화"]
-
-    # 기본 추천 (아무것도 매칭되지 않을 때)
-    if not rec_food:
-        rec_food = ["기본 소화기 건강 포뮬러"]
-    if not rec_supp:
-        rec_supp = ["기본 종합영양(오메가3 권장)"]
-    if not rec_ins:
-        rec_ins = ["표준 플랜(자기부담 20%, 연간보장 1,000만원 가정)"]
-
-    return {
-        "foods": list(dict.fromkeys(rec_food))[:3],
-        "supplements": list(dict.fromkeys(rec_supp))[:3],
-        "insurance": list(dict.fromkeys(rec_ins))[:3]
-    }
-
-# ========= Google OCR 호출 & 전체 파이프라인 =========
-
-def google_ocr_bytes(image_bytes: bytes, mime: str) -> str:
-    if not GOOGLE_VISION_API_KEY:
-        raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY not set")
-
-    url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    body = {
-        "requests": [{
-            "image": {"content": b64},
-            "features": [{"type": "TEXT_DETECTION"}]
-        }]
-    }
-    headers = {"Content-Type": "application/json"}
-    res = requests.post(url, headers=headers, json=body, timeout=20)
-
-    if res.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Vision API error: {res.text[:200]}")
-
-    data = res.json()
+    # S3 업로드
+    rid = str(uuid.uuid4())
+    key = f"uploads/{rid}.jpg"
     try:
-        text = data["responses"][0]["fullTextAnnotation"]["text"]
-    except KeyError:
-        text = data["responses"][0].get("textAnnotations", [{}])[0].get("description", "")
-    return text or ""
+        s3_client().put_object(Bucket=S3_BUCKET, Key=key, Body=data, ContentType="image/jpeg")
+    except Exception as e:
+        # 로컬에라도 저장(개발 테스트용)
+        (UPLOADS_DIR / f"{rid}.jpg").write_bytes(data)
+    return UploadResponse(receipt_id=rid)
 
-@app.post("/api/ocr_analyze")
-async def ocr_analyze(file: UploadFile = File(...)):
-    """
-    보호자가 영수증/명세서 사진을 업로드하면:
-    1) Google OCR로 텍스트 추출
-    2) 텍스트 → 진료 JSON 구조화
-    3) JSON 기반 추천(사료/영양제/보험) 반환
-    """
-    content = await file.read()
-    mime = file.content_type or "image/jpeg"
+# 2) 분석: S3에서 내려받아 OCR → 결과 구조화
+@app.post("/ocr/analyze", response_model=OCRResult)
+def analyze(req: OCRAnalyzeRequest):
+    key = f"uploads/{req.receipt_id}.jpg"
+    try:
+        obj = s3_client().get_object(Bucket=S3_BUCKET, Key=key)
+        img_bytes = obj["Body"].read()
+    except Exception:
+        # 로컬 백업에서 찾기
+        local = UPLOADS_DIR / f"{req.receipt_id}.jpg"
+        if not local.exists():
+            raise HTTPException(404, "이미지를 찾을 수 없습니다.")
+        img_bytes = local.read_bytes()
 
-    # (PDF도 Vision API가 처리 가능하지만, 첫 MVP는 이미지 권장)
-    ocr_text = google_ocr_bytes(content, mime)
+    lines = run_ocr(img_bytes)
+    return parse_receipt_to_ocrresult(lines)
 
-    record = parse_receipt_text(ocr_text)
-    recos = recommend_from_items(record["items"])
+# 3) 기록: GET/POST (간이 JSON 저장)
+@app.get("/records", response_model=List[MedicalRecord])
+def list_records():
+    return load_records()
 
-    return {
-        "ocr_text": ocr_text,    # 디버깅/확인용
-        "record": record,        # 진료 JSON
-        "recommendations": recos # 추천 JSON
-    }
+@app.post("/records", response_model=MedicalRecord)
+def add_record(rec: MedicalRecord):
+    lst = load_records()
+    lst.insert(0, rec.model_dump())
+    save_records(lst)
+    return rec
+
+# 4) 추천: 간단 룰 기반(알러지, 항목, 금액 등)
+@app.post("/recommend", response_model=List[Recommendation])
+def recommend(req: RecommendRequest):
+    pet = req.profile or {}
+    allergies = set([a.lower() for a in pet.get("allergies", [])])
+
+    has_skin = any("피부" in (i.name if isinstance(i, dict) else i.name) for r in req.recentRecords for i in r.items)
+    high_total = any((r.totalAmount or 0) >= 100000 for r in req.recentRecords)
+
+    recs: List[Recommendation] = []
+
+    # 사료 추천 (알러지 고려)
+    if "chicken" in allergies or "소고기" in allergies or "beef" in allergies:
+        recs.append(Recommendation(
+            type="food",
+            title="저자극 단백질 사료",
+            subtitle="알러지 성분 제외(치킨/소고기 Free)",
+            reasons=["알러지 이력 기반", "소화기 부담↓", "피부 컨디션 개선"],
+            tags=["그레인프리", "하이포알러제닉"],
+            deeplink="https://store.example.com/food-hypo"
+        ))
+    else:
+        recs.append(Recommendation(
+            type="food",
+            title="피모 케어 사료",
+            subtitle="오메가3·비오틴 강화",
+            reasons=["피부·모질 개선", "일반 체질에 적합"],
+            tags=["오메가3", "비오틴"],
+            deeplink="https://store.example.com/food-skin"
+        ))
+
+    # 영양제 추천 (피부/관절 등)
+    if has_skin:
+        recs.append(Recommendation(
+            type="supplement",
+            title="피부·모질 영양제",
+            subtitle="오메가3 + 아연 + 비오틴",
+            reasons=["피부 트러블 이력 감지", "피모 윤기 개선"],
+            tags=["오메가3","아연","비오틴"],
+            deeplink="https://store.example.com/supp-skin"
+        ))
+
+    # 보험 추천 (고액 진료 경험)
+    if high_total:
+        recs.append(Recommendation(
+            type="insurance",
+            title="실속형 반려동물 보험",
+            subtitle="연간 보장 1,000만원 / 자기부담 20%",
+            reasons=["최근 고액 진료 감지", "예상 의료비 리스크 완화"],
+            tags=["자기부담 20%","연 1,000만원"],
+            deeplink="https://store.example.com/ins-basic"
+        ))
+
+    if not recs:
+        recs.append(Recommendation(
+            type="food",
+            title="균형 영양 사료",
+            subtitle="활동량 보통, 표준 체중 가정",
+            reasons=["기본 건강상태 가정", "가격대비 성능 우수"],
+            tags=["표준형","가성비"],
+            deeplink="https://store.example.com/food-basic"
+        ))
+    return recs
