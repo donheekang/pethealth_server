@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, APIRouter, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,7 +18,7 @@ from PIL import Image
 # ---------------------------
 # 운영/개발 스위치
 # ---------------------------
-STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"  # ← 라우팅/프론트 개발 계속하려면 true
+STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"   # 프론트 연동/라우팅 테스트는 true
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
 # ---------------------------
@@ -62,7 +62,7 @@ if not STUB_MODE:
     )
 
 # ---------------------------
-# FastAPI 기본 설정
+# FastAPI
 # ---------------------------
 app = FastAPI(title="PetHealth+ API")
 
@@ -75,13 +75,12 @@ app.add_middleware(
 )
 
 # ---------------------------
-# 헬스체크 라우터 (절대 안 사라지게)
+# 헬스체크
 # ---------------------------
 health_router = APIRouter()
 
 @health_router.get("/health")
 def health():
-    """Render/모니터링용 헬스체크"""
     return {"ok": True, "service": "PetHealthPlus", "version": "1.0.0", "stub": STUB_MODE}
 
 app.include_router(health_router)
@@ -146,11 +145,11 @@ class Recommendation(BaseModel):
     tags: List[str] = Field(default_factory=list)
     deeplink: Optional[str] = None
 
-# In-memory demo store (records)
+# 임시 인메모리 DB (데모)
 RECORDS_DB: List[MedicalRecord] = []
 
 # ---------------------------
-# 유틸리티
+# 유틸
 # ---------------------------
 def _pil_to_jpeg_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
@@ -164,8 +163,7 @@ def _validate_and_to_jpeg(raw: bytes) -> bytes:
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         return _pil_to_jpeg_bytes(img)
     except Exception:
-        # 이미지 아닐 때는 원본 그대로(멀티파트 등)
-        return raw
+        return raw  # 멀티파트 등 이미지가 아닐 수도 있으니 그대로
 
 def _put_s3(key: str, data: bytes, content_type: str = "image/jpeg"):
     if STUB_MODE:
@@ -177,7 +175,6 @@ def _put_s3(key: str, data: bytes, content_type: str = "image/jpeg"):
 
 def _get_s3(key: str) -> bytes:
     if STUB_MODE:
-        # STUB 모드에서는 실제 S3 없이 더미 바이트 반환
         return b"STUB_IMAGE_BYTES"
     try:
         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
@@ -190,7 +187,7 @@ def _extract_text_google_vision(image_bytes: bytes) -> str:
         return ""
     image = vision.Image(content=image_bytes)
     resp = vision_client.text_detection(image=image)
-    if resp.error.message:
+    if getattr(resp, "error", None) and resp.error.message:
         print("[Vision] error:", resp.error.message)
         return ""
     if resp.full_text_annotation and resp.full_text_annotation.text:
@@ -227,7 +224,7 @@ def _simple_parse(text: str) -> OCRResult:
             result.totalAmount = int(m.group(2).replace(",", ""))
             break
 
-    # 항목
+    # 항목 (맨 뒤 금액 패턴)
     price_tail = re.compile(r"(.+?)\s+([\d,]{3,})$")
     for ln in lines:
         m = price_tail.match(ln)
@@ -236,7 +233,6 @@ def _simple_parse(text: str) -> OCRResult:
             if not any(k in name for k in ["합계", "총액", "소계"]):
                 result.items.append(MedicalItem(name=name, price=int(price.replace(",", ""))))
 
-    # 기본값 보정
     if not result.visitDate:
         result.visitDate = datetime.now(timezone.utc)
     if not result.clinicName:
@@ -244,12 +240,11 @@ def _simple_parse(text: str) -> OCRResult:
     return result
 
 # ---------------------------
-# OCR 업로드/분석
+# OCR 업로드/분석 (정식 플로우: S3 경유)
 # ---------------------------
 @app.post("/ocr/upload", response_model=UploadResponse)
 async def upload(file: UploadFile = File(...)):
     if STUB_MODE:
-        # 프론트 개발/라우팅 검증용
         return UploadResponse(receipt_id="receipts/STUB.jpg")
 
     raw = await file.read()
@@ -261,7 +256,6 @@ async def upload(file: UploadFile = File(...)):
 @app.post("/ocr/analyze", response_model=OCRResult)
 async def analyze(req: OCRAnalyzeRequest):
     if STUB_MODE:
-        # 프론트 개발/라우팅 검증용
         return OCRResult(
             clinicName="Stub Animal Hospital",
             visitDate=datetime.now(timezone.utc),
@@ -276,7 +270,6 @@ async def analyze(req: OCRAnalyzeRequest):
     image_bytes = _get_s3(req.receipt_id)
     text = _extract_text_google_vision(image_bytes) if vision_client else ""
     if not text:
-        # 텍스트가 비어도 빈 파싱 결과 반환(프론트가 흐름 테스트 가능)
         return OCRResult(
             clinicName=None,
             visitDate=datetime.now(timezone.utc),
@@ -287,7 +280,7 @@ async def analyze(req: OCRAnalyzeRequest):
     return _simple_parse(text)
 
 # ---------------------------
-# Records (프론트 연동용 간단 구현)
+# Records (데모)
 # ---------------------------
 @app.get("/records", response_model=List[MedicalRecord])
 def list_records():
@@ -299,31 +292,54 @@ def add_record(record: MedicalRecord):
     return record
 
 # ---------------------------
-# Recommend (간단 룰/스텁)
+# Recommend (간단 룰 데모)
 # ---------------------------
 @app.post("/recommend", response_model=List[Recommendation])
 def recommend(req: RecommendRequest):
-    # 간단 룰: 알러지 존재 시 저자극 사료 + 피부 영양제
     recs: List[Recommendation] = []
     if req.profile.allergies:
         recs.append(Recommendation(
             type="food", title="저자극 단백질 사료",
-            subtitle="알레르기 대응", reasons=["한정 원료", "곡물/옥수수/콩 배제"],
+            subtitle="알레르기 대응",
+            reasons=["한정 원료", "곡물/옥수수/콩 배제"],
             tags=["limited-ingredient","allergenic-free"]
         ))
         recs.append(Recommendation(
             type="supplement", title="피부/피모 케어 영양제",
-            reasons=["오메가-3/비오틴/아연", "가려움·각질 완화"], tags=["skin","itching"]
+            reasons=["오메가-3/비오틴/아연", "가려움·각질 완화"],
+            tags=["skin","itching"]
         ))
     else:
         recs.append(Recommendation(
             type="food", title="균형 잡힌 표준 사료",
-            reasons=["오메가3/6 균형","표준 체중 유지"], tags=["balanced","adult"]
+            reasons=["오메가3/6 균형","표준 체중 유지"],
+            tags=["balanced","adult"]
         ))
     return recs
 
 # ---------------------------
-# 시작 시 라우트 확인 (배포본 진실 로그)
+# Diagnostics (Google Vision / 환경 확인)
+# ---------------------------
+@app.get("/ocr/diag")
+def ocr_diag():
+    return {
+        "stub_mode": STUB_MODE,
+        "gcv_enabled": GCV_ENABLED,
+        "vision_client": bool(vision_client),
+        "s3_bucket": S3_BUCKET,
+        "aws_region": AWS_REGION,
+    }
+
+# S3를 거치지 않고 업로드 파일을 직접 Vision에 넣어보는 테스트
+@app.post("/ocr/test")
+async def ocr_test(file: UploadFile = File(...)):
+    data = await file.read()
+    data = _validate_and_to_jpeg(data)
+    text = _extract_text_google_vision(data)
+    return {"ok": bool(text), "len": len(text), "sample": text[:300]}
+
+# ---------------------------
+# 시작 시 라우트 로그
 # ---------------------------
 @app.on_event("startup")
 async def _print_routes():
