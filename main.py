@@ -1,330 +1,286 @@
-import io
-import os
-import re
-import json
-import uuid
-import base64
-from datetime import datetime
-from typing import List, Optional
+from _future_ import annotations
+import os, io, json, re, base64
+from pathlib import Path
+from typing import List, Optional, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import boto3
-from botocore.client import Config
-from PIL import Image
 
-# ---- Google Vision (Service Account JSON via ENV) ----
-GCV_ENABLED = os.getenv("GCV_ENABLED", "true").lower() == "true"
-GCV_CREDENTIALS_JSON = os.getenv("GCV_CREDENTIALS_JSON", "")
+# --------- Google Cloud Vision 준비 (옵션) ----------
+USE_GCV = os.getenv("GCV_ENABLED", "false").lower() == "true"
+GCV_JSON = os.getenv("GCV_CREDENTIALS_JSON")
 
-if GCV_ENABLED and GCV_CREDENTIALS_JSON:
-    from google.cloud import vision
-    from google.oauth2.service_account import Credentials
-
+if USE_GCV and GCV_JSON:
+    # Render에서는 파일이 없으니 JSON 문자열을 /tmp에 저장 후 경로로 지정
+    gcv_path = "/tmp/gcv.json"
+    Path(gcv_path).write_text(GCV_JSON, encoding="utf-8")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gcv_path
     try:
-        _svc_info = json.loads(GCV_CREDENTIALS_JSON)
-        _creds = Credentials.from_service_account_info(_svc_info)
-        vision_client = vision.ImageAnnotatorClient(credentials=_creds)
+        from google.cloud import vision  # type: ignore
+        _gcv_client = vision.ImageAnnotatorClient()
     except Exception as e:
-        print("[WARN] Failed to init Google Vision client:", e)
-        vision_client = None
+        print("[WARN] GCV import/init failed:", e)
+        USE_GCV = False
+        _gcv_client = None
 else:
-    vision_client = None
-    print("[INFO] Google Vision disabled or missing creds")
+    _gcv_client = None
 
-# ---- AWS S3 ----
+# --------- RapidOCR (백업용) ----------
+try:
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+    _rapidocr = RapidOCR()
+except Exception as e:
+    print("[WARN] RapidOCR init failed:", e)
+    _rapidocr = None
+
+# --------- AWS S3 기본 설정 ----------
 AWS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 
-if not (AWS_KEY and AWS_SECRET and S3_BUCKET):
-    print("[WARN] Missing AWS/S3 environment variables")
+if not all([AWS_KEY, AWS_SECRET, AWS_REGION, S3_BUCKET]):
+    print("[WARN] Missing AWS envs. S3 features may fail.")
 
-s3_client = boto3.client(
+s3 = boto3.client(
     "s3",
     region_name=AWS_REGION,
     aws_access_key_id=AWS_KEY,
     aws_secret_access_key=AWS_SECRET,
-    config=Config(signature_version="s3v4"),
 )
 
-# ---- FastAPI ----
-app = FastAPI(title="PetHealthPlus API")
+# --------- FastAPI ----------
+app = FastAPI(title="PetHealth+ API (GCV)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 필요시 도메인으로 제한
+    allow_origins=["*"],  # MVP 단계에서는 허용, 운영 시 도메인 제한
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Models ----------
+# --------- Models ----------
 class MedicalItem(BaseModel):
-    id: str = uuid.uuid4().hex
     name: str
-    category: str = "others"  # exam/medication/vaccine/others
+    category: str = "others"
     quantity: Optional[float] = None
     unit: Optional[str] = None
     price: Optional[int] = None
 
 class OCRResult(BaseModel):
     clinicName: Optional[str] = None
-    visitDate: Optional[datetime] = None
+    visitDate: Optional[str] = None  # iOS에서 ISO-8601로 파싱 가능 문자열이면 OK
     items: List[MedicalItem] = []
     notes: Optional[str] = None
     totalAmount: Optional[int] = None
 
-class UploadResponse(BaseModel):
+class UploadResp(BaseModel):
     receipt_id: str
 
-class OCRAnalyzeRequest(BaseModel):
-    receipt_id: str
+class OCRAnalyzeReq(BaseModel):
+    receipt_id: str  # S3 객체 키
 
-class PetProfile(BaseModel):
-    id: str
-    name: str
-    species: str
-    breed: Optional[str] = None
-    birthDate: Optional[datetime] = None
-    allergies: List[str] = []
-    weightKg: Optional[float] = None
+class RecommendReq(BaseModel):
+    profile: Dict
+    recentRecords: List[Dict]
 
-class MedicalRecord(BaseModel):
-    id: str = uuid.uuid4().hex
-    petId: str
-    clinicName: str
-    visitDate: datetime
-    items: List[MedicalItem] = []
-    notes: Optional[str] = None
-    totalAmount: Optional[int] = None
+# --------- Utils ----------
+def s3_put_bytes(key: str, data: bytes, content_type: str = "image/jpeg") -> None:
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data, ContentType=content_type)
 
-class RecommendRequest(BaseModel):
-    profile: PetProfile
-    recentRecords: List[MedicalRecord] = []
+def s3_get_bytes(key: str) -> bytes:
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    return obj["Body"].read()
 
-class Recommendation(BaseModel):
-    id: str = uuid.uuid4().hex
-    type: str  # food/supplement/insurance
-    title: str
-    subtitle: Optional[str] = None
-    reasons: List[str] = []
-    tags: List[str] = []
-    deeplink: Optional[str] = None
+def normalize_price(text: str) -> Optional[int]:
+    # "12,300원" -> 12300
+    m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)\s*원", text.replace(" ", ""))
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
 
-# ---------- In-memory storage (데모) ----------
-RECORDS_DB: List[MedicalRecord] = []
-
-
-# ---------- Utils ----------
-def _put_s3(key: str, data: bytes, content_type: str = "image/jpeg"):
-    try:
-        s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=data, ContentType=content_type)
-    except Exception as e:
-        print("[S3] put_object error:", e)
-        raise HTTPException(status_code=500, detail="S3 upload failed")
-
-def _get_s3(key: str) -> bytes:
-    try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-        return obj["Body"].read()
-    except Exception as e:
-        print("[S3] get_object error:", e)
-        raise HTTPException(status_code=404, detail="S3 object not found")
-
-def _pil_to_jpeg_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
-    return buf.getvalue()
-
-def _extract_text_google_vision(image_bytes: bytes) -> str:
-    if not vision_client:
-        # 안전장치: 비전 비활성 시 기본값
-        return ""
-    image = vision.Image(content=image_bytes)
-    resp = vision_client.text_detection(image=image)
+def gcv_ocr_lines(image_bytes: bytes) -> List[str]:
+    """Google Cloud Vision으로 라인 텍스트 추출"""
+    if not _gcv_client:
+        return []
+    from google.cloud import vision
+    img = vision.Image(content=image_bytes)
+    resp = _gcv_client.text_detection(image=img)
     if resp.error.message:
-        print("[Vision] error:", resp.error.message)
-        return ""
-    return resp.full_text_annotation.text if resp.full_text_annotation and resp.full_text_annotation.text else (
-        resp.text_annotations[0].description if resp.text_annotations else ""
-    )
+        raise RuntimeError(resp.error.message)
+    # text_annotations[0]는 전체 문서, 이후는 요소들
+    lines: List[str] = []
+    if resp.text_annotations:
+        # 전체 블록을 줄바꿈 기준으로 분리
+        full = resp.text_annotations[0].description
+        for ln in full.splitlines():
+            t = ln.strip()
+            if t:
+                lines.append(t)
+    return lines
 
-def _simple_parse(text: str) -> OCRResult:
+def rapid_ocr_lines(image_bytes: bytes) -> List[str]:
+    """RapidOCR로 라인 텍스트 추출(백업)"""
+    if not _rapidocr:
+        return []
+    import cv2
+    import numpy as np
+    img_arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+    res, _ = _rapidocr(img)
+    lines = [r[1] for r in res] if res else []
+    return lines
+
+def parse_receipt(lines: List[str]) -> OCRResult:
     """
-    매우 단순한 규칙 파서 (데모용)
-    - 병원명: 첫 줄 혹은 '동물병원' 포함 줄
-    - 날짜: YYYY.MM.DD / YYYY-MM-DD / YYYY/MM/DD
-    - 총액: '합계|총액|총 합계' 숫자
-    - 항목: 줄단위로 이름 + 금액
+    매우 단순한 규칙 기반 파서 (MVP).
+    병원명, 합계, 항목/가격을 라인에서 추출해 OCRResult로 반환.
     """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     result = OCRResult(items=[])
 
-    # clinic
-    for ln in lines[:5]:
-        if ("동물병원" in ln) or ("병원" in ln):
-            result.clinicName = ln
+    # 병원명: '동물병원'/'병원' 단어가 포함된 첫 줄
+    for ln in lines[:10]:
+        if "동물병원" in ln or ln.endswith("병원") or "병원" in ln:
+            result.clinicName = ln.strip()
             break
-    if not result.clinicName and lines:
-        result.clinicName = lines[0]
 
-    # date
-    date_pat = re.compile(r"(\d{4}[./-]\d{1,2}[./-]\d{1,2})")
+    # 총액
+    for ln in reversed(lines):
+        price = normalize_price(ln)
+        if price:
+            # "합계", "총액" 같은 단어가 있으면 더 신뢰
+            if any(k in ln for k in ("합계", "총액", "총금액", "결제금액")):
+                result.totalAmount = price
+                break
+            # 마지막 금액으로라도 채움
+            if result.totalAmount is None:
+                result.totalAmount = price
+
+    # 간단 항목 파싱: "주사", "초음파", "X-ray" 등 키워드 체킹
+    CATEGORIES = {
+        "vaccine": ["백신", "예방접종", "DHPPL", "라비즈"],
+        "exam": ["진찰", "초진", "재진", "X-ray", "엑스레이", "초음파", "혈액", "검사"],
+        "medication": ["주사", "주사제", "항생제", "약", "처방"],
+    }
     for ln in lines:
-        m = date_pat.search(ln)
-        if m:
-            raw = m.group(1).replace("/", "-").replace(".", "-")
-            try:
-                result.visitDate = datetime.strptime(raw, "%Y-%m-%d")
-            except:
-                try:
-                    result.visitDate = datetime.strptime(raw, "%Y-%m-%d")
-                except:
-                    pass
-            break
+        price = normalize_price(ln)
+        # 한 줄에서 이름 + 가격이 같이 잡히는 경우
+        if price:
+            name = ln
+            cat = "others"
+            for c, keys in CATEGORIES.items():
+                if any(k in ln for k in keys):
+                    cat = c
+                    break
+            result.items.append(MedicalItem(name=name, category=cat, price=price))
 
-    # total amount
-    won_pat = re.compile(r"(합계|총액|총\s*합계)\s*[:\-]?\s*([\d,]+)")
-    for ln in lines[::-1]:
-        m = won_pat.search(ln)
-        if m:
-            amt = int(m.group(2).replace(",", ""))
-            result.totalAmount = amt
-            break
-
-    # items (아주 단순화: '... 12,000' 형식)
-    price_tail = re.compile(r"(.+?)\s+([\d,]{2,})\s*$")
-    for ln in lines:
-        m = price_tail.match(ln)
-        if m:
-            name = m.group(1)
-            price = int(m.group(2).replace(",", ""))
-            # 총액/합계 라인은 제외
-            if any(k in name for k in ["합계", "총", "총액"]):
-                continue
-            result.items.append(MedicalItem(name=name, price=price))
-
-    # notes: 첫 4~6줄 정도를 묶어서 간단히
+    # 메모 필드 (긴 문장 요약)
     if lines:
-        head = "\n".join(lines[:6])
-        if len(head) > 10:
-            result.notes = head
+        sample = " / ".join(lines[:6])
+        result.notes = sample[:300]
 
-    # 날짜 없으면 오늘
-    if not result.visitDate:
-        result.visitDate = datetime.utcnow()
     return result
 
+# --------- Endpoints ----------
+@app.get("/")
+def home():
+    return {"message": "PetHealth+ 서버 연결 성공 ✅"}
 
-# ---------- Endpoints ----------
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "PetHealthPlus", "version": "1.0.0"}
+    return {"status": "ok", "gcv_enabled": USE_GCV}
 
-@app.post("/ocr/upload", response_model=UploadResponse)
-async def upload(file: UploadFile = File(...)):
-    """
-    이미지 업로드 → S3 저장 → receipt_id 반환
-    """
-    raw = await file.read()
-
-    # 혹시 이미지가 HEIC/PNG 등일 경우 JPEG로 변환
+# 영수증 업로드 -> S3 저장 -> receipt_id 반환
+@app.post("/ocr/upload", response_model=UploadResp)
+async def ocr_upload(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(400, "No file")
+    data = await file.read()
+    key = f"receipts/{os.urandom(8).hex()}_{file.filename or 'receipt.jpg'}"
     try:
-        img = Image.open(io.BytesIO(raw))
-        img = img.convert("RGB")
-        raw = _pil_to_jpeg_bytes(img)
-    except Exception:
-        pass
+        s3_put_bytes(key, data, content_type=file.content_type or "image/jpeg")
+    except Exception as e:
+        raise HTTPException(500, f"S3 upload failed: {e}")
+    return UploadResp(receipt_id=key)
 
-    receipt_id = f"receipts/{uuid.uuid4().hex}.jpg"
-    _put_s3(receipt_id, raw, "image/jpeg")
-    return UploadResponse(receipt_id=receipt_id)
-
+# 업로드된 영수증을 분석 -> OCRResult 반환
 @app.post("/ocr/analyze", response_model=OCRResult)
-async def analyze(req: OCRAnalyzeRequest):
-    """
-    S3에서 이미지 다운로드 → Google Vision OCR → 텍스트 파싱 → 구조화 결과 반환
-    """
-    image_bytes = _get_s3(req.receipt_id)
-    text = _extract_text_google_vision(image_bytes) if GCV_ENABLED else ""
-    if not text:
-        # 비전 꺼져있거나 실패 시: 아주 간단한 fallback (빈 텍스트)
-        text = ""
+def ocr_analyze(req: OCRAnalyzeReq):
+    try:
+        img = s3_get_bytes(req.receipt_id)
+    except Exception as e:
+        raise HTTPException(404, f"S3 object not found: {e}")
 
-    result = _simple_parse(text)
-    return result
+    lines: List[str] = []
+    try:
+        if USE_GCV:
+            lines = gcv_ocr_lines(img)
+        if not lines:  # 백업
+            lines = rapid_ocr_lines(img)
+    except Exception as e:
+        raise HTTPException(500, f"OCR failed: {e}")
 
-@app.get("/records", response_model=List[MedicalRecord])
-def list_records():
-    return RECORDS_DB
+    if not lines:
+        raise HTTPException(422, "텍스트를 인식하지 못했습니다.")
 
-@app.post("/records", response_model=MedicalRecord)
-def add_record(record: MedicalRecord):
-    RECORDS_DB.insert(0, record)
-    return record
+    return parse_receipt(lines)
 
-@app.post("/recommend", response_model=List[Recommendation])
-def recommend(req: RecommendRequest):
-    """
-    매우 단순한 룰 기반 데모:
-    - 알러지 키워드 있으면 사료/영양제 태그/이유 변경
-    - 최근 항목에 '백신'/'접종' 있으면 예방관리 권고
-    - 총액이 높으면 보험 추천
-    """
-    recs: List[Recommendation] = []
+# (MVP) 메모리 저장소 – 필요시 DB로 대체
+_DB_RECORDS: List[Dict] = []
 
-    allergy = set(a.lower() for a in req.profile.allergies)
-    recent_text = " ".join([it.name for r in req.recentRecords for it in r.items])
+@app.get("/records")
+def get_records():
+    return _DB_RECORDS
 
-    # Food
-    if {"chicken", "beef", "lamb"} & allergy:
-        recs.append(Recommendation(
-            type="food",
-            title="저자극 단백질 사료 추천",
-            subtitle="피부염/단백질 알레르기 대응",
-            reasons=[
-                "단백질 제한(연어/곤충/오리 베이스)",
-                "곡물·옥수수·콩 성분 없음",
-                f"알러지: {', '.join(req.profile.allergies)}"
-            ],
-            tags=["limited-ingredient", "allergenic-free"],
-            deeplink="https://your-commerce/food/low-irritation"
-        ))
+@app.post("/records")
+def add_record(record: Dict):
+    _DB_RECORDS.insert(0, record)
+    return {"ok": True, "count": len(_DB_RECORDS)}
+
+@app.post("/recommend")
+def recommend(req: RecommendReq):
+    # 아주 단순한 데모 로직
+    profile = req.profile
+    allergies = set(map(str.lower, profile.get("allergies", [])))
+    recs = []
+
+    # 사료 추천
+    if "chicken" in allergies or "beef" in allergies:
+        recs.append({
+            "type": "food",
+            "title": "저자극 단백질 사료 (연어/오리)",
+            "subtitle": "닭/소고기 알러지 회피",
+            "reasons": ["알러지 프로필 기반", "단일 단백질", "피부 가려움 완화 기대"],
+            "tags": ["그레인프리", "저자극", "연어/오리"],
+        })
     else:
-        recs.append(Recommendation(
-            type="food",
-            title="표준 성견용 균형 사료",
-            reasons=["필수 아미노산/오메가3/6 균형", "표준 체중 유지"],
-            tags=["balanced", "adult"]
-        ))
+        recs.append({
+            "type": "food",
+            "title": "밸런스 고단백 사료",
+            "subtitle": "활동량 높은 반려견",
+            "reasons": ["체중/체형 고려", "기초 영양밸런스 적합"],
+            "tags": ["고단백", "오메가3"],
+        })
 
-    # Supplement
-    if "피부" in recent_text or {"chicken", "beef"}.intersection(allergy):
-        recs.append(Recommendation(
-            type="supplement",
-            title="피부/피모 케어 영양제",
-            reasons=["오메가-3, 비오틴, 아연 포함", "가려움/각질 완화"],
-            tags=["skin", "itching"],
-            deeplink="https://your-commerce/supplement/skin"
-        ))
+    # 영양제 추천
+    recs.append({
+        "type": "supplement",
+        "title": "관절 케어 (글루코사민+MSM)",
+        "reasons": ["소형견 슬개골 예방", "활동량↑"],
+        "tags": ["관절", "MSM"],
+    })
 
-    # Insurance
-    big_total = False
-    for r in req.recentRecords:
-        if r.totalAmount and r.totalAmount >= 200000:
-            big_total = True
-            break
-    if big_total:
-        recs.append(Recommendation(
-            type="insurance",
-            title="수술/입원 집중형 보험",
-            subtitle="고액 진료 대비",
-            reasons=["최근 고액 진료 발생", "수술/입원 보장 강화 필요"],
-            tags=["surgery", "inpatient"]
-        ))
+    # 보험 추천
+    recs.append({
+        "type": "insurance",
+        "title": "통원형 70% 보장 플랜",
+        "subtitle": "예상 진료비 분산",
+        "reasons": ["검진/예방접종 히스토리 기반", "처치 항목 커버"],
+        "tags": ["보장70%", "통원형"],
+    })
 
     return recs
