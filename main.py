@@ -147,40 +147,19 @@ async def analyze_receipt(
     file: UploadFile = File(...),
 ):
     """
-    iOS에서 업로드한 영수증 이미지를 받아서:
-    - (현재) S3 업로드 시도 + 더미 파싱 결과 반환
-    - (향후) 구글 OCR + Gemini 로 실제 텍스트/질병/증상 분석
+    ⚠️ 완전 STUB 버전
+    - 파일은 그냥 길이만 체크하고
+    - S3 / Pillow / OCR 아무 것도 안 쓰고
+    - 무조건 더미 데이터로 200 OK 응답만 보냄
     """
 
     # 1) 파일 읽기
     raw = await file.read()
     if len(raw) == 0:
+        # 이건 400으로 돌려보내는 정상 에러 (앱에서 "빈 파일입니다" 같은 메시지 나옴)
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail="이미지 용량이 너무 큽니다. (15MB 이하)")
 
-    # 2) 이미지인지 간단히 검증 + JPEG로 정규화
-    try:
-        image = Image.open(io.BytesIO(raw))
-        image = image.convert("RGB")
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=90)
-        buf.seek(0)
-        image_bytes = buf.read()
-    except Exception:
-        # 이미지가 아니면 원본 그대로 업로드 시도
-        image_bytes = raw
-
-    # 3) S3 업로드 시도 (실패하면 더미 URL 사용)
-    try:
-        s3_url = upload_image_to_s3(image_bytes, file.filename)
-    except Exception as e:
-        # S3 미설정 등으로 실패한 경우: 일단 더미 URL 사용
-        print("S3 업로드 실패:", e)
-        s3_url = f"https://dummy-s3.pethealthplus/{petId}/{file.filename}"
-
-    # 4) STUB 파싱 결과 (테스트용)
-    #    나중에 여기서 구글 OCR + Gemini 로 텍스트 / 질병 등 실제 분석
+    # 2) STUB 파싱 결과 (그냥 예시 데이터)
     parsed = ReceiptParsed(
         clinicName="테스트동물병원",
         visitDate="2025-11-17",
@@ -193,12 +172,12 @@ async def analyze_receipt(
         totalAmount=35000,
     )
 
+    # 3) S3 URL 도 그냥 가짜값
+    dummy_url = f"https://dummy-s3.pethealthplus/{petId}/{file.filename}"
+
     return ReceiptAnalyzeResponse(
         petId=petId,
-        s3Url=s3_url,
+        s3Url=dummy_url,
         parsed=parsed,
-        notes=(
-            "이 응답은 STUB 데이터입니다. "
-            "나중에 구글 OCR + Gemini 분석 결과로 교체 예정입니다."
-        ),
+        notes="이 응답은 S3/OCR 없이 STUB 로 생성된 데이터입니다."
     )
