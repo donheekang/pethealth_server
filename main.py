@@ -2,35 +2,36 @@
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
+# S3
 import boto3
 from botocore.client import Config
 
-# 선택: 설치 안 돼 있으면 그냥 None로
-try:
-    from google.cloud import vision
-except ImportError:
-    vision = None
-
+# Gemini
 try:
     import google.generativeai as genai
 except ImportError:
     genai = None
 
+# Google Vision OCR
+try:
+    from google.cloud import vision
+except ImportError:
+    vision = None
 
-# =========================
-# 환경 변수 / 기본 설정
-# =========================
+
+# ============================================================
+# 환경 변수
+# ============================================================
 STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+AWS_REGION = os.getenv("AWS_REGION")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
 GCV_ENABLED = os.getenv("GCV_ENABLED", "false").lower() == "true"
@@ -38,12 +39,53 @@ GCV_CREDENTIALS_JSON = os.getenv("GCV_CREDENTIALS_JSON")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# =========================
-# S3 클라이언트
-# =========================
-s3_client = None
-if not STUB_MODE and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME:
-    s3_client = boto3.client(
+
+# ============================================================
+# FastAPI 앱
+# ============================================================
+app = FastAPI(title="PetHealth+ API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# 루트 (/) — 앱 상태 확인용
+# ============================================================
+@app.get("/")
+async def root():
+    return {
+        "message": "PetHealth+ 서버 연결 성공 ✅",
+        "ocr": GCV_ENABLED,
+        "stubMode": STUB_MODE,
+    }
+
+
+# ============================================================
+# 헬스체크 (/health)
+# ============================================================
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc),
+        "stubMode": STUB_MODE
+    }
+
+
+# ============================================================
+# S3 Client
+# ============================================================
+def s3_client():
+    if STUB_MODE:
+        return None
+
+    return boto3.client(
         "s3",
         region_name=AWS_REGION,
         aws_access_key_id=AWS_ACCESS_KEY_ID,
@@ -51,305 +93,147 @@ if not STUB_MODE and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_N
         config=Config(signature_version="s3v4"),
     )
 
-# =========================
-# Google Vision 클라이언트
-# =========================
-vision_client = None
-if not STUB_MODE and GCV_ENABLED and GCV_CREDENTIALS_JSON and vision is not None:
-    # Render 환경변수에 JSON 문자열로 넣어둔 걸 임시파일로 저장
-    cred_path = "/tmp/gcv_credentials.json"
-    with open(cred_path, "w", encoding="utf-8") as f:
-        f.write(GCV_CREDENTIALS_JSON)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-    vision_client = vision.ImageAnnotatorClient()
 
-# =========================
-# Gemini 클라이언트
-# =========================
-gemini_model = None
-if not STUB_MODE and GEMINI_API_KEY and genai is not None:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+def upload_to_s3(file_bytes: bytes, filename: str):
+    if STUB_MODE:
+        return f"https://stub.s3/{filename}"
 
-
-# =========================
-# Pydantic 모델 (iOS와 맞춤)
-# =========================
-class MedicalItem(BaseModel):
-    id: str
-    name: str
-    price: Optional[int] = None
-
-
-class MedicalRecord(BaseModel):
-    id: str
-    petId: str
-    clinicName: str
-    visitDate: datetime
-    items: List[MedicalItem]
-    totalAmount: Optional[int] = None
-    imageUrl: Optional[str] = None
-    rawText: Optional[str] = None
-    summary: Optional[str] = None  # Gemini 요약 (옵션)
-
-
-class UploadedFileInfo(BaseModel):
-    id: str
-    kind: str            # "lab" / "certificate"
-    petId: Optional[str] = None
-    fileUrl: str
-    originalFilename: str
-    createdAt: datetime
-
-
-# =========================
-# FastAPI 앱 & CORS
-# =========================
-app = FastAPI(title="PetHealth+ API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 필요하면 나중에 도메인 제한
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# =========================
-# 유틸 함수
-# =========================
-def upload_to_s3(folder: str, filename: str, data: bytes, content_type: str) -> str:
-    """S3 업로드 후 presigned URL 반환 (STUB_MODE면 dummy URL)."""
-    if STUB_MODE or s3_client is None or not S3_BUCKET_NAME:
-        return f"https://example.com/{folder}/{filename}"
-
-    key = f"{folder}/{filename}"
-    s3_client.put_object(
+    client = s3_client()
+    client.put_object(
         Bucket=S3_BUCKET_NAME,
-        Key=key,
-        Body=data,
-        ContentType=content_type,
+        Key=filename,
+        Body=file_bytes,
+        ContentType="application/octet-stream"
     )
 
-    url = s3_client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": S3_BUCKET_NAME, "Key": key},
-        ExpiresIn=60 * 60 * 24 * 7,  # 7일
-    )
-    return url
+    return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
 
 
+# ============================================================
+# Google Vision OCR
+# ============================================================
 def run_vision_ocr(image_bytes: bytes) -> str:
-    """Google Vision OCR. 실패 시 빈 문자열 / STUB_MODE면 예시 텍스트."""
-    if STUB_MODE or vision_client is None:
-        return "토리동물병원\n진료 15,000원\n피부약 22,000원\n합계 37,000원"
+    if STUB_MODE or not GCV_ENABLED:
+        return "토리동물병원\n진료 15,000원\n피부약 22,000원"
 
-    try:
-        from google.cloud import vision as _vision
+    if not GCV_CREDENTIALS_JSON:
+        raise HTTPException(500, "Google OCR 자격증명이 설정되지 않음")
 
-        img = _vision.Image(content=image_bytes)
-        resp = vision_client.document_text_detection(image=img)
-        if resp.error.message:
-            print("GCV error:", resp.error.message)
-            return ""
-        if resp.full_text_annotation and resp.full_text_annotation.text:
-            return resp.full_text_annotation.text
-        if resp.text_annotations:
-            return "\n".join([a.description for a in resp.text_annotations])
-    except Exception as e:
-        print("GCV exception:", e)
+    client = vision.ImageAnnotatorClient()
+    img = vision.Image(content=image_bytes)
+    response = client.text_detection(image=img)
+    if not response.text_annotations:
         return ""
-    return ""
+    return response.text_annotations[0].description
 
 
-def gemini_summary(text: str) -> Optional[str]:
-    if STUB_MODE or not text.strip() or gemini_model is None:
-        return None
-    try:
-        prompt = (
-            "다음은 반려동물 병원 영수증 OCR 텍스트입니다. "
-            "병원명, 날짜, 주요 진료/처치, 비용 특징을 2~3줄로 한국어 요약해 주세요.\n\n"
-            f"{text}"
-        )
-        res = gemini_model.generate_content(prompt)
-        return (res.text or "").strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        return None
+# ============================================================
+# Gemini 분석
+# ============================================================
+def analyze_with_gemini(text: str) -> dict:
+    if STUB_MODE:
+        return {
+            "clinicName": "토리동물병원",
+            "items": [
+                {"name": "진료", "price": 15000},
+                {"name": "피부약", "price": 22000}
+            ],
+            "totalAmount": 37000
+        }
+
+    if not GEMINI_API_KEY or genai is None:
+        raise HTTPException(500, "Gemini API Key 미설정")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    prompt = f"""
+다음 텍스트는 동물병원 영수증입니다.
+병원명, 진료항목 이름, 금액, 총금액을 JSON으로 변환하세요.
+
+텍스트:
+{text}
+
+JSON 형식:
+{{
+  "clinicName": "",
+  "items": [
+    {{"name": "", "price": 0}}
+  ],
+  "totalAmount": 0
+}}
+"""
+
+    res = model.generate_content(prompt)
+    cleaned = res.text.replace("⁠  json", "").replace("  ⁠", "").strip()
+
+    import json
+    return json.loads(cleaned)
 
 
-def parse_receipt(text: str):
-    """
-    OCR 텍스트에서 병원명 / 합계 금액 정도만 간단히 파싱.
-    나중에 정교하게 바꿀 수 있음.
-    """
-    if not text:
-        now = datetime.now(timezone.utc)
-        items = [MedicalItem(id=str(uuid.uuid4()), name="진료", price=None)]
-        return "미확인 동물병원", now, items, None
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    clinic_name = lines[0] if lines else "미확인 동물병원"
-    visit_date = datetime.now(timezone.utc)
-
-    import re
-
-    amount_pattern = re.compile(r"([0-9][0-9,]{2,})\s*원")
-    candidates = []
-    for ln in lines:
-        for m in amount_pattern.finditer(ln):
-            try:
-                candidates.append(int(m.group(1).replace(",", "")))
-            except ValueError:
-                pass
-
-    total_amount = max(candidates) if candidates else None
-
-    items: List[MedicalItem] = []
-    if total_amount is not None:
-        items.append(
-            MedicalItem(
-                id=str(uuid.uuid4()),
-                name="진료/처치",
-                price=total_amount,
-            )
-        )
-    else:
-        items.append(MedicalItem(id=str(uuid.uuid4()), name="진료", price=None))
-
-    return clinic_name, visit_date, items, total_amount
-
-
-# =========================
-# 라우트 정의
-# =========================
-
-@app.get("/")
-async def root():
-    """브라우저에서 열면 보이는 기본 응답."""
-    return {
-        "message": "PetHealth+ 서버 연결 성공 ✅",
-        "ocr": bool(vision_client) or STUB_MODE,
-        "stubMode": STUB_MODE,
-    }
-
-
-@app.get("/health")
-async def health():
-    """헬스 체크 (iOS / Render)."""
-    return {
-        "status": "ok",
-        "time": datetime.now(timezone.utc).isoformat(),
-        "stubMode": STUB_MODE,
-    }
-
-
-@app.post("/api/receipt/analyze", response_model=MedicalRecord)
-async def analyze_receipt(
+# ============================================================
+# API 1: 영수증 이미지 OCR + 분석
+# ============================================================
+@app.post("/api/receipt/analyze")
+async def upload_receipt(
     petId: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile = File(...)
 ):
-    """
-    iOS: 영수증 이미지 업로드 → MedicalRecord 응답.
+    try:
+        raw = await file.read()
+        ext = file.filename.split(".")[-1].lower()
+        filename = f"receipts/{petId}/{uuid.uuid4()}.{ext}"
 
-    - URL: POST /api/receipt/analyze
-    - Form fields:
-        - petId: String
-        - file: image/jpeg or image/png
-    """
-    if file.content_type is None or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="이미지 파일이 아닙니다.")
+        # 업로드
+        s3_url = upload_to_s3(raw, filename)
 
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+        # OCR
+        ocr_text = run_vision_ocr(raw)
 
-    # 1) S3 업로드
-    ext = "jpg"
-    if file.filename and "." in file.filename:
-        ext = file.filename.rsplit(".", 1)[-1]
-    rec_id = str(uuid.uuid4())
-    filename = f"{rec_id}.{ext}"
+        # Gemini 분석
+        result = analyze_with_gemini(ocr_text)
 
-    image_url = upload_to_s3(
-        folder="receipts",
-        filename=filename,
-        data=data,
-        content_type=file.content_type or "image/jpeg",
-    )
+        return {
+            "petId": petId,
+            "s3Url": s3_url,
+            "ocrText": ocr_text,
+            "parsed": result
+        }
 
-    # 2) OCR
-    raw_text = run_vision_ocr(data)
-
-    # 3) 파싱
-    clinic_name, visit_date, items, total_amount = parse_receipt(raw_text)
-
-    # 4) Gemini 요약 (옵션)
-    summary = gemini_summary(raw_text)
-
-    return MedicalRecord(
-        id=rec_id,
-        petId=petId,
-        clinicName=clinic_name,
-        visitDate=visit_date,
-        items=items,
-        totalAmount=total_amount,
-        imageUrl=image_url,
-        rawText=raw_text or None,
-        summary=summary,
-    )
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
-@app.post("/api/lab/upload", response_model=UploadedFileInfo)
-async def upload_lab(
-    petId: Optional[str] = Form(None),
-    file: UploadFile = File(...),
+# ============================================================
+# API 2: PDF (검사결과·증명서) 업로드 + Gemini 분석
+# ============================================================
+@app.post("/api/pdf/analyze")
+async def upload_pdf(
+    petId: str = Form(...),
+    file: UploadFile = File(...)
 ):
-    """검사결과 PDF S3 업로드."""
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="PDF만 업로드 가능합니다.")
+    raw = await file.read()
+    ext = file.filename.split(".")[-1].lower()
 
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+    if ext not in ["pdf"]:
+        raise HTTPException(400, "PDF만 업로드 가능")
 
-    rec_id = str(uuid.uuid4())
-    filename = f"{rec_id}.pdf"
-    url = upload_to_s3("labs", filename, data, "application/pdf")
+    filename = f"pdf/{petId}/{uuid.uuid4()}.pdf"
+    s3_url = upload_to_s3(raw, filename)
 
-    return UploadedFileInfo(
-        id=rec_id,
-        kind="lab",
-        petId=petId,
-        fileUrl=url,
-        originalFilename=file.filename or filename,
-        createdAt=datetime.now(timezone.utc),
-    )
+    # Gemini PDF 분석
+    if STUB_MODE:
+        analysis = {"summary": "PDF 분석 결과 (stub)"}
+    else:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        analysis = model.generate_content(
+            "다음 PDF 검사를 해석해 요약해주세요.",
+            blob={"mime_type": "application/pdf", "data": raw}
+        ).text
 
-
-@app.post("/api/certificate/upload", response_model=UploadedFileInfo)
-async def upload_certificate(
-    petId: Optional[str] = Form(None),
-    file: UploadFile = File(...),
-):
-    """증명서 PDF S3 업로드."""
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="PDF만 업로드 가능합니다.")
-
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 파일입니다.")
-
-    rec_id = str(uuid.uuid4())
-    filename = f"{rec_id}.pdf"
-    url = upload_to_s3("certificates", filename, data, "application/pdf")
-
-    return UploadedFileInfo(
-        id=rec_id,
-        kind="certificate",
-        petId=petId,
-        fileUrl=url,
-        originalFilename=file.filename or filename,
-        createdAt=datetime.now(timezone.utc),
-    )
+    return {
+        "petId": petId,
+        "s3Url": s3_url,
+        "analysis": analysis
+    }
