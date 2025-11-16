@@ -1,90 +1,85 @@
 # main.py
 import os
 import uuid
+import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# S3
 import boto3
 from botocore.client import Config
 
-# Gemini
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+import google.generativeai as genai
 
-# Google Vision OCR
-try:
-    from google.cloud import vision
-except ImportError:
-    vision = None
-
-
-# ============================================================
+# ==============================
 # 환경 변수
-# ============================================================
+# ==============================
 STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_REGION")
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-
-GCV_ENABLED = os.getenv("GCV_ENABLED", "false").lower() == "true"
-GCV_CREDENTIALS_JSON = os.getenv("GCV_CREDENTIALS_JSON")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-# ============================================================
-# FastAPI 앱
-# ============================================================
-app = FastAPI(title="PetHealth+ API")
+
+# ==============================
+# FastAPI 앱 & CORS
+# ==============================
+app = FastAPI(title="PetHealth+ API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # 나중에 도메인 제한하고 싶으면 여기 수정
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ============================================================
-# 루트 (/) — 앱 상태 확인용
-# ============================================================
-@app.get("/")
-async def root():
-    return {
-        "message": "PetHealth+ 서버 연결 성공 ✅",
-        "ocr": GCV_ENABLED,
-        "stubMode": STUB_MODE,
-    }
+# ==============================
+# 공통 모델
+# ==============================
+class ReceiptItem(BaseModel):
+    name: str
+    price: Optional[int] = None
 
 
-# ============================================================
-# 헬스체크 (/health)
-# ============================================================
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "time": datetime.now(timezone.utc),
-        "stubMode": STUB_MODE
-    }
+class ReceiptParsed(BaseModel):
+    clinicName: Optional[str] = None
+    visitDate: Optional[str] = None  # ISO string or null
+    items: List[ReceiptItem] = []
+    totalAmount: Optional[int] = None
 
 
-# ============================================================
-# S3 Client
-# ============================================================
-def s3_client():
-    if STUB_MODE:
+class ReceiptResponse(BaseModel):
+    petId: str
+    s3Url: str
+    parsed: ReceiptParsed
+    notes: Optional[str] = None
+
+
+class FileAnalysisResponse(BaseModel):
+    petId: Optional[str] = None
+    kind: str                     # lab / certificate
+    s3Url: str
+    summary: str
+    recommendation: Optional[str] = None
+
+
+# ==============================
+# S3 유틸
+# ==============================
+def get_s3_client():
+    if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME):
         return None
-
     return boto3.client(
         "s3",
         region_name=AWS_REGION,
@@ -94,146 +89,264 @@ def s3_client():
     )
 
 
-def upload_to_s3(file_bytes: bytes, filename: str):
-    if STUB_MODE:
-        return f"https://stub.s3/{filename}"
+def upload_to_s3(folder: str, filename: str, data: bytes, content_type: str) -> str:
+    """
+    S3에 업로드하고, 접근 가능한 URL을 리턴.
+    STUB_MODE일 때는 실제 업로드 없이 예시 URL 리턴.
+    """
+    if STUB_MODE or not S3_BUCKET_NAME:
+        return f"https://example.com/{folder}/{filename}"
 
-    client = s3_client()
+    client = get_s3_client()
+    if client is None:
+        raise HTTPException(status_code=500, detail="S3 설정이 잘못되었습니다.")
+
+    key = f"{folder}/{filename}"
     client.put_object(
         Bucket=S3_BUCKET_NAME,
-        Key=filename,
-        Body=file_bytes,
-        ContentType="application/octet-stream"
+        Key=key,
+        Body=data,
+        ContentType=content_type,
     )
 
-    return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+    return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
 
-# ============================================================
-# Google Vision OCR
-# ============================================================
-def run_vision_ocr(image_bytes: bytes) -> str:
-    if STUB_MODE or not GCV_ENABLED:
-        return "토리동물병원\n진료 15,000원\n피부약 22,000원"
-
-    if not GCV_CREDENTIALS_JSON:
-        raise HTTPException(500, "Google OCR 자격증명이 설정되지 않음")
-
-    client = vision.ImageAnnotatorClient()
-    img = vision.Image(content=image_bytes)
-    response = client.text_detection(image=img)
-    if not response.text_annotations:
-        return ""
-    return response.text_annotations[0].description
+# ==============================
+# Gemini 유틸
+# ==============================
+def _clean_json_text(text: str) -> str:
+    """
+    ⁠ json ...  ⁠ 같은 코드블록을 제거하고 순수 JSON만 남긴다.
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("⁠  "):
+        cleaned = cleaned.split("  ⁠", 2)[1]  # 첫 번째 블럭 내용
+    cleaned = cleaned.replace("⁠  json", "").replace("  ⁠", "")
+    return cleaned.strip()
 
 
-# ============================================================
-# Gemini 분석
-# ============================================================
-def analyze_with_gemini(text: str) -> dict:
-    if STUB_MODE:
-        return {
-            "clinicName": "토리동물병원",
-            "items": [
-                {"name": "진료", "price": 15000},
-                {"name": "피부약", "price": 22000}
-            ],
-            "totalAmount": 37000
-        }
+def analyze_receipt_with_gemini(image_bytes: bytes, mime_type: str) -> Dict[str, Any]:
+    """
+    영수증 이미지를 Gemini로 분석해서 구조화된 JSON을 돌려받는다.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Gemini API Key가 설정되지 않았습니다.")
 
-    if not GEMINI_API_KEY or genai is None:
-        raise HTTPException(500, "Gemini API Key 미설정")
-
-    genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
 
-    prompt = f"""
-다음 텍스트는 동물병원 영수증입니다.
-병원명, 진료항목 이름, 금액, 총금액을 JSON으로 변환하세요.
+    prompt = """
+당신은 동물병원 영수증을 분석하는 어시스턴트입니다.
+이미지를 보고 다음 정보를 JSON 형식으로 반환하세요.
 
-텍스트:
-{text}
+필수 규칙:
+•⁠  ⁠JSON 이외의 텍스트는 절대 추가하지 마세요.
+•⁠  ⁠금액은 '원' 등을 제거한 정수 숫자로만 적으세요.
+•⁠  ⁠날짜가 명확하지 않으면 null 로 설정하세요.
 
-JSON 형식:
-{{
-  "clinicName": "",
+필수 필드:
+{
+  "clinicName": "병원 이름 (모르면 null)",
+  "visitDate": "YYYY-MM-DD 형식 또는 null",
   "items": [
-    {{"name": "", "price": 0}}
+    { "name": "항목명", "price": 15000 }
   ],
-  "totalAmount": 0
+  "totalAmount": 37000
+}
+"""
+
+    result = model.generate_content(
+        [
+            prompt,
+            {"mime_type": mime_type, "data": image_bytes},
+        ]
+    )
+
+    cleaned = _clean_json_text(result.text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # 파싱 실패 시 대충 fallback
+        return {
+            "clinicName": None,
+            "visitDate": None,
+            "items": [],
+            "totalAmount": None,
+        }
+
+
+def analyze_pdf_with_gemini(pdf_bytes: bytes, kind: str) -> Dict[str, str]:
+    """
+    검사결과/증명서 PDF를 Gemini로 요약.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="Gemini API Key가 설정되지 않았습니다.")
+
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    role = "수의학 검사결과" if kind == "lab" else "동물 관련 증명서(예: 예방접종 증명서 등)"
+
+    prompt = f"""
+다음 PDF는 반려동물의 {role} 입니다.
+보호자가 이해하기 쉽게 핵심 내용을 요약해 주세요.
+
+1) '한줄 요약' (한두 문장)
+2) '검사/내용 핵심 포인트'
+3) '보호자가 앞으로 어떻게 관리하면 좋은지' 간단한 행동 가이드
+
+응답은 아래 JSON 형식으로만 해주세요.
+
+{{
+  "summary": "핵심 요약 한두 문장",
+  "recommendation": "보호자 행동 가이드"
 }}
 """
 
-    res = model.generate_content(prompt)
-    cleaned = res.text.replace("⁠  json", "").replace("  ⁠", "").strip()
+    result = model.generate_content(
+        [
+            prompt,
+            {"mime_type": "application/pdf", "data": pdf_bytes},
+        ]
+    )
 
-    import json
-    return json.loads(cleaned)
-
-
-# ============================================================
-# API 1: 영수증 이미지 OCR + 분석
-# ============================================================
-@app.post("/api/receipt/analyze")
-async def upload_receipt(
-    petId: str = Form(...),
-    file: UploadFile = File(...)
-):
+    cleaned = _clean_json_text(result.text)
     try:
-        raw = await file.read()
-        ext = file.filename.split(".")[-1].lower()
-        filename = f"receipts/{petId}/{uuid.uuid4()}.{ext}"
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        data = {
+            "summary": "PDF 내용을 요약하는 데 실패했습니다.",
+            "recommendation": "수의사와 상의하여 해석을 받는 것이 좋습니다.",
+        }
+    return data
 
-        # 업로드
-        s3_url = upload_to_s3(raw, filename)
 
-        # OCR
-        ocr_text = run_vision_ocr(raw)
+# ==============================
+# STUB 헬퍼
+# ==============================
+def stub_receipt_parsed() -> Dict[str, Any]:
+    return {
+        "clinicName": "토리동물병원",
+        "visitDate": datetime.now().date().isoformat(),
+        "items": [
+            {"name": "진료", "price": 15000},
+            {"name": "피부약", "price": 22000},
+        ],
+        "totalAmount": 37000,
+    }
 
-        # Gemini 분석
-        result = analyze_with_gemini(ocr_text)
 
+def stub_file_summary(kind: str) -> Dict[str, str]:
+    if kind == "lab":
         return {
-            "petId": petId,
-            "s3Url": s3_url,
-            "ocrText": ocr_text,
-            "parsed": result
+            "summary": "혈액 검사 결과 전반적으로 양호하나, 간 수치가 약간 높게 나왔습니다.",
+            "recommendation": "기름진 간식을 줄이고 1~2개월 후 재검사를 권장합니다.",
+        }
+    else:
+        return {
+            "summary": "예방접종이 일정에 맞게 잘 완료되었음을 확인했습니다.",
+            "recommendation": "다음 접종 일정에 맞춰 병원을 방문해 주세요.",
         }
 
-    except Exception as e:
-        raise HTTPException(500, str(e))
 
-
-# ============================================================
-# API 2: PDF (검사결과·증명서) 업로드 + Gemini 분석
-# ============================================================
-@app.post("/api/pdf/analyze")
-async def upload_pdf(
-    petId: str = Form(...),
-    file: UploadFile = File(...)
-):
-    raw = await file.read()
-    ext = file.filename.split(".")[-1].lower()
-
-    if ext not in ["pdf"]:
-        raise HTTPException(400, "PDF만 업로드 가능")
-
-    filename = f"pdf/{petId}/{uuid.uuid4()}.pdf"
-    s3_url = upload_to_s3(raw, filename)
-
-    # Gemini PDF 분석
-    if STUB_MODE:
-        analysis = {"summary": "PDF 분석 결과 (stub)"}
-    else:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        analysis = model.generate_content(
-            "다음 PDF 검사를 해석해 요약해주세요.",
-            blob={"mime_type": "application/pdf", "data": raw}
-        ).text
-
+# ==============================
+# 기본 라우트
+# ==============================
+@app.get("/")
+async def root():
     return {
-        "petId": petId,
-        "s3Url": s3_url,
-        "analysis": analysis
+        "message": "PetHealth+ 서버 연결 성공 ✅",
+        "stubMode": STUB_MODE,
+        "usesGemini": bool(GEMINI_API_KEY),
     }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc),
+        "stubMode": STUB_MODE,
+    }
+
+
+# ==============================
+# 1) 영수증 이미지 분석
+# ==============================
+@app.post("/api/receipt/analyze", response_model=ReceiptResponse)
+async def upload_receipt(
+    petId: str = Form(...),
+    file: UploadFile = File(...),
+):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="이미지 파일이 아닙니다.")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+
+    # 파일 이름 & 확장자
+    ext = "jpg"
+    if file.filename and "." in file.filename:
+        ext = file.filename.rsplit(".", 1)[-1].lower()
+
+    key = f"{uuid.uuid4()}.{ext}"
+    s3_url = upload_to_s3("receipts", key, data, file.content_type)
+
+    # 분석
+    if STUB_MODE:
+        parsed_dict = stub_receipt_parsed()
+        notes = "STUB_MODE: 실제 OCR/AI 대신 예시 데이터가 반환되었습니다."
+    else:
+        parsed_dict = analyze_receipt_with_gemini(data, file.content_type)
+        notes = "Gemini로 영수증 내용을 분석했습니다."
+
+    parsed = ReceiptParsed(
+        clinicName=parsed_dict.get("clinicName"),
+        visitDate=parsed_dict.get("visitDate"),
+        items=[ReceiptItem(**it) for it in parsed_dict.get("items", [])],
+        totalAmount=parsed_dict.get("totalAmount"),
+    )
+
+    return ReceiptResponse(
+        petId=petId,
+        s3Url=s3_url,
+        parsed=parsed,
+        notes=notes,
+    )
+
+
+# ==============================
+# 2) 검사결과/증명서 PDF 분석
+# ==============================
+@app.post("/api/file/analyze", response_model=FileAnalysisResponse)
+async def upload_pdf(
+    kind: str = Form(...),        # "lab" or "certificate"
+    petId: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+):
+    kind = kind.lower()
+    if kind not in ("lab", "certificate"):
+        raise HTTPException(status_code=400, detail="kind는 'lab' 또는 'certificate' 여야 합니다.")
+
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+
+    key = f"{uuid.uuid4()}.pdf"
+    s3_url = upload_to_s3(f"{kind}s", key, data, "application/pdf")
+
+    if STUB_MODE:
+        analysis = stub_file_summary(kind)
+    else:
+        analysis = analyze_pdf_with_gemini(data, kind)
+
+    return FileAnalysisResponse(
+        petId=petId,
+        kind=kind,
+        s3Url=s3_url,
+        summary=analysis.get("summary", ""),
+        recommendation=analysis.get("recommendation"),
+    )
