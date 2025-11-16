@@ -1,5 +1,4 @@
 # main.py
-import io
 import os
 import uuid
 from typing import Optional, List
@@ -10,7 +9,6 @@ from pydantic import BaseModel
 
 import boto3
 from botocore.client import Config
-from PIL import Image
 
 # =========================
 # 설정 값 / 상수
@@ -18,17 +16,17 @@ from PIL import Image
 
 MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15MB 제한
 
-AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")          # 필수: S3 버킷명
+AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")          # 필수: S3 버킷명 (없어도 동작은 함)
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 AWS_S3_ENDPOINT_URL = os.getenv("AWS_S3_ENDPOINT_URL")  # 선택: 커스텀 엔드포인트
 AWS_S3_PUBLIC_BASE_URL = os.getenv("AWS_S3_PUBLIC_BASE_URL")  # 선택: CloudFront 등
 
-# 구글 OCR / Gemini 나중에 붙일 때 사용할 환경변수 (지금은 안 씀)
+# 나중에 구글 OCR / Gemini 붙일 때 쓸 환경변수 (지금은 안 씀)
 GCV_ENABLED = os.getenv("GCV_ENABLED", "false").lower() == "true"
 GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "false").lower() == "true"
 
 # =========================
-# S3 클라이언트 준비
+# S3 클라이언트 (지금은 사용 안 해도 됨)
 # =========================
 
 s3_client = None
@@ -40,6 +38,7 @@ if AWS_S3_BUCKET:
         config=Config(signature_version="s3v4"),
         endpoint_url=AWS_S3_ENDPOINT_URL or None,
     )
+
 
 def build_public_url(key: str) -> str:
     """
@@ -57,7 +56,8 @@ def build_public_url(key: str) -> str:
 def upload_image_to_s3(file_bytes: bytes, filename: str) -> str:
     """
     이미지를 S3에 업로드하고, 접근 URL을 돌려준다.
-    S3가 설정 안 돼 있으면 예외를 던진다.
+    지금 STUB 버전에서는 사용하지 않지만,
+    나중에 실제 업로드 붙일 때를 위해 남겨둠.
     """
     if not s3_client or not AWS_S3_BUCKET:
         raise RuntimeError("S3가 설정되어 있지 않습니다. AWS_S3_BUCKET 환경변수를 확인하세요.")
@@ -74,18 +74,20 @@ def upload_image_to_s3(file_bytes: bytes, filename: str) -> str:
         Key=key,
         Body=file_bytes,
         ContentType=f"image/{ext}",
-        ACL="private",  # 필요에 따라 public-read 등으로 변경 가능
+        ACL="private",  # 필요시 public-read 등으로 변경
     )
 
     return build_public_url(key)
 
+
 # =========================
-# Pydantic 응답 모델 정의
+# Pydantic 모델
 # =========================
 
 class ReceiptItem(BaseModel):
     name: str
     price: Optional[int] = None
+
 
 class ReceiptParsed(BaseModel):
     clinicName: Optional[str] = None
@@ -95,30 +97,33 @@ class ReceiptParsed(BaseModel):
     items: List[ReceiptItem] = []
     totalAmount: Optional[int] = None
 
+
 class ReceiptAnalyzeResponse(BaseModel):
     petId: str
     s3Url: str
     parsed: ReceiptParsed
     notes: Optional[str] = None
 
+
 # =========================
-# FastAPI 앱 생성
+# FastAPI 앱
 # =========================
 
 app = FastAPI(
     title="PetHealth+ Backend",
     description="반려동물 영수증 분석 / 기록 저장용 API (Stub 버전)",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 # CORS 설정 (iOS / 로컬 개발 허용)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 필요하면 도메인 제한 가능
+    allow_origins=["*"],   # 나중에 도메인 제한 가능
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================
 # 헬스체크 / 루트
@@ -128,17 +133,19 @@ app.add_middleware(
 async def health():
     return {"status": "ok"}
 
+
 @app.get("/")
 async def root():
     return {
         "message": "PetHealth+ 서버 연결 성공 ✅",
-        "ocr": False,              # 나중에 구글 OCR 붙이면 True 로 변경
-        "gemini": False,           # 나중에 Gemini 붙이면 True 로 변경
+        "ocr": False,              # 나중에 구글 OCR 붙이면 True
+        "gemini": False,           # 나중에 Gemini 붙이면 True
         "s3": bool(AWS_S3_BUCKET), # S3 설정 여부
     }
 
+
 # =========================
-# 영수증 분석 엔드포인트 (Stub)
+# 영수증 분석 엔드포인트 (완전 STUB 버전)
 # =========================
 
 @app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponse)
@@ -147,19 +154,20 @@ async def analyze_receipt(
     file: UploadFile = File(...),
 ):
     """
-    ⚠️ 완전 STUB 버전
-    - 파일은 그냥 길이만 체크하고
-    - S3 / Pillow / OCR 아무 것도 안 쓰고
-    - 무조건 더미 데이터로 200 OK 응답만 보냄
+    iOS에서 업로드한 영수증 이미지를 받아서:
+    - 파일이 비어있는지만 확인하고
+    - S3 / OCR / Gemini 아무 것도 안 쓰고
+    - 무조건 더미 진료기록을 응답으로 내려주는 STUB 버전
     """
 
     # 1) 파일 읽기
     raw = await file.read()
     if len(raw) == 0:
-        # 이건 400으로 돌려보내는 정상 에러 (앱에서 "빈 파일입니다" 같은 메시지 나옴)
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="이미지 용량이 너무 큽니다. (15MB 이하)")
 
-    # 2) STUB 파싱 결과 (그냥 예시 데이터)
+    # 2) STUB 파싱 결과 (테스트용 더미 데이터)
     parsed = ReceiptParsed(
         clinicName="테스트동물병원",
         visitDate="2025-11-17",
@@ -172,12 +180,12 @@ async def analyze_receipt(
         totalAmount=35000,
     )
 
-    # 3) S3 URL 도 그냥 가짜값
+    # 3) S3 URL 도 일단 가짜 값
     dummy_url = f"https://dummy-s3.pethealthplus/{petId}/{file.filename}"
 
     return ReceiptAnalyzeResponse(
         petId=petId,
         s3Url=dummy_url,
         parsed=parsed,
-        notes="이 응답은 S3/OCR 없이 STUB 로 생성된 데이터입니다."
+        notes="이 응답은 S3/OCR 없이 STUB 로 생성된 데이터입니다.",
     )
