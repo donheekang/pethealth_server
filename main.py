@@ -45,7 +45,7 @@ app.add_middleware(
 
 
 # ==============================
-# 공통 모델
+# 공통 모델 (iOS에서 그대로 받기 좋게)
 # ==============================
 class ReceiptItem(BaseModel):
     name: str
@@ -54,7 +54,9 @@ class ReceiptItem(BaseModel):
 
 class ReceiptParsed(BaseModel):
     clinicName: Optional[str] = None
-    visitDate: Optional[str] = None  # ISO string or null
+    visitDate: Optional[str] = None      # "YYYY-MM-DD" 또는 null
+    diseaseName: Optional[str] = None
+    symptomsSummary: Optional[str] = None
     items: List[ReceiptItem] = []
     totalAmount: Optional[int] = None
 
@@ -63,12 +65,12 @@ class ReceiptResponse(BaseModel):
     petId: str
     s3Url: str
     parsed: ReceiptParsed
-    notes: Optional[str] = None
+    notes: Optional[str] = None          # STUB / 분석 설명
 
 
 class FileAnalysisResponse(BaseModel):
     petId: Optional[str] = None
-    kind: str                     # lab / certificate
+    kind: str                            # "lab" / "certificate"
     s3Url: str
     summary: str
     recommendation: Optional[str] = None
@@ -121,7 +123,9 @@ def _clean_json_text(text: str) -> str:
     """
     cleaned = text.strip()
     if cleaned.startswith("⁠  "):
-        cleaned = cleaned.split("  ⁠", 2)[1]  # 첫 번째 블럭 내용
+        parts = cleaned.split("  ⁠")
+        if len(parts) >= 2:
+            cleaned = parts[1]
     cleaned = cleaned.replace("⁠  json", "").replace("  ⁠", "")
     return cleaned.strip()
 
@@ -129,6 +133,7 @@ def _clean_json_text(text: str) -> str:
 def analyze_receipt_with_gemini(image_bytes: bytes, mime_type: str) -> Dict[str, Any]:
     """
     영수증 이미지를 Gemini로 분석해서 구조화된 JSON을 돌려받는다.
+    clinicName / visitDate / diseaseName / symptomsSummary / items[] / totalAmount
     """
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="Gemini API Key가 설정되지 않았습니다.")
@@ -137,17 +142,25 @@ def analyze_receipt_with_gemini(image_bytes: bytes, mime_type: str) -> Dict[str,
 
     prompt = """
 당신은 동물병원 영수증을 분석하는 어시스턴트입니다.
-이미지를 보고 다음 정보를 JSON 형식으로 반환하세요.
+이미지를 보고 아래 정보를 한국어로 JSON 형식으로만 반환하세요.
 
-필수 규칙:
-•⁠  ⁠JSON 이외의 텍스트는 절대 추가하지 마세요.
-•⁠  ⁠금액은 '원' 등을 제거한 정수 숫자로만 적으세요.
-•⁠  ⁠날짜가 명확하지 않으면 null 로 설정하세요.
+목표:
+•⁠  ⁠보호자가 "어떤 병 때문에, 어떤 치료를 받고, 얼마 썼는지" 한눈에 볼 수 있도록 정리합니다.
 
-필수 필드:
+규칙:
+•⁠  ⁠JSON 이외의 텍스트는 절대 쓰지 마세요.
+•⁠  ⁠금액은 '원' 같은 단위를 제거한 정수 숫자로만 적으세요.
+•⁠  ⁠날짜가 영수증에 보이면 YYYY-MM-DD 형식으로 적고, 없으면 null 로 적으세요.
+•⁠  ⁠질병명이 명확하면 질병명을 쓰고, 애매하면 "기타 피부질환", "위장관 질환 추정"과 같이 카테고리 수준으로 적어도 됩니다.
+•⁠  ⁠증상 요약은 1~2문장으로, 보호자가 이해하기 쉽게 적으세요.
+
+반환 JSON 스키마는 다음과 같습니다:
+
 {
   "clinicName": "병원 이름 (모르면 null)",
-  "visitDate": "YYYY-MM-DD 형식 또는 null",
+  "visitDate": "YYYY-MM-DD 또는 null",
+  "diseaseName": "주된 질환/진료 카테고리 (예: 피부염, 위장염, 관절질환 등) 또는 null",
+  "symptomsSummary": "증상/내원 사유 요약 (한두 문장)",
   "items": [
     { "name": "항목명", "price": 15000 }
   ],
@@ -166,10 +179,12 @@ def analyze_receipt_with_gemini(image_bytes: bytes, mime_type: str) -> Dict[str,
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # 파싱 실패 시 대충 fallback
+        # 파싱 실패 시 최소 구조 반환
         return {
             "clinicName": None,
             "visitDate": None,
+            "diseaseName": None,
+            "symptomsSummary": None,
             "items": [],
             "totalAmount": None,
         }
@@ -221,14 +236,17 @@ def analyze_pdf_with_gemini(pdf_bytes: bytes, kind: str) -> Dict[str, str]:
 
 
 # ==============================
-# STUB 헬퍼
+# STUB 헬퍼 (개발/테스트용)
 # ==============================
 def stub_receipt_parsed() -> Dict[str, Any]:
+    today = datetime.now().date().isoformat()
     return {
         "clinicName": "토리동물병원",
-        "visitDate": datetime.now().date().isoformat(),
+        "visitDate": today,
+        "diseaseName": "피부염",
+        "symptomsSummary": "가려움과 피부 발진으로 내원한 기록입니다.",
         "items": [
-            {"name": "진료", "price": 15000},
+            {"name": "진찰료", "price": 15000},
             {"name": "피부약", "price": 22000},
         ],
         "totalAmount": 37000,
@@ -295,7 +313,7 @@ async def upload_receipt(
     # 분석
     if STUB_MODE:
         parsed_dict = stub_receipt_parsed()
-        notes = "STUB_MODE: 실제 OCR/AI 대신 예시 데이터가 반환되었습니다."
+        notes = "STUB_MODE: 실제 Gemini 대신 예시 데이터가 반환되었습니다."
     else:
         parsed_dict = analyze_receipt_with_gemini(data, file.content_type)
         notes = "Gemini로 영수증 내용을 분석했습니다."
@@ -303,6 +321,8 @@ async def upload_receipt(
     parsed = ReceiptParsed(
         clinicName=parsed_dict.get("clinicName"),
         visitDate=parsed_dict.get("visitDate"),
+        diseaseName=parsed_dict.get("diseaseName"),
+        symptomsSummary=parsed_dict.get("symptomsSummary"),
         items=[ReceiptItem(**it) for it in parsed_dict.get("items", [])],
         totalAmount=parsed_dict.get("totalAmount"),
     )
