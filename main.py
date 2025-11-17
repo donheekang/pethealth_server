@@ -28,7 +28,7 @@ AWS_S3_ENDPOINT_URL = os.getenv("AWS_S3_ENDPOINT_URL")
 AWS_S3_PUBLIC_BASE_URL = os.getenv("AWS_S3_PUBLIC_BASE_URL")
 
 # Google Vision / Gemini
-GCV_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+GCV_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # 사용할 Gemini 모델 (콘솔에 나온 것 기준)
@@ -118,12 +118,12 @@ def run_google_ocr(image_bytes: bytes) -> str:
     Google Cloud Vision OCR로 영수증 텍스트 추출
     """
     if not GCV_CREDENTIALS_JSON:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON 환경변수가 설정되지 않았습니다.")
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 설정되지 않았습니다.")
 
     try:
         creds_dict = json.loads(GCV_CREDENTIALS_JSON)
     except json.JSONDecodeError:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON 값이 올바른 JSON 형식이 아닙니다.")
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS 값이 올바른 JSON 형식이 아닙니다.")
 
     client = vision.ImageAnnotatorClient.from_service_account_info(creds_dict)
 
