@@ -1,12 +1,8 @@
-# ================================
-# PetHealth+ Backend (AI + S3)
-# ================================
-
 import io
 import os
 import json
 import uuid
-from typing import Optional, List
+from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,13 +12,13 @@ import boto3
 from botocore.client import Config
 from PIL import Image
 
-# Gemini AI
 import google.generativeai as genai
 
+# ============================================================
+# 환경변수
+# ============================================================
 
-# =========================
-# 환경변수 / 설정
-# =========================
+MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15MB 제한
 
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
@@ -31,21 +27,24 @@ AWS_S3_PUBLIC_BASE_URL = os.getenv("AWS_S3_PUBLIC_BASE_URL")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15MB 제한
+# Gemini 활성화 여부 → API KEY 있으면 자동 활성
+GEMINI_ENABLED = bool(GEMINI_API_KEY)
 
+if GEMINI_ENABLED:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-# =========================
+# ============================================================
 # S3 클라이언트
-# =========================
+# ============================================================
 
-s3 = None
+s3_client = None
 if AWS_S3_BUCKET:
     session = boto3.session.Session()
-    s3 = session.client(
+    s3_client = session.client(
         "s3",
         region_name=AWS_REGION,
-        config=Config(signature_version="s3v4"),
         endpoint_url=AWS_S3_ENDPOINT_URL or None,
+        config=Config(signature_version="s3v4"),
     )
 
 
@@ -57,13 +56,17 @@ def build_public_url(key: str) -> str:
     return f"https://{AWS_S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
 
 
-def upload_to_s3(file_bytes: bytes, ext: str) -> str:
-    if not s3 or not AWS_S3_BUCKET:
-        raise RuntimeError("S3가 올바르게 설정되지 않았습니다.")
+def upload_image_to_s3(file_bytes: bytes, filename: str) -> str:
+    if not s3_client or not AWS_S3_BUCKET:
+        raise RuntimeError("S3 설정이 없습니다. AWS_S3_BUCKET 확인.")
+
+    ext = "jpg"
+    if "." in filename:
+        ext = filename.rsplit(".", 1)[1].lower()
 
     key = f"receipts/{uuid.uuid4().hex}.{ext}"
 
-    s3.put_object(
+    s3_client.put_object(
         Bucket=AWS_S3_BUCKET,
         Key=key,
         Body=file_bytes,
@@ -73,39 +76,66 @@ def upload_to_s3(file_bytes: bytes, ext: str) -> str:
 
     return build_public_url(key)
 
+# ============================================================
+# Gemini JSON Safe Parser
+# ============================================================
 
-# =========================
-# Pydantic DTO
-# =========================
+def safe_parse_gemini_json(text: str) -> dict:
+    """
+    Gemini 결과에서 JSON만 추출해 dict로 반환.
+    """
+    text = text.strip()
+
+    # 1) 그대로 JSON 시도
+    try:
+        return json.loads(text)
+    except:
+        pass
+
+    # 2) { ... } 범위만 잘라서 재시도
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        chunk = text[start:end+1]
+        try:
+            return json.loads(chunk)
+        except:
+            pass
+
+    raise ValueError("Gemini가 JSON 형식이 아닌 응답을 반환했습니다.")
+
+
+# ============================================================
+# Pydantic Models
+# ============================================================
 
 class ReceiptItem(BaseModel):
     name: str
-    price: Optional[int] = None
+    price: int | None = None
 
 
 class ReceiptParsed(BaseModel):
-    clinicName: Optional[str] = None
-    visitDate: Optional[str] = None
-    diseaseName: Optional[str] = None
-    symptomsSummary: Optional[str] = None
-    items: List[ReceiptItem] = []
-    totalAmount: Optional[int] = None
+    clinicName: str | None = None
+    visitDate: str | None = None
+    diseaseName: str | None = None
+    symptomsSummary: str | None = None
+    items: list[ReceiptItem] = []
+    totalAmount: int | None = None
 
 
 class ReceiptAnalyzeResponse(BaseModel):
     petId: str
     s3Url: str
     parsed: ReceiptParsed
-    notes: Optional[str] = None
+    notes: str | None = None
 
-
-# =========================
-# FastAPI 앱
-# =========================
+# ============================================================
+# FastAPI 설정
+# ============================================================
 
 app = FastAPI(
     title="PetHealth+ Backend",
-    description="반려동물 영수증 분석 / 저장 API",
+    description="영수증 분석 / S3 업로드 / Gemini AI",
     version="1.0.0",
 )
 
@@ -116,13 +146,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
+# 기본 라우트
+# ============================================================
 
 @app.get("/")
 async def root():
     return {
-        "message": "PetHealth+ 서버 연결 성공",
+        "message": "PetHealth+ 서버 정상 작동중",
+        "gemini": GEMINI_ENABLED,
         "s3": bool(AWS_S3_BUCKET),
-        "gemini": bool(GEMINI_API_KEY),
     }
 
 
@@ -130,26 +163,23 @@ async def root():
 async def health():
     return {"status": "ok"}
 
-
-# =========================
+# ============================================================
 # 영수증 분석 API
-# =========================
+# ============================================================
 
 @app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponse)
 async def analyze_receipt(
     petId: str = Form(...),
     file: UploadFile = File(...),
 ):
-    # 1) 파일 읽기
+    # -------- 1) 파일 로드
     raw = await file.read()
-
-    if not raw:
-        raise HTTPException(400, detail="빈 파일입니다.")
-
+    if len(raw) == 0:
+        raise HTTPException(400, "빈 파일입니다.")
     if len(raw) > MAX_IMAGE_BYTES:
-        raise HTTPException(400, detail="이미지 용량 초과 (15MB 이하만 가능).")
+        raise HTTPException(400, "파일 용량이 너무 큽니다. (15MB 이하)")
 
-    # 2) 이미지 → JPEG 변환 시도
+    # 이미지 → JPEG 정규화
     try:
         img = Image.open(io.BytesIO(raw))
         img = img.convert("RGB")
@@ -157,67 +187,84 @@ async def analyze_receipt(
         img.save(buf, format="JPEG", quality=90)
         buf.seek(0)
         image_bytes = buf.read()
-        ext = "jpg"
     except:
-        # 이미지 아닐 경우 원본 업로드
         image_bytes = raw
-        ext = file.filename.split(".")[-1].lower()
 
-    # 3) S3 업로드
+    # -------- 2) S3 업로드
     try:
-        s3_url = upload_to_s3(image_bytes, ext)
+        s3_url = upload_image_to_s3(image_bytes, file.filename)
     except Exception as e:
         print("S3 업로드 실패:", e)
-        s3_url = f"https://dummy-s3.pethealthplus/{petId}/{file.filename}"
+        s3_url = f"https://dummy-s3.pethealthplus/{uuid.uuid4().hex}.jpg"
 
-    # 4) Gemini AI 분석
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, detail="Gemini API Key 미설정")
+    # -------- 3) Gemini 분석
+    ai_data = None
+    note_msg = ""
 
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-2.5-flash")
+    if GEMINI_ENABLED:
+        try:
+            model = genai.GenerativeModel("gemini-2.5-flash")
 
-        prompt = """
-        너는 동물병원 영수증 분석 전문가야.
-        아래 영수증 사진에서 다음 JSON 형태로만 출력해줘.
+            prompt = """
+반려동물 병원 영수증을 분석해서 아래 JSON 형식으로만 답하라.
+문장 설명 없이 반드시 JSON만 출력하라.
 
-        {
-            "clinicName": "",
-            "visitDate": "",
+{
+  "clinicName": "",
+  "visitDate": "YYYY-MM-DD",
+  "diseaseName": "",
+  "symptomsSummary": "",
+  "items": [
+      {"name": "", "price": 0}
+  ],
+  "totalAmount": 0
+}
+"""
+
+            response = model.generate_content(
+                [prompt, image_bytes],
+                safety_settings=None,
+            )
+
+            ai_text = (response.text or "").strip()
+            print("=== Gemini RAW ===")
+            print(ai_text[:500])
+
+            ai_data = safe_parse_gemini_json(ai_text)
+            note_msg = "AI 분석 성공"
+
+        except Exception as e:
+            print("Gemini 분석 오류:", e)
+            ai_data = None
+            note_msg = f"AI 분석 실패 → STUB 적용 ({e})"
+
+    # -------- 4) AI 실패 시 STUB 기본값
+    if ai_data is None:
+        ai_data = {
+            "clinicName": "테스트동물병원",
+            "visitDate": datetime.now().strftime("%Y-%m-%d"),
+            "diseaseName": "피부염",
+            "symptomsSummary": "가려움, 발진",
             "items": [
-                { "name": "", "price": 0 }
+                {"name": "진료비", "price": 20000},
+                {"name": "약품비", "price": 15000},
             ],
-            "totalAmount": 0
+            "totalAmount": 35000,
         }
 
-        JSON 외의 텍스트는 절대 넣지 마.
-        """
-
-        response = model.generate_content(
-            [prompt, image_bytes],
-            safety_settings=None,
-        )
-
-        ai_text = response.text.strip()
-
-        data = json.loads(ai_text)
-
-    except Exception as e:
-        print("Gemini 오류:", e)
-        raise HTTPException(500, detail="AI 분석 실패. JSON 파싱 오류 또는 모델 문제.")
-
-    # 5) 최종 응답 구성
+    # -------- 5) 모델 변환
     parsed = ReceiptParsed(
-        clinicName=data.get("clinicName"),
-        visitDate=data.get("visitDate"),
-        items=data.get("items", []),
-        totalAmount=data.get("totalAmount"),
+        clinicName=ai_data.get("clinicName"),
+        visitDate=ai_data.get("visitDate"),
+        diseaseName=ai_data.get("diseaseName"),
+        symptomsSummary=ai_data.get("symptomsSummary"),
+        items=[ReceiptItem(**item) for item in ai_data.get("items", [])],
+        totalAmount=ai_data.get("totalAmount"),
     )
 
     return ReceiptAnalyzeResponse(
         petId=petId,
         s3Url=s3_url,
         parsed=parsed,
-        notes="AI 분석 완료",
+        notes=note_msg,
     )
