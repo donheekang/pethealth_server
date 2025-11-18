@@ -1,265 +1,234 @@
-# main.py
 import os
-import io
 import uuid
-from datetime import datetime, timezone
-from typing import List, Optional, Dict
-
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Form,
-    HTTPException
-)
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+import datetime
+import logging
+from typing import List, Optional
 
 import boto3
-from botocore.client import Config
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# ------------------------------------------------------
-# 환경 스위치
-# ------------------------------------------------------
-STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
-MAX_IMAGE_BYTES = 15 * 1024 * 1024
+# =========================
+# 기본 로거 설정
+# =========================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(_name_)
 
-# ------------------------------------------------------
-# S3 설정
-# ------------------------------------------------------
-AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")
-S3_PUBLIC_BASE = os.getenv("S3_PUBLIC_BASE")  # 예: https://my-bucket.s3.ap-northeast-2.amazonaws.com
+# =========================
+# AWS S3 설정
+# =========================
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
+AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "")
 
-s3_client = None
-if not STUB_MODE and S3_BUCKET:
-    s3_client = boto3.client(
+
+def get_s3_client():
+    return boto3.client(
         "s3",
         region_name=AWS_REGION,
-        config=Config(signature_version="s3v4")
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
     )
 
-# ------------------------------------------------------
-# FastAPI 앱
-# ------------------------------------------------------
-app = FastAPI(title="PetHealth+ Backend")
+
+def upload_to_s3(data: bytes, key: str, content_type: str) -> str:
+    """
+    S3에 업로드하고 public URL 리턴
+    """
+    if not AWS_S3_BUCKET:
+        raise RuntimeError("환경변수 AWS_S3_BUCKET 이 설정되어 있지 않습니다.")
+
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=AWS_S3_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+    return f"https://{AWS_S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
+
+
+# =========================
+# Pydantic 모델들
+# =========================
+class ReceiptItem(BaseModel):
+    name: str
+    price: Optional[int] = None
+
+
+class ParsedReceipt(BaseModel):
+    clinicName: Optional[str] = None
+    visitDate: Optional[str] = None  # "YYYY-MM-DD"
+    items: List[ReceiptItem] = []
+    totalAmount: Optional[int] = None
+
+
+class ReceiptAnalyzeResponse(BaseModel):
+    parsed: ParsedReceipt
+
+
+class PdfRecord(BaseModel):
+    id: str
+    petId: str
+    title: Optional[str] = None
+    memo: Optional[str] = None
+    s3Url: str
+    uploadedAt: str  # ISO8601 문자열
+
+
+# =========================
+# FastAPI 앱 생성
+# =========================
+app = FastAPI(title="PetHealth+ Server")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 필요하면 특정 도메인으로 좁혀도 됨
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------
-# 공통 유틸
-# ------------------------------------------------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
-def build_s3_url(key: str) -> str:
-    if S3_PUBLIC_BASE:
-        return f"{S3_PUBLIC_BASE.rstrip('/')}/{key}"
-    # 기본 형식
-    return f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
+# -------------------------
+# 헬스 체크
+# -------------------------
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
-def upload_bytes_to_s3(data: bytes, key: str, content_type: str) -> str:
-    """
-    S3에 업로드 후 공개 URL 반환.
-    STUB_MODE면 가짜 URL만 리턴.
-    """
-    if STUB_MODE or not s3_client or not S3_BUCKET:
-        return f"https://stub.local/{key}"
 
-    s3_client.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=data,
-        ContentType=content_type,
-        ACL="public-read",  # 필요에 따라 조정
-    )
-    return build_s3_url(key)
-
-# ------------------------------------------------------
-# 모델 정의 (Swift DTO에 맞춰 설계)
-# ------------------------------------------------------
-
-# 1) 영수증 분석용 DTO -----------------------------------
-class ReceiptItemDTO(BaseModel):
-    id: str
-    name: str
-    price: Optional[int] = None
-
-class ReceiptParsedDTO(BaseModel):
-    clinicName: Optional[str] = None
-    visitDate: Optional[str] = None  # "yyyy-MM-dd"
-    items: List[ReceiptItemDTO] = Field(default_factory=list)
-    totalAmount: Optional[int] = None
-
-class ReceiptAnalyzeResponseDTO(BaseModel):
-    id: str
-    petId: str
-    createdAt: str
-    parsed: ReceiptParsedDTO
-
-# 2) PDF 업로드용 DTO ------------------------------------
-class PdfRecord(BaseModel):
-    id: str
-    petId: str
-    title: str
-    memo: Optional[str] = None
-    uploadedAt: str     # ISO8601 문자열
-    fileURL: str        # S3 또는 스텁 URL
-
-# ------------------------------------------------------
-# 헬퍼: 영수증 분석 (Stub 버전)
-# ------------------------------------------------------
-def analyze_receipt_stub(pet_id: str) -> ReceiptAnalyzeResponseDTO:
-    """
-    실제로는 Google Vision + Gemini 로직이 들어갈 자리.
-    지금은 iOS 개발용 stub만 내려줌.
-    """
-    now = now_iso()
-    items = [
-        ReceiptItemDTO(
-            id=str(uuid.uuid4()),
-            name="진찰료",
-            price=15000,
-        ),
-        ReceiptItemDTO(
-            id=str(uuid.uuid4()),
-            name="예방접종",
-            price=35000,
-        ),
-    ]
-    parsed = ReceiptParsedDTO(
-        clinicName="PetHealth 동물병원",
-        visitDate=now[:10],   # "YYYY-MM-DD"
-        items=items,
-        totalAmount=sum([i.price or 0 for i in items])
-    )
-    return ReceiptAnalyzeResponseDTO(
-        id=str(uuid.uuid4()),
-        petId=pet_id,
-        createdAt=now,
-        parsed=parsed,
-    )
-
-# ------------------------------------------------------
-# 라우트: 헬스체크
-# ------------------------------------------------------
-@app.get("/api/health")
-async def health_check():
-    return {"status": "ok", "stubMode": STUB_MODE}
-
-# ------------------------------------------------------
-# 라우트: 영수증 분석 (이미지 OCR)
-# ------------------------------------------------------
-@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponseDTO)
+# =========================
+# 1) 영수증 OCR 엔드포인트 (이미지)
+# =========================
+@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponse)
 async def analyze_receipt(
     petId: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     """
-    iOS에서 영수증 이미지를 올릴 때 호출.
-    - petId: 반려동물 ID
-    - file: 이미지 (jpeg/png 등)
-    현재는 STUB로 동작하고, 나중에 Vision+Gemini 붙이면 됨.
+    iOS: multipart/form-data
+      - petId: string
+      - file: image/* (영수증 사진)
     """
-    data = await file.read()
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail="이미지 용량이 너무 큽니다.")
 
-    # 필요하다면 이미지 S3 업로드 (선택사항)
-    _ = upload_bytes_to_s3(
-        data=data,
-        key=f"receipt-images/{petId}/{uuid.uuid4()}.jpg",
-        content_type=file.content_type or "image/jpeg"
+    logger.info(f"[analyze_receipt] petId={petId}, filename={file.filename}")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="비어 있는 파일입니다.")
+
+    # S3에 원본 이미지 업로드 (선택)
+    ext = os.path.splitext(file.filename or "")[1] or ".jpg"
+    key = f"receipts/{petId}/{uuid.uuid4()}{ext}"
+
+    try:
+        image_url = upload_to_s3(data, key, file.content_type or "image/jpeg")
+        logger.info(f"[analyze_receipt] uploaded to {image_url}")
+    except Exception as e:
+        logger.exception("S3 업로드 실패")
+        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
+
+    # TODO: Google Vision + Gemini 연동 (현재는 더미 데이터)
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    parsed = ParsedReceipt(
+        clinicName="미분류 동물병원",
+        visitDate=today_str,
+        items=[],
+        totalAmount=None,
     )
 
-    # 실제 분석 대신 Stub 호출
-    result = analyze_receipt_stub(pet_id=petId)
-    return result
+    return ReceiptAnalyzeResponse(parsed=parsed)
 
-# ------------------------------------------------------
-# 라우트: 검사결과 PDF 업로드
-# ------------------------------------------------------
+
+# =========================
+# 2) PDF 업로드 공통 함수
+# =========================
+async def handle_pdf_upload(
+    category: str,
+    petId: str,
+    title: str,
+    memo: str,
+    file: UploadFile,
+) -> PdfRecord:
+    """
+    category: 'lab' 또는 'cert' 등
+    """
+
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="비어 있는 파일입니다.")
+
+    key = f"{category}/{petId}/{uuid.uuid4()}.pdf"
+
+    try:
+        url = upload_to_s3(data, key, "application/pdf")
+        logger.info(f"[handle_pdf_upload] {category} pdf uploaded: {url}")
+    except Exception as e:
+        logger.exception("S3 PDF 업로드 실패")
+        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
+
+    now_iso = datetime.datetime.utcnow().isoformat()
+
+    record = PdfRecord(
+        id=str(uuid.uuid4()),
+        petId=petId,
+        title=title or None,
+        memo=memo or None,
+        s3Url=url,
+        uploadedAt=now_iso,
+    )
+    return record
+
+
+# =========================
+# 3) 검사결과 PDF 업로드
+# =========================
 @app.post("/api/lab/upload-pdf", response_model=PdfRecord)
 async def upload_lab_pdf(
     petId: str = Form(...),
     title: str = Form(""),
     memo: str = Form(""),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     """
-    검사결과 PDF 업로드
-    Swift: APIClient.shared.uploadLabPDF(...)
-    경로: /api/lab/upload-pdf
+    iOS:
+      - path: /api/lab/upload-pdf
+      - fields: petId, title, memo, file(PDF)
     """
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        # 일부 브라우저는 octet-stream 으로 보내기도 함
-        raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
+    return await handle_pdf_upload("lab", petId, title, memo, file)
 
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 파일은 업로드할 수 없습니다.")
 
-    record_id = str(uuid.uuid4())
-    key = f"lab/{petId}/{record_id}.pdf"
-
-    url = upload_bytes_to_s3(data=data, key=key, content_type="application/pdf")
-
-    rec = PdfRecord(
-        id=record_id,
-        petId=petId,
-        title=title or "검사결과",
-        memo=memo or None,
-        uploadedAt=now_iso(),
-        fileURL=url,
-    )
-    return rec
-
-# ------------------------------------------------------
-# 라우트: 증명서 PDF 업로드
-# ------------------------------------------------------
+# =========================
+# 4) 증명서 PDF 업로드
+# =========================
 @app.post("/api/cert/upload-pdf", response_model=PdfRecord)
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form(""),
     memo: str = Form(""),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
     """
-    증명서 PDF 업로드
-    Swift: APIClient.shared.uploadCertPDF(...)
-    경로: /api/cert/upload-pdf
+    iOS:
+      - path: /api/cert/upload-pdf
+      - fields: petId, title, memo, file(PDF)
     """
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
+    return await handle_pdf_upload("cert", petId, title, memo, file)
 
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="빈 파일은 업로드할 수 없습니다.")
 
-    record_id = str(uuid.uuid4())
-    key = f"cert/{petId}/{record_id}.pdf"
-
-    url = upload_bytes_to_s3(data=data, key=key, content_type="application/pdf")
-
-    rec = PdfRecord(
-        id=record_id,
-        petId=petId,
-        title=title or "증명서",
-        memo=memo or None,
-        uploadedAt=now_iso(),
-        fileURL=url,
-    )
-    return rec
-
-# ------------------------------------------------------
-# (선택) Uvicorn 실행용
-# ------------------------------------------------------
+# =========================
+# 로컬 실행용 (Render는 uvicorn main:app ... 사용)
+# =========================
 if _name_ == "_main_":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=False,
+    )
