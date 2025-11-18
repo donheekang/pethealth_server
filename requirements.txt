@@ -1,8 +1,12 @@
 fastapi
 uvicorn[standard]
 python-multipart
-Pillow
+pydantic
+pydantic-settings
 boto3
+google-cloud-storage
 google-cloud-vision
 google-generativeai
+Pillow
 python-dotenv
+requests
