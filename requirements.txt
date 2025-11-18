@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 python-multipart
-pydantic
+pydantic>=2
 pydantic-settings
 boto3
 google-cloud-storage
