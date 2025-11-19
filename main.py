@@ -129,6 +129,10 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+@app.get("/api/health")
+async def api_health():
+    # 위의 health()와 완전히 같은 값 리턴해도 됨
+    return {"status": "ok", "stubMode": settings.STUB_MODE}
 
 # -------------------------------------------------------------------
 # 공통: S3 업로드 + presigned URL 생성
