@@ -7,7 +7,8 @@ from typing import Optional
 import boto3
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 # Google / Gemini
 from google.cloud import vision
