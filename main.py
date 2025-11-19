@@ -380,7 +380,7 @@ async def upload_cert_pdf(
 # 로컬 개발용 실행 엔트리
 # -------------------------------------------------------------------
 
-if _name_ == "_main_":
+if __name__ == "_main_":
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
