@@ -135,30 +135,15 @@ async def api_health():
     return {"status": "ok", "stubMode": STUB_MODE}
 
 
-# 맨 위쪽에 이미 있을 수도 있음
-from typing import List
-
 # ============================================================
 # 검사결과 / 증명서 목록 조회용 엔드포인트 (앱 진입 시 호출)
 # ============================================================
-
-@app.get("/api/lab/list", response_model=List[LabResult])
-async def list_lab_results():
-    """
-    검사결과 탭 진입 시 사용하는 목록 조회 API.
-    일단은 DB가 없으니까 S3에서 저장한 key 기준으로
-    나중에 구현할 예정. 지금은 최소한 빈 리스트를 돌려줘서
-    앱에서 404 에러가 안 나게만 처리.
-    """
+@app.get("/lab/list", response_model=List[LabResult])
+async def list_lab_results_legacy():
     return []
 
-
-@app.get("/api/cert/list", response_model=List[Certificate])
-async def list_cert_results():
-    """
-    증명서 탭 진입 시 사용하는 목록 조회 API.
-    지금은 임시로 빈 리스트만 반환.
-    """
+@app.get("/cert/list", response_model=List[Certificate])
+async def list_cert_results_legacy():
     return []
 # -------------------------------------------------------------------
 # 공통: S3 업로드 + presigned URL 생성
