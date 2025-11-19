@@ -227,6 +227,15 @@ async def list_cert_results_legacy() -> List[Certificate]:
     return []
 
 
+@app.post("/lab/upload", response_model=UploadResponse)
+async def upload_lab_result_legacy(file: UploadFile = File(...)):
+    # 기존 /api/lab/upload 로 그대로 위임
+    return await upload_lab_result(file)
+
+
+@app.post("/cert/upload", response_model=UploadResponse)
+async def upload_certificate_legacy(file: UploadFile = File(...)):
+    # 기존 /api/cert/upload 로 그대로 위임
 # ============================================================
 # 선택: OCR + Gemini 분석용 엔드포인트 (추후 연동)
 # 현재 앱이 안 쓰고 있다면 그냥 두어도 되고,
