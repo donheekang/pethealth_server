@@ -1,9 +1,10 @@
-fastapi
-uvicorn[standard]
-boto3
-python-multipart
-pydantic>=1.10,<3
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
 
-google-cloud-vision
-google-generativeai
-google-auth
+boto3==1.35.50
+python-multipart==0.0.9
+pydantic==1.10.17
+
+google-cloud-vision==3.8.0
+google-generativeai==0.8.3
+google-auth==2.36.0
