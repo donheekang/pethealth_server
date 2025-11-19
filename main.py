@@ -48,7 +48,7 @@ app = FastAPI(title="PetHealth+ Server")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # 필요하면 나중에 앱 도메인만 허용
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -73,7 +73,7 @@ class CertificateDocument(BaseModel):
     createdAt: datetime.datetime
 
 
-# 아주 간단한 인메모리 저장소 (서버 재시작하면 날아감)
+# 간단 인메모리 저장소 (배포 서버 재시작 시 초기화)
 labs_db: dict[str, list[LabDocument]] = {}
 cert_db: dict[str, list[CertificateDocument]] = {}
 
@@ -133,21 +133,45 @@ def _upload_to_s3(prefix: str, pet_id: str, file: UploadFile) -> str:
 
 
 # =========================================
+# 응답 직렬화 helper
+#  - Swift 쪽에서 fileUrl / url 을 기대할 수도 있으니
+#    s3Url 과 별도로 fileUrl 키도 같이 내려줌
+# =========================================
+
+def serialize_lab(doc: LabDocument) -> dict:
+    return {
+        "id": doc.id,
+        "petId": doc.petId,
+        "fileUrl": doc.s3Url,     # Swift 가 기대할 가능성 큰 키
+        "s3Url": doc.s3Url,       # 실제 S3 URL
+        "createdAt": doc.createdAt,
+    }
+
+
+def serialize_cert(doc: CertificateDocument) -> dict:
+    return {
+        "id": doc.id,
+        "petId": doc.petId,
+        "fileUrl": doc.s3Url,
+        "s3Url": doc.s3Url,
+        "createdAt": doc.createdAt,
+    }
+
+
+# =========================================
 # 검사결과(Lab) 리스트 조회
-# (여러 URL을 같은 함수로 묶어서 처리)
 # =========================================
 
 def _list_labs(pet_id: str | None):
     if pet_id:
-        return labs_db.get(pet_id, [])
-    # petId 안 넘기면 전체 플랫하게 리턴
-    all_docs: list[LabDocument] = []
-    for docs in labs_db.values():
-        all_docs.extend(docs)
-    return all_docs
+        docs = labs_db.get(pet_id, [])
+    else:
+        docs: list[LabDocument] = []
+        for d in labs_db.values():
+            docs.extend(d)
+    return [serialize_lab(d) for d in docs]
 
 
-# 기존 우리가 만들었던 경로들
 @app.get("/labs")
 @app.get("/labs/list")
 @app.get("/api/labs")
@@ -156,8 +180,7 @@ async def list_labs(petId: str | None = None):
     return _list_labs(petId)
 
 
-# ✅ iOS 앱에서 실제로 호출하는 경로: /api/lab/list
-#    같은 함수 재사용만 해주면 됨
+# iOS 앱에서 실제 호출하는 경로
 @app.get("/api/lab/list")
 async def api_lab_list(petId: str | None = None):
     return _list_labs(petId)
@@ -169,11 +192,12 @@ async def api_lab_list(petId: str | None = None):
 
 def _list_certs(pet_id: str | None):
     if pet_id:
-        return cert_db.get(pet_id, [])
-    all_docs: list[CertificateDocument] = []
-    for docs in cert_db.values():
-        all_docs.extend(docs)
-    return all_docs
+        docs = cert_db.get(pet_id, [])
+    else:
+        docs: list[CertificateDocument] = []
+        for d in cert_db.values():
+            docs.extend(d)
+    return [serialize_cert(d) for d in docs]
 
 
 @app.get("/certificates")
@@ -182,7 +206,6 @@ async def list_certificates(petId: str | None = None):
     return _list_certs(petId)
 
 
-# ✅ iOS 앱에서 실제로 호출하는 경로: /api/cert/list
 @app.get("/api/cert/list")
 async def api_cert_list(petId: str | None = None):
     return _list_certs(petId)
@@ -197,9 +220,6 @@ async def upload_lab_pdf(
     petId: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """
-    기본 업로드 엔드포인트 (웹/테스트용)
-    """
     url = _upload_to_s3("labs", petId, file)
 
     doc = LabDocument(
@@ -209,11 +229,10 @@ async def upload_lab_pdf(
         createdAt=datetime.datetime.utcnow(),
     )
     labs_db.setdefault(petId, []).append(doc)
-    return doc
+    return serialize_lab(doc)
 
 
-# ✅ iOS 앱에서 실제로 호출하는 경로: /api/lab/upload-pdf
-#    위 함수 그대로 래핑해서 사용
+# iOS 앱에서 실제 호출하는 경로
 @app.post("/api/lab/upload-pdf")
 async def upload_lab_pdf_alias(
     petId: str = Form(...),
@@ -240,4 +259,4 @@ async def upload_certificate_pdf(
         createdAt=datetime.datetime.utcnow(),
     )
     cert_db.setdefault(petId, []).append(doc)
-    return doc
+    return serialize_cert(doc)
