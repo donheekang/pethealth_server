@@ -1,215 +1,243 @@
 import os
-import io
 import uuid
+import datetime
 import logging
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
-import boto3
-from botocore.exceptions import NoCredentialsError
-
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings
-from pydantic import Field  # Field 안 쓰더라도 남겨둬도 무방
+import boto3
 
 
-# ============================================
-# SETTINGS (Render 환경변수 자동 매핑)
-# ============================================
+# =========================================
+# 설정
+# =========================================
 
 class Settings(BaseSettings):
-    STUB_MODE: bool = False
-
     AWS_ACCESS_KEY_ID: str | None = None
     AWS_SECRET_ACCESS_KEY: str | None = None
-    AWS_REGION: str | None = None
+    AWS_REGION: str = "ap-northeast-2"
     S3_BUCKET_NAME: str | None = None
 
-    GEMINI_API_KEY: str | None = None
-    GEMINI_ENABLED: bool = True
+    # STUB_MODE = True 이면 S3 안 쓰고 가짜 URL만 리턴
+    STUB_MODE: bool = False
 
-    GOOGLE_APPLICATION_CREDENTIALS: str | None = None
 
 settings = Settings()
 
+logger = logging.getLogger("pethealthplus")
+logger.setLevel(logging.INFO)
 
-# ============================================
-# FASTAPI APP 설정
-# ============================================
+if not settings.STUB_MODE:
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        region_name=settings.AWS_REGION,
+    )
+else:
+    s3_client = None
+
+
+# =========================================
+# FastAPI 기본 세팅
+# =========================================
 
 app = FastAPI(title="PetHealth+ Server")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],       # 필요하면 나중에 앱 도메인만 허용
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+# =========================================
+# 모델 (검사결과 PDF / 증명서 PDF)
+# =========================================
+
+class LabDocument(BaseModel):
+    id: str
+    petId: str
+    s3Url: str
+    createdAt: datetime.datetime
 
 
-# ============================================
-# 기본 헬스체크
-# ============================================
+class CertificateDocument(BaseModel):
+    id: str
+    petId: str
+    s3Url: str
+    createdAt: datetime.datetime
+
+
+# 아주 간단한 인메모리 저장소 (서버 재시작하면 날아감)
+labs_db: dict[str, list[LabDocument]] = {}
+cert_db: dict[str, list[CertificateDocument]] = {}
+
+
+# =========================================
+# 헬스 체크
+# =========================================
 
 @app.get("/")
 async def root():
-    """브라우저에서 확인 용 루트 엔드포인트"""
+    """Render 브라우저에서 확인용 루트 엔드포인트"""
     return {"status": "ok", "stubMode": settings.STUB_MODE}
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.get("/api/health")
 async def api_health():
     return {"status": "ok", "stubMode": settings.STUB_MODE}
 
 
-# ============================================
-# AWS S3 클라이언트
-# ============================================
+# =========================================
+# 공통: S3 업로드 유틸
+# =========================================
 
-def get_s3():
-    try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-            region_name=settings.AWS_REGION,
-        )
-        return s3
-    except NoCredentialsError:
-        raise HTTPException(status_code=500, detail="AWS Credential Error")
+def _upload_to_s3(prefix: str, pet_id: str, file: UploadFile) -> str:
+    """
+    prefix: "labs" 또는 "certificates"
+    pet_id: 반려동물 ID
+    file  : 업로드된 PDF
+    """
+    # STUB_MODE면 그냥 가짜 URL
+    if settings.STUB_MODE:
+        key = f"{prefix}/{pet_id}/{uuid.uuid4()}.pdf"
+        fake_url = f"https://stub-s3/{key}"
+        logger.info(f"[STUB] upload_to_s3 -> {fake_url}")
+        return fake_url
 
+    if not settings.S3_BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="S3 bucket not configured")
 
-# ============================================
-# Presigned URL 생성
-# ============================================
+    key = f"{prefix}/{pet_id}/{uuid.uuid4()}.pdf"
 
-@app.get("/api/s3/presign")
-async def create_presigned_url(filename: str, filetype: str):
-    s3 = get_s3()
-    key = f"uploads/{uuid.uuid4()}_{filename}"
+    s3_client.upload_fileobj(
+        file.file,
+        settings.S3_BUCKET_NAME,
+        key,
+        ExtraArgs={"ContentType": file.content_type or "application/pdf"},
+    )
 
-    try:
-        presigned_url = s3.generate_presigned_url(
-            ClientMethod="put_object",
-            Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key, "ContentType": filetype},
-            ExpiresIn=3600,
-        )
-
-        return {
-            "url": presigned_url,
-            "path": key,
-            "view_url": f"https://{settings.S3_BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/{key}",
-        }
-
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="Failed to generate URL")
+    url = f"https://{settings.S3_BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/{key}"
+    logger.info(f"Uploaded to S3: {url}")
+    return url
 
 
-# ============================================
-# PDF 직접 업로드 (iOS multipart 방식)
-# ============================================
+# =========================================
+# 검사결과(Lab) 리스트 조회
+# (여러 URL을 같은 함수로 묶어서 처리)
+# =========================================
 
-@app.post("/api/upload/pdf")
-async def upload_pdf(file: UploadFile = File(...)):
-    s3 = get_s3()
-
-    file_bytes = await file.read()
-    key = f"pdf/{uuid.uuid4()}_{file.filename}"
-
-    try:
-        s3.put_object(
-            Bucket=settings.S3_BUCKET_NAME,
-            Key=key,
-            Body=file_bytes,
-            ContentType="application/pdf",
-        )
-        return {
-            "status": "uploaded",
-            "key": key,
-            "url": f"https://{settings.S3_BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/{key}",
-        }
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="PDF Upload Failed")
+def _list_labs(pet_id: str | None):
+    if pet_id:
+        return labs_db.get(pet_id, [])
+    # petId 안 넘기면 전체 플랫하게 리턴
+    all_docs: list[LabDocument] = []
+    for docs in labs_db.values():
+        all_docs.extend(docs)
+    return all_docs
 
 
-# ============================================
-# 이미지 업로드 + Gemini OCR 분석
-# ============================================
-
-@app.post("/api/upload/image-ocr")
-async def upload_and_ocr(file: UploadFile = File(...)):
-    s3 = get_s3()
-
-    file_bytes = await file.read()
-    key = f"images/{uuid.uuid4()}_{file.filename}"
-
-    # 1) S3 저장
-    try:
-        s3.put_object(
-            Bucket=settings.S3_BUCKET_NAME,
-            Key=key,
-            Body=file_bytes,
-            ContentType=file.content_type,
-        )
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="Image Upload Failed")
-
-    # 2) OCR 분석
-    if not settings.GEMINI_ENABLED or not settings.GEMINI_API_KEY:
-        # OCR 비활성화 상태면 업로드 정보만 반환
-        return {
-            "status": "uploaded_only",
-            "ocr": None,
-            "url": f"https://{settings.S3_BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/{key}",
-        }
-
-    try:
-        from google.generativeai import configure, GenerativeModel
-
-        configure(api_key=settings.GEMINI_API_KEY)
-        model = GenerativeModel("gemini-1.5-flash")
-
-        # 이미지 바이트를 그대로 넣어서 OCR
-        result = model.generate_content(["Extract all medical text from this receipt:", file_bytes])
-        ocr_text = result.text
-    except Exception as e:
-        logger.error(e)
-        ocr_text = None
-
-    return {
-        "status": "ok",
-        "ocr_text": ocr_text,
-        "url": f"https://{settings.S3_BUCKET_NAME}.s3.{settings.AWS_REGION}.amazonaws.com/{key}",
-    }
-
-
-# ============================================
-# 검사결과 / 증명서 LIST (여러 URL를 한 번에 처리)
-# ============================================
-
-# --- 검사결과(랩) 리스트 ---
+# 기존 우리가 만들었던 경로들
 @app.get("/labs")
 @app.get("/labs/list")
 @app.get("/api/labs")
 @app.get("/api/labs/list")
-async def get_labs():
-    # 여기서 나중에 DB 붙이면 items에 실제 데이터 넣으면 됨
-    return {"items": []}
+async def list_labs(petId: str | None = None):
+    return _list_labs(petId)
 
-# --- 증명서 리스트 ---
+
+# ✅ iOS 앱에서 실제로 호출하는 경로: /api/lab/list
+#    같은 함수 재사용만 해주면 됨
+@app.get("/api/lab/list")
+async def api_lab_list(petId: str | None = None):
+    return _list_labs(petId)
+
+
+# =========================================
+# 증명서(Certificate) 리스트 조회
+# =========================================
+
+def _list_certs(pet_id: str | None):
+    if pet_id:
+        return cert_db.get(pet_id, [])
+    all_docs: list[CertificateDocument] = []
+    for docs in cert_db.values():
+        all_docs.extend(docs)
+    return all_docs
+
+
 @app.get("/certificates")
-@app.get("/certificates/list")
 @app.get("/api/certificates")
-@app.get("/api/certificates/list")
-async def get_certificates():
-    return {"items": []}
+async def list_certificates(petId: str | None = None):
+    return _list_certs(petId)
+
+
+# ✅ iOS 앱에서 실제로 호출하는 경로: /api/cert/list
+@app.get("/api/cert/list")
+async def api_cert_list(petId: str | None = None):
+    return _list_certs(petId)
+
+
+# =========================================
+# 검사결과(Lab) PDF 업로드
+# =========================================
+
+@app.post("/labs/upload-pdf")
+async def upload_lab_pdf(
+    petId: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """
+    기본 업로드 엔드포인트 (웹/테스트용)
+    """
+    url = _upload_to_s3("labs", petId, file)
+
+    doc = LabDocument(
+        id=str(uuid.uuid4()),
+        petId=petId,
+        s3Url=url,
+        createdAt=datetime.datetime.utcnow(),
+    )
+    labs_db.setdefault(petId, []).append(doc)
+    return doc
+
+
+# ✅ iOS 앱에서 실제로 호출하는 경로: /api/lab/upload-pdf
+#    위 함수 그대로 래핑해서 사용
+@app.post("/api/lab/upload-pdf")
+async def upload_lab_pdf_alias(
+    petId: str = Form(...),
+    file: UploadFile = File(...),
+):
+    return await upload_lab_pdf(petId=petId, file=file)
+
+
+# =========================================
+# 증명서(Certificate) PDF 업로드 (필요 시)
+# =========================================
+
+@app.post("/certificates/upload-pdf")
+async def upload_certificate_pdf(
+    petId: str = Form(...),
+    file: UploadFile = File(...),
+):
+    url = _upload_to_s3("certificates", petId, file)
+
+    doc = CertificateDocument(
+        id=str(uuid.uuid4()),
+        petId=petId,
+        s3Url=url,
+        createdAt=datetime.datetime.utcnow(),
+    )
+    cert_db.setdefault(petId, []).append(doc)
+    return doc
