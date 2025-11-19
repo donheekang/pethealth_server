@@ -1,9 +1,12 @@
-fastapi
-uvicorn[standard]
-boto3
-python-multipart
-pydantic>=1.10,<3
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
 
-google-cloud-vision
-google-generativeai
-google-auth
+boto3==1.35.0
+python-multipart==0.0.9
+
+Pillow==10.4.0
+
+google-cloud-vision==3.7.4
+
+# 선택: PDF 텍스트 뽑고 싶을 때 사용 (지금 코드는 안 써도 됨)
+PyPDF2==3.0.1
