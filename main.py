@@ -1,329 +1,386 @@
 import os
 import io
-import uuid
+import json
 import logging
-from datetime import datetime
+from uuid import uuid4
 from typing import List, Optional
 
-import boto3
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import boto3
+
+# OCR & LLM
 from google.cloud import vision
+import google.generativeai as genai
 
-# ------------------------------------------------------------------------------
-# 기본 설정 & 로거
-# ------------------------------------------------------------------------------
-logger = logging.getLogger(__name__)  # ✅ _name_ 오타 주의
+# -------------------------------------------------------------------
+# 기본 설정 / 로거
+# -------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------------------
-# 환경변수 (Render 대시보드에서 설정한 값과 매칭)
-# ------------------------------------------------------------------------------
+STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
+GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "true").lower() == "true"
+
+# -------------------------------------------------------------------
+# AWS S3 설정
+# -------------------------------------------------------------------
+
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
-# GOOGLE_APPLICATION_CREDENTIALS = "/opt/render/project/src/google-cred.json" 처럼
-# "컨테이너 안의 파일 경로" 여야 해.
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+if not STUB_MODE:
+    if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME):
+        logger.warning("S3 환경변수 일부가 비어 있습니다. STUB_MODE = false 이지만 S3 업로드에 실패할 수 있습니다.")
 
-STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
-
-# ------------------------------------------------------------------------------
-# S3 클라이언트 생성
-# ------------------------------------------------------------------------------
-if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET_NAME]):
-    logger.warning("⚠️ AWS/S3 환경변수가 일부 비어 있습니다. S3 업로드가 실패할 수 있습니다.")
-
-session = boto3.session.Session(
+s3_client = boto3.client(
+    "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     region_name=AWS_REGION,
 )
-s3_client = session.client("s3")
 
-# ------------------------------------------------------------------------------
-# Vision 클라이언트 생성
-# ------------------------------------------------------------------------------
-if GOOGLE_APPLICATION_CREDENTIALS:
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
+# -------------------------------------------------------------------
+# Google Vision / Gemini 설정
+# -------------------------------------------------------------------
 
-try:
-    vision_client = vision.ImageAnnotatorClient()
-    logger.info("✅ Google Vision client initialized")
-except Exception as e:
-    logger.error(f"Google Vision 초기화 실패: {e}")
-    vision_client = None
+vision_client = None
+gemini_model = None
 
-# ------------------------------------------------------------------------------
-# FastAPI 앱
-# ------------------------------------------------------------------------------
-app = FastAPI(title="PetHealth+ Server")
+if not STUB_MODE:
+    try:
+        # GOOGLE_APPLICATION_CREDENTIALS 환경변수는 Render 쪽에서 설정해둔 경로 사용
+        vision_client = vision.ImageAnnotatorClient()
+        logger.info("Google Vision 클라이언트 초기화 완료")
+    except Exception as e:
+        logger.error(f"Vision 클라이언트 초기화 실패: {e}")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 필요하면 iOS 도메인/포트만 남기기
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    if GEMINI_ENABLED:
+        try:
+            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+            gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+            logger.info("Gemini 모델 초기화 완료")
+        except Exception as e:
+            logger.error(f"Gemini 초기화 실패: {e}")
+    else:
+        logger.info("GEMINI_ENABLED = false, Gemini 사용 안 함")
 
-# ------------------------------------------------------------------------------
-# Pydantic 모델 - iOS에서 쓰는 DTO와 맞추기
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Pydantic 모델
+# -------------------------------------------------------------------
+
 class ReceiptItem(BaseModel):
     name: str
     price: Optional[int] = None
 
 
-class ParsedReceipt(BaseModel):
+class ReceiptParsed(BaseModel):
     clinicName: Optional[str] = None
     visitDate: Optional[str] = None  # "YYYY-MM-DD"
-    items: List[ReceiptItem] = []
     totalAmount: Optional[int] = None
+    items: List[ReceiptItem] = []
 
 
-class ReceiptAnalyzeResponseDTO(BaseModel):
-    parsed: ParsedReceipt
-    rawText: str
+class ReceiptAnalyzeResponse(BaseModel):
+    parsed: ReceiptParsed
+    rawOcrText: Optional[str] = None
 
 
 class PdfRecord(BaseModel):
     id: str
     petId: str
-    title: Optional[str] = None
-    memo: Optional[str] = None
+    title: str = ""
+    memo: str = ""
     s3Url: str
-    createdAt: datetime
+    kind: str  # "lab" or "cert"
 
 
-# 메모리용 저장 (나중에 DB 붙이면 대체)
-LAB_PDFS: dict[str, List[PdfRecord]] = {}
-CERT_PDFS: dict[str, List[PdfRecord]] = {}
+# -------------------------------------------------------------------
+# FastAPI 앱
+# -------------------------------------------------------------------
 
-# ------------------------------------------------------------------------------
-# 유틸: S3 업로드
-# ------------------------------------------------------------------------------
-def upload_to_s3(file_bytes: bytes, key: str, content_type: str) -> str:
+app = FastAPI(title="PetHealth+ Server", version="1.0.0")
+
+# CORS: iOS + 테스트용 웹에서 다 접근할 수 있게 전체 허용
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------------------------
+# 헬스 체크
+# -------------------------------------------------------------------
+
+@app.get("/")
+async def root():
+    """Render 브라우저에서 확인용 루트 엔드포인트."""
+    return {"status": "ok", "stubMode": STUB_MODE}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# -------------------------------------------------------------------
+# 공통: S3 업로드 + presigned URL 생성
+# -------------------------------------------------------------------
+
+def upload_pdf_and_presign(kind: str, pet_id: str, file: UploadFile) -> str:
+    """
+    S3에 PDF 업로드 후, 기간 제한된 다운로드 URL(presigned URL)을 리턴.
+    """
     if STUB_MODE:
-        # STUB 모드면 그냥 가짜 URL 리턴 (테스트용)
-        return f"https://example.com/{key}"
+        # 개발용 더미 URL
+        return f"https://example.com/{kind}/{pet_id}/{uuid4()}.pdf"
 
     if not S3_BUCKET_NAME:
-        raise RuntimeError("S3_BUCKET_NAME 환경변수가 비어 있습니다.")
+        raise RuntimeError("S3_BUCKET_NAME 이 설정되어 있지 않습니다.")
 
-    s3_client.put_object(
-        Bucket=S3_BUCKET_NAME,
-        Key=key,
-        Body=file_bytes,
-        ContentType=content_type,
+    # 파일 키: kind/petId/uuid.pdf
+    key = f"{kind}/{pet_id}/{uuid4()}.pdf"
+
+    # UploadFile.file 은 파일 객체이므로 그대로 upload_fileobj 사용 가능
+    file.file.seek(0)
+    s3_client.upload_fileobj(
+        file.file,
+        S3_BUCKET_NAME,
+        key,
+        ExtraArgs={"ContentType": "application/pdf"},
     )
 
-    url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
+    # presigned URL 생성 (예: 7일 유효)
+    url = s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET_NAME, "Key": key},
+        ExpiresIn=60 * 60 * 24 * 7,
+    )
     return url
 
 
-# ------------------------------------------------------------------------------
-# 유틸: OCR + 간단 파싱 (Google Vision만 사용)
-# ------------------------------------------------------------------------------
-def ocr_receipt_image(image_bytes: bytes) -> str:
+# -------------------------------------------------------------------
+# OCR + Gemini: 영수증 분석 로직
+# -------------------------------------------------------------------
+
+def call_vision_ocr(image_bytes: bytes) -> str:
     """
-    영수증 이미지에서 텍스트만 뽑아오는 함수
+    Google Vision 으로 전체 텍스트 추출.
     """
     if STUB_MODE or vision_client is None:
-        # 테스트용 더미 텍스트
-        return """펫케어동물병원
-2025-11-18
-진찰료 20000
-X-ray 50000
-혈액검사 80000
-합계 150000"""
+        # stub 모드에서는 간단한 더미 텍스트
+        return "펫동물병원 2025-11-18 진료비 총액 88000원 진찰료 30000원 혈액검사 40000원 기타 18000원"
 
     image = vision.Image(content=image_bytes)
     response = vision_client.document_text_detection(image=image)
 
     if response.error.message:
-        raise RuntimeError(f"Vision API error: {response.error.message}")
+        raise RuntimeError(f"Vision 오류: {response.error.message}")
 
-    return response.full_text_annotation.text
+    if response.full_text_annotation and response.full_text_annotation.text:
+        return response.full_text_annotation.text
+    elif response.text_annotations:
+        return response.text_annotations[0].description
+    else:
+        return ""
 
 
-def parse_receipt_text(text: str) -> ParsedReceipt:
+def call_gemini_for_receipt(ocr_text: str) -> ReceiptParsed:
     """
-    OCR 결과 텍스트를 매우 단순하게 파싱.
-    - 첫 줄: 병원 이름 가정
-    - 첫 번째 날짜 패턴: 방문일
-    - '원' 이 들어간 줄: 항목/금액 추출
+    OCR 텍스트를 Gemini에게 넘겨 구조화된 JSON으로 파싱.
     """
-    import re
+    if STUB_MODE or not GEMINI_ENABLED or gemini_model is None:
+        # 간단한 하드코딩 더미
+        return ReceiptParsed(
+            clinicName="펫동물병원",
+            visitDate="2025-11-18",
+            totalAmount=88000,
+            items=[
+                ReceiptItem(name="진찰료", price=30000),
+                ReceiptItem(name="혈액검사", price=40000),
+                ReceiptItem(name="기타", price=18000),
+            ],
+        )
 
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return ParsedReceipt(items=[])
+    prompt = """
+너는 한국 동물병원 영수증을 분석하는 도우미야.
+다음 OCR 텍스트를 보고 아래 JSON 형식으로만 답해줘.
 
-    clinic_name = lines[0]
+반드시 이 스키마를 지켜:
+{
+  "clinicName": "병원 이름 또는 null",
+  "visitDate": "YYYY-MM-DD 형식 문자열 또는 null",
+  "totalAmount": 정수 또는 null,
+  "items": [
+    { "name": "항목명", "price": 정수 또는 null },
+    ...
+  ]
+}
 
-    # 날짜 찾기
-    date_pattern = re.compile(r"(\d{4})[./-](\d{1,2})[./-](\d{1,2})")
-    visit_date = None
-    for ln in lines:
-        m = date_pattern.search(ln)
-        if m:
-            y, mth, d = m.groups()
-            visit_date = f"{int(y):04d}-{int(mth):02d}-{int(d):02d}"
-            break
+불필요한 설명, 코드블록, 마크다운은 절대 넣지 말고 오직 JSON만 출력해.
+"""
+    content = prompt + "\n\n==== OCR TEXT ====\n" + ocr_text
 
+    response = gemini_model.generate_content(content)
+    text = response.text.strip()
+
+    # ⁠ json ...  ⁠ 같은 코드블록 제거
+    if text.startswith("```"):
+        text = text.strip("`")
+        # "json\n{ ... }" 형태일 수 있음
+        if text.startswith("json"):
+            text = text[4:]
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"Gemini JSON 파싱 실패: {e} / 원본: {text}")
+        # 최소 구조만 채운 기본값 리턴
+        return ReceiptParsed(
+            clinicName=None,
+            visitDate=None,
+            totalAmount=None,
+            items=[],
+        )
+
+    clinic = data.get("clinicName")
+    visit = data.get("visitDate")
+    total = data.get("totalAmount")
+
+    items_raw = data.get("items") or []
     items: List[ReceiptItem] = []
-    total_amount = None
-
-    money_pattern = re.compile(r"([0-9,]+)\s*원")
-
-    for ln in lines[1:]:
-        m = money_pattern.search(ln)
-        if not m:
+    for it in items_raw:
+        if not isinstance(it, dict):
             continue
-        amount_str = m.group(1).replace(",", "")
+        name = it.get("name") or ""
+        if not name:
+            continue
+        price_val = it.get("price")
         try:
-            amount = int(amount_str)
-        except ValueError:
-            continue
+            price_int = int(price_val) if price_val is not None else None
+        except (TypeError, ValueError):
+            price_int = None
+        items.append(ReceiptItem(name=name, price=price_int))
 
-        if "합계" in ln or "총액" in ln:
-            total_amount = amount
-        else:
-            # 매우 단순하게: 숫자 앞 부분을 항목 이름으로 사용
-            name = ln[: m.start()].strip() or "항목"
-            items.append(ReceiptItem(name=name, price=amount))
-
-    # 총액이 없으면 항목 가격 합으로 대체
-    if total_amount is None and items:
-        total_amount = sum(i.price or 0 for i in items)
-
-    return ParsedReceipt(
-        clinicName=clinic_name,
-        visitDate=visit_date,
+    return ReceiptParsed(
+        clinicName=clinic,
+        visitDate=visit,
+        totalAmount=total if isinstance(total, int) else None,
         items=items,
-        totalAmount=total_amount,
     )
 
 
-# ------------------------------------------------------------------------------
-# API 라우트
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# 엔드포인트: 영수증 OCR 분석
+# -------------------------------------------------------------------
 
-@app.get("/api/health")
-def health_check():
-    return {"status": "ok", "stubMode": STUB_MODE}
-
-
-# ------------------------- 영수증 분석 (진료기록) ------------------------------
-@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponseDTO)
+@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponse)
 async def analyze_receipt(
-    petId: str = Form(...),
+    petId: str = Form(...),  # 현재는 petId 는 그냥 받아만 두고 사용은 안 함
     file: UploadFile = File(...),
 ):
     """
-    iOS: APIClient.shared.analyzeReceipt(petId:image:) 가 호출하는 엔드포인트
-    - multipart/form-data 로 petId + file(이미지) 받음
-    - Vision OCR -> 텍스트 -> 간단 파싱 -> DTO 리턴
+    iOS에서 호출하는 영수증 OCR 엔드포인트.
+    - multipart/form-data
+      - petId: 문자열
+      - file: 이미지 (jpg/png 등)
     """
     try:
-        content = await file.read()
-        if not content:
+        contents = await file.read()
+        if not contents:
             raise HTTPException(status_code=400, detail="빈 파일입니다.")
 
-        raw_text = ocr_receipt_image(content)
-        parsed = parse_receipt_text(raw_text)
+        # 1) OCR
+        ocr_text = call_vision_ocr(contents)
 
-        return ReceiptAnalyzeResponseDTO(parsed=parsed, rawText=raw_text)
+        # 2) Gemini로 구조화
+        parsed = call_gemini_for_receipt(ocr_text)
+
+        return ReceiptAnalyzeResponse(parsed=parsed, rawOcrText=ocr_text)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("영수증 분석 실패")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"/api/receipt/analyze 오류: {e}")
+        raise HTTPException(status_code=500, detail="영수증 분석 중 오류가 발생했습니다.")
 
 
-# ------------------------- PDF 업로드 (검사결과 / 증명서) ----------------------
+# -------------------------------------------------------------------
+# 엔드포인트: PDF 업로드 (검사결과 / 증명서)
+# -------------------------------------------------------------------
+
 @app.post("/api/lab/upload-pdf", response_model=PdfRecord)
 async def upload_lab_pdf(
     petId: str = Form(...),
-    title: Optional[str] = Form(None),
-    memo: Optional[str] = Form(None),
+    title: str = Form(""),
+    memo: str = Form(""),
     file: UploadFile = File(...),
 ):
     """
-    iOS: APIClient.uploadLabPDF(petId:title:memo:fileURL:)
+    검사결과 PDF 업로드.
+    iOS: APIClient.uploadLabPDF(...) 와 매칭.
     """
-    return await _handle_pdf_upload(petId, title, memo, file, LAB_PDFS, folder="lab")
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+
+    try:
+        url = upload_pdf_and_presign("lab", petId, file)
+        record = PdfRecord(
+            id=str(uuid4()),
+            petId=petId,
+            title=title or "",
+            memo=memo or "",
+            s3Url=url,
+            kind="lab",
+        )
+        return record
+    except Exception as e:
+        logger.exception(f"/api/lab/upload-pdf 오류: {e}")
+        raise HTTPException(status_code=500, detail="검사결과 업로드 중 오류가 발생했습니다.")
 
 
 @app.post("/api/cert/upload-pdf", response_model=PdfRecord)
 async def upload_cert_pdf(
     petId: str = Form(...),
-    title: Optional[str] = Form(None),
-    memo: Optional[str] = Form(None),
+    title: str = Form(""),
+    memo: str = Form(""),
     file: UploadFile = File(...),
 ):
     """
-    iOS: APIClient.uploadCertPDF(petId:title:memo:fileURL:)
+    증명서 PDF 업로드.
+    iOS: APIClient.uploadCertPDF(...) 와 매칭.
     """
-    return await _handle_pdf_upload(petId, title, memo, file, CERT_PDFS, folder="cert")
-
-
-async def _handle_pdf_upload(
-    pet_id: str,
-    title: Optional[str],
-    memo: Optional[str],
-    file: UploadFile,
-    store: dict[str, List[PdfRecord]],
-    folder: str,
-) -> PdfRecord:
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
+    if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="빈 파일입니다.")
-
-    ext = ".pdf"
-    object_id = str(uuid.uuid4())
-    key = f"{folder}/{pet_id}/{object_id}{ext}"
-
     try:
-        s3_url = upload_to_s3(content, key, "application/pdf")
+        url = upload_pdf_and_presign("cert", petId, file)
+        record = PdfRecord(
+            id=str(uuid4()),
+            petId=petId,
+            title=title or "",
+            memo=memo or "",
+            s3Url=url,
+            kind="cert",
+        )
+        return record
     except Exception as e:
-        logger.exception("S3 업로드 실패")
-        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
-
-    record = PdfRecord(
-        id=object_id,
-        petId=pet_id,
-        title=title,
-        memo=memo,
-        s3Url=s3_url,
-        createdAt=datetime.utcnow(),
-    )
-
-    store.setdefault(pet_id, []).append(record)
-    return record
+        logger.exception(f"/api/cert/upload-pdf 오류: {e}")
+        raise HTTPException(status_code=500, detail="증명서 업로드 중 오류가 발생했습니다.")
 
 
-# --------------------- PDF 목록 조회 (선택) ------------------------------------
-@app.get("/api/lab/list", response_model=List[PdfRecord])
-async def list_lab_pdfs(petId: str):
-    return LAB_PDFS.get(petId, [])
+# -------------------------------------------------------------------
+# 로컬 개발용 실행 엔트리
+# -------------------------------------------------------------------
 
+if _name_ == "_main_":
+    import uvicorn
 
-@app.get("/api/cert/list", response_model=List[PdfRecord])
-async def list_cert_pdfs(petId: str):
-    return CERT_PDFS.get(petId, [])
-
-
-# ------------------------------------------------------------------------------
-# Render: Start command 에서 ⁠ uvicorn main:app --host 0.0.0.0 --port $PORT ⁠
-# 를 쓰고 있으므로, 여기서는 따로 if _name_ == "_main_": 없어도 됨.
-# ------------------------------------------------------------------------------
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
