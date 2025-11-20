@@ -330,7 +330,33 @@ async def upload_lab_pdf(
         s3Url=s3_url,
         createdAt=datetime.now(timezone.utc).isoformat()
     )
+@app.get("/api/labs/list")
+async def list_labs(petId: str):
+    s3 = get_s3_client()
 
+    prefix = f"lab/{petId}/"
+    objects = s3.list_objects_v2(Bucket=settings.s3_bucket_name, Prefix=prefix)
+
+    results = []
+    for obj in objects.get("Contents", []):
+        key = obj["Key"]
+
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.s3_bucket_name, "Key": key},
+            ExpiresIn=7*24*3600,
+        )
+
+        results.append({
+            "id": key.split("/")[-1].replace(".pdf", ""),
+            "petId": petId,
+            "title": "검사결과",
+            "memo": None,
+            "s3Url": url,
+            "createdAt": obj["LastModified"].isoformat(),
+        })
+
+    return results
 
 # ============================================================
 #  3) 증명서 PDF 업로드
@@ -362,3 +388,30 @@ async def upload_cert_pdf(
         s3Url=s3_url,
         createdAt=datetime.now(timezone.utc).isoformat()
     )
+@app.get("/api/cert/list")
+async def list_certs(petId: str):
+    s3 = get_s3_client()
+
+    prefix = f"cert/{petId}/"
+    objects = s3.list_objects_v2(Bucket=settings.s3_bucket_name, Prefix=prefix)
+
+    results = []
+    for obj in objects.get("Contents", []):
+        key = obj["Key"]
+
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.s3_bucket_name, "Key": key},
+            ExpiresIn=7*24*3600,
+        )
+
+        results.append({
+            "id": key.split("/")[-1].replace(".pdf", ""),
+            "petId": petId,
+            "title": "증명서",
+            "memo": None,
+            "s3Url": url,
+            "createdAt": obj["LastModified"].isoformat(),
+        })
+
+    return results
