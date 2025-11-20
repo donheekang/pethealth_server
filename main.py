@@ -284,3 +284,170 @@ def parse_receipt_with_gemini(ocr_text: str) -> ReceiptParsedDTO:
 텍스트:
 ```TEXT
 {ocr_text}
+
+resp = gemini_model.generate_content(prompt)  # type: ignore
+text = (resp.text or "").strip()
+
+# 코드블록 안에 JSON이 들어있을 수도 있으니 정리
+if text.startswith("```"):
+    text = text.strip("`")
+    # 첫 줄에 json, JSON 등 있을 수 있음
+    parts = text.split("\n", 1)
+    if len(parts) == 2 and parts[0].lower().startswith("json"):
+        text = parts[1]
+
+try:
+    obj = json.loads(text)
+except json.JSONDecodeError as e:
+    raise RuntimeError(f"Gemini 응답 JSON 파싱 실패: {e} / raw={text[:200]}")
+
+# pydantic 모델로 검증
+return ReceiptParsedDTO(**obj)
+
+기본 라우트 & 헬스체크
+============================================================
+
+@app.get("/")
+def root():
+return {"message": "PetHealth+ backend running"}
+
+@app.get("/health")
+@app.get("/api/health")
+def health():
+return {
+"status": "ok",
+"stub": settings.stub_mode,
+"ocr": vision_client is not None,
+"gemini": settings.gemini_enabled,
+"bucket": settings.s3_bucket_name,
+}
+
+영수증 OCR 분석
+============================================================
+
+@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponseDTO)
+async def analyze_receipt(
+petId: str = Form(...),
+image: UploadFile = File(...),
+):
+# 이미지 읽기
+try:
+image_bytes = await image.read()
+except Exception as e:
+raise HTTPException(status_code=400, detail=f"이미지 읽기 실패: {e}")
+# 원본 이미지 S3 업로드
+now = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+rec_id = str(uuid.uuid4())
+key = f"receipts/{petId}/{now}-{rec_id}.jpg"
+
+s3_url = upload_bytes_to_s3(
+    data=image_bytes,
+    key=key,
+    content_type=image.content_type or "image/jpeg",
+    metadata={"petid": petId, "type": "receipt"},
+)
+
+# STUB 모드면 더미 데이터
+if settings.stub_mode:
+    parsed = ReceiptParsedDTO(
+        clinicName="테스트동물병원",
+        visitDate=datetime.now().strftime("%Y-%m-%d"),
+        diseaseName=None,
+        symptomsSummary="예시용 더미 데이터",
+        items=[
+            ReceiptItemDTO(name="진료비", price=20000),
+            ReceiptItemDTO(name="피부약", price=15000),
+        ],
+        totalAmount=35000,
+    )
+    return ReceiptAnalyzeResponseDTO(
+        petId=petId,
+        s3Url=s3_url,
+        parsed=parsed,
+        notes="STUB_MODE=True 더미 응답",
+    )
+
+# 실제 OCR + Gemini
+try:
+    ocr_text = run_vision_ocr_bytes(image_bytes)
+    parsed = parse_receipt_with_gemini(ocr_text)
+    return ReceiptAnalyzeResponseDTO(
+        petId=petId,
+        s3Url=s3_url,
+        parsed=parsed,
+        notes=None,
+    )
+except Exception as e:
+    raise HTTPException(status_code=500, detail=f"영수증 분석 실패: {e}")
+
+PDF 업로드 공통 함수
+============================================================
+
+def handle_pdf_upload(
+folder: str,
+petId: str,
+title: str,
+memo: Optional[str],
+file: UploadFile,
+) -> PdfRecord:
+try:
+data = file.file.read()
+except Exception as e:
+raise HTTPException(status_code=400, detail=f"PDF 읽기 실패: {e}")
+rec_id = str(uuid.uuid4())
+now = datetime.now(timezone.utc).isoformat()
+key = f"{folder}/{petId}/{rec_id}.pdf"
+
+metadata = {"petid": petId, "title": title}
+if memo:
+    metadata["memo"] = memo
+
+url = upload_bytes_to_s3(
+    data=data,
+    key=key,
+    content_type="application/pdf",
+    metadata=metadata,
+)
+
+return PdfRecord(
+    id=rec_id,
+    petId=petId,
+    title=title,
+    memo=memo,
+    s3Url=url,
+    createdAt=now,
+)
+
+검사결과 / 증명서 업로드 + 리스트
+============================================================
+
+@app.post("/lab/upload-pdf", response_model=PdfRecord)
+@app.post("/api/lab/upload-pdf", response_model=PdfRecord)
+async def upload_lab_pdf(
+petId: str = Form(...),
+title: str = Form(...),
+memo: Optional[str] = Form(None),
+file: UploadFile = File(...),
+):
+return handle_pdf_upload("labs", petId, title, memo, file)
+
+@app.post("/cert/upload-pdf", response_model=PdfRecord)
+@app.post("/api/cert/upload-pdf", response_model=PdfRecord)
+async def upload_cert_pdf(
+petId: str = Form(...),
+title: str = Form(...),
+memo: Optional[str] = Form(None),
+file: UploadFile = File(...),
+):
+return handle_pdf_upload("certs", petId, title, memo, file)
+
+@app.get("/labs/list", response_model=List[PdfRecord])
+@app.get("/api/labs/list", response_model=List[PdfRecord])
+def list_labs(petId: Optional[str] = None):
+return list_pdf_records_from_s3("labs", petId)
+
+@app.get("/cert/list", response_model=List[PdfRecord])
+@app.get("/api/cert/list", response_model=List[PdfRecord])
+def list_certs(petId: Optional[str] = None):
+return list_pdf_records_from_s3("certs", petId)
+    
