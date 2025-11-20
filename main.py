@@ -364,7 +364,7 @@ async def analyze_document(payload: AnalysisRequest):
 # Uvicorn 로컬 실행용
 # -------------------------------------------------------------------
 
-if _name_ == "_main_":
+if __name__ == "_main_":
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
