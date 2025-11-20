@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-boto3
-pydantic
-pydantic-settings
-google-generativeai
-python-multipart
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+boto3==1.35.0
+python-multipart==0.0.9
+pydantic==2.8.2
+pydantic-settings==2.4.0
