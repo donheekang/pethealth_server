@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from starlette.responses import JSONResponse
 
-# -------- Settings --------
+# -------- Settings -------
 
 
 class Settings(BaseSettings):
