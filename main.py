@@ -1,370 +1,322 @@
-from __future__ import annotations
+from _future_ import annotations
 
-import logging
 import os
+import uuid
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import List, Optional
 
-from fastapi import (
-    FastAPI,
-    File,
-    Form,
-    HTTPException,
-    UploadFile,
-    Query,
-)
+import boto3
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
-import boto3
-from uuid import uuid4
 
-# -------------------------------------------------------------------
-# 설정 / 환경변수
-# -------------------------------------------------------------------
-
+# =========================
+# 설정
+# =========================
 
 class Settings(BaseSettings):
-    AWS_ACCESS_KEY_ID: str | None = None
-    AWS_SECRET_ACCESS_KEY: str | None = None
-    AWS_REGION: str = "ap-northeast-2"
-    S3_BUCKET_NAME: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_region: str = "ap-northeast-2"
+    s3_bucket_name: str
 
-    GEMINI_API_KEY: str | None = None
-    GEMINI_ENABLED: bool = False
+    gemini_api_key: str | None = None
+    gemini_enabled: bool = False
 
-    # 서버 테스트용 플래그 (S3 / Gemini 안 쓰고 가짜 데이터만)
-    STUB_MODE: bool = True
+    stub_mode: bool = True  # True면 더미 데이터/로직 사용
 
     class Config:
         env_file = ".env"
+        env_file_encoding = "utf-8"
+        # Render 환경변수 이름과 맞추기
+        fields = {
+            "aws_access_key_id": {"env": "AWS_ACCESS_KEY_ID"},
+            "aws_secret_access_key": {"env": "AWS_SECRET_ACCESS_KEY"},
+            "aws_region": {"env": "AWS_REGION"},
+            "s3_bucket_name": {"env": "S3_BUCKET_NAME"},
+            "gemini_api_key": {"env": "GEMINI_API_KEY"},
+            "gemini_enabled": {"env": "GEMINI_ENABLED"},
+            "stub_mode": {"env": "STUB_MODE"},
+        }
 
 
 settings = Settings()
-logger = logging.getLogger("pethealthplus")
-logging.basicConfig(level=logging.INFO)
 
-# -------------------------------------------------------------------
-# S3 클라이언트 (STUB_MODE 이거나 설정이 없으면 None)
-# -------------------------------------------------------------------
+# =========================
+# AWS S3 클라이언트
+# =========================
 
-s3_client = None
-if (
-    not settings.STUB_MODE
-    and settings.AWS_ACCESS_KEY_ID
-    and settings.AWS_SECRET_ACCESS_KEY
-    and settings.S3_BUCKET_NAME
-):
-    session = boto3.session.Session(
-        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-        region_name=settings.AWS_REGION,
-    )
-    s3_client = session.client("s3")
-    logger.info("S3 client initialized")
-else:
-    logger.info("S3 client not initialized (stub mode or missing credentials)")
-
-# -------------------------------------------------------------------
-# (선택) Gemini / OCR – 설치 안 되어 있으면 그냥 None
-# -------------------------------------------------------------------
-
-try:
-    import google.generativeai as genai
-
-    if settings.GEMINI_API_KEY and settings.GEMINI_ENABLED:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        logger.info("Gemini client configured")
-    else:
-        genai = None
-        logger.info("Gemini not enabled")
-except ImportError:
-    genai = None
-    logger.info("google.generativeai is not installed, Gemini disabled")
-
-# -------------------------------------------------------------------
-# 공통 모델
-# -------------------------------------------------------------------
+session = boto3.session.Session(
+    aws_access_key_id=settings.aws_access_key_id,
+    aws_secret_access_key=settings.aws_secret_access_key,
+    region_name=settings.aws_region,
+)
+s3 = session.client("s3")
 
 
-class DocumentRecord(BaseModel):
+def upload_file_to_s3(prefix: str, file: UploadFile, content_type: str) -> str:
     """
-    iOS 쪽에서 검사결과/증명서 둘 다 이런 형태의 JSON을 디코딩한다고 가정.
-    (keyNotFound 방지용으로 넉넉하게 필드 넣어 둠)
+    파일을 S3에 올리고 object key를 반환
     """
+    ext = os.path.splitext(file.filename or "")[1] or ".bin"
+    key = f"{prefix}/{uuid.uuid4().hex}{ext}"
 
+    try:
+        s3.upload_fileobj(
+            file.file,
+            settings.s3_bucket_name,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
+
+    return key
+
+
+def create_presigned_url(key: str, expires_in: int = 60 * 60 * 24 * 7) -> str:
+    """
+    S3 object에 접근 가능한 서명 URL 생성
+    """
+    try:
+        url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": settings.s3_bucket_name, "Key": key},
+            ExpiresIn=expires_in,
+        )
+        return url
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 URL 생성 실패: {e}")
+
+
+# =========================
+# Pydantic 모델 (iOS DTO와 맞춤)
+# =========================
+
+class ReceiptItemDTO(BaseModel):
+    name: str
+    price: Optional[int] = None
+
+
+class ReceiptParsedDTO(BaseModel):
+    clinicName: Optional[str] = None
+    visitDate: Optional[str] = None  # "yyyy-MM-dd"
+    diseaseName: Optional[str] = None
+    symptomsSummary: Optional[str] = None
+    items: List[ReceiptItemDTO] = []
+    totalAmount: Optional[int] = None
+
+
+class ReceiptAnalyzeResponseDTO(BaseModel):
+    petId: str
+    s3Url: str
+    parsed: ReceiptParsedDTO
+    notes: Optional[str] = None
+
+
+class PdfRecord(BaseModel):
     id: str
     petId: str
-    fileName: str
-    fileUrl: str  # iOS struct 에서 fileUrl 로 쓸 수 있게
-    url: str      # 혹시 url 로만 받는 경우도 대비
-    uploadedAt: datetime
-    createdAt: datetime
-    category: str  # "lab" or "cert"
+    title: str
+    memo: Optional[str] = None
+    url: str          # iOS의 PdfRecord.s3Url 로 매핑
+    createdAt: Optional[str] = None  # ISO 문자열
 
 
-# petId별로 메모리상에 저장 (DB 대신 임시 저장소)
-LAB_STORE: Dict[str, List[DocumentRecord]] = {}
-CERT_STORE: Dict[str, List[DocumentRecord]] = {}
+# =========================
+# FastAPI 앱
+# =========================
 
-
-def _get_store(category: str) -> Dict[str, List[DocumentRecord]]:
-    if category == "lab":
-        return LAB_STORE
-    elif category == "cert":
-        return CERT_STORE
-    else:
-        raise ValueError(f"Unknown category: {category}")
-
-
-def _make_document_record(
-    *,
-    category: str,
-    pet_id: str,
-    filename: str,
-    url: str,
-) -> DocumentRecord:
-    now = datetime.now(timezone.utc)
-    return DocumentRecord(
-        id=str(uuid4()),
-        petId=pet_id,
-        fileName=filename,
-        fileUrl=url,
-        url=url,
-        uploadedAt=now,
-        createdAt=now,
-        category=category,
-    )
-
-
-# -------------------------------------------------------------------
-# S3 업로드 헬퍼
-# -------------------------------------------------------------------
-
-
-async def save_pdf_to_s3(category: str, pet_id: str, file: UploadFile) -> str:
-    """
-    PDF 를 S3 에 저장하고, iOS 에서 바로 열 수 있는 presigned URL 을 리턴.
-    STUB_MODE 이거나 S3 설정이 없으면 가짜 URL 리턴.
-    """
-    if settings.STUB_MODE or s3_client is None or not settings.S3_BUCKET_NAME:
-        # 서버/앱 연동 테스트용 가짜 URL
-        fake_url = f"https://example.com/{category}/{pet_id}/{uuid4()}.pdf"
-        logger.info(f"[STUB] return fake url: {fake_url}")
-        return fake_url
-
-    content = await file.read()
-    key = f"{category}/{pet_id}/{uuid4()}_{file.filename}"
-
-    logger.info(f"Uploading to S3: bucket={settings.S3_BUCKET_NAME}, key={key}")
-    s3_client.put_object(
-        Bucket=settings.S3_BUCKET_NAME,
-        Key=key,
-        Body=content,
-        ContentType=file.content_type or "application/pdf",
-    )
-
-    # presigned URL 생성 (예: 7일 유효)
-    url = s3_client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-        ExpiresIn=7 * 24 * 3600,
-    )
-    logger.info(f"Generated presigned url: {url}")
-    return url
-
-
-# -------------------------------------------------------------------
-# FastAPI 앱 초기화
-# -------------------------------------------------------------------
-
-app = FastAPI(title="PetHealth+ Server")
+app = FastAPI(title="PetHealth+ API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # iOS 앱/시뮬레이터에서 자유롭게 호출
+    allow_origins=["*"],  # 필요하면 도메인 제한
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------------------------------------------------
-# 헬스 체크 / 기본 라우트
-# -------------------------------------------------------------------
 
+# =========================
+# 기본/헬스 체크
+# =========================
 
 @app.get("/")
-async def root():
-    """Render 브라우저 및 기본 서버 동작 확인용"""
-    return {"status": "ok", "stubMode": settings.STUB_MODE}
+def root():
+    return {"message": "PetHealth+ API running"}
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
 @app.get("/api/health")
-async def api_health():
-    return {"status": "ok", "stubMode": settings.STUB_MODE}
+def health():
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
-# -------------------------------------------------------------------
-# 검사결과(Lab) 리스트 조회
-#  - iOS 에서 호출하는 엔드포인트: GET /api/lab/list?petId=...
-#  - 브라우저 테스트용 엔드포인트도 같이 묶어둠
-# -------------------------------------------------------------------
+# =========================
+# 검사결과 / 증명서 리스트 (STUB)
+# 실제로는 DB 붙이면 됨
+# =========================
+
+# 간단한 인메모리 스토리지 (STUB_MODE용)
+LAB_STORE: list[PdfRecord] = []
+CERT_STORE: list[PdfRecord] = []
 
 
-@app.get(
-    "/api/lab/list",
-    response_model=list[DocumentRecord],
-)
-@app.get("/labs", response_model=list[DocumentRecord])
-@app.get("/labs/list", response_model=list[DocumentRecord])
-@app.get("/api/labs", response_model=list[DocumentRecord])
-@app.get("/api/labs/list", response_model=list[DocumentRecord])
-async def get_lab_list(petId: str = Query(..., alias="petId")):
+@app.get("/labs/list", response_model=list[PdfRecord])
+@app.get("/api/labs/list", response_model=list[PdfRecord])
+def list_labs(petId: Optional[str] = None):
     """
-    petId 기준으로 검사결과 PDF 리스트 리턴.
+    검사결과 리스트
+    petId가 오면 해당 펫만 필터링
     """
-    store = _get_store("lab")
-    return store.get(petId, [])
+    if petId:
+        return [r for r in LAB_STORE if r.petId == petId]
+    return LAB_STORE
 
 
-# -------------------------------------------------------------------
-# 증명서(Cert) 리스트 조회
-#  - iOS: GET /api/cert/list?petId=...
-# -------------------------------------------------------------------
+@app.get("/cert/list", response_model=list[PdfRecord])
+@app.get("/api/cert/list", response_model=list[PdfRecord])
+def list_certs(petId: Optional[str] = None):
+    """
+    증명서 리스트
+    """
+    if petId:
+        return [r for r in CERT_STORE if r.petId == petId]
+    return CERT_STORE
 
 
-@app.get(
-    "/api/cert/list",
-    response_model=list[DocumentRecord],
-)
-@app.get("/certificates", response_model=list[DocumentRecord])
-@app.get("/api/certificates", response_model=list[DocumentRecord])
-async def get_cert_list(petId: str = Query(..., alias="petId")):
-    store = _get_store("cert")
-    return store.get(petId, [])
+# =========================
+# PDF 업로드 (검사결과 / 증명서)
+# =========================
+
+def _build_pdf_record(
+    store: list[PdfRecord],
+    prefix: str,
+    petId: str,
+    title: str,
+    memo: Optional[str],
+    file: UploadFile,
+) -> PdfRecord:
+    key = upload_file_to_s3(prefix=prefix, file=file, content_type="application/pdf")
+    url = create_presigned_url(key)
+    now = datetime.now(timezone.utc).isoformat()
+
+    record = PdfRecord(
+        id=uuid.uuid4().hex,
+        petId=petId,
+        title=title,
+        memo=memo,
+        url=url,
+        createdAt=now,
+    )
+    store.append(record)
+    return record
 
 
-# -------------------------------------------------------------------
-# 검사결과(Lab) PDF 업로드
-#  - iOS: POST /api/lab/upload-pdf (multipart/form-data)
-#  - Form 필드: petId, file
-#  - 응답: 업로드된 DocumentRecord (iOS struct 와 맞춤)
-# -------------------------------------------------------------------
-
-
-@app.post("/api/lab/upload-pdf", response_model=DocumentRecord)
+@app.post("/lab/upload-pdf", response_model=PdfRecord)
+@app.post("/api/lab/upload-pdf", response_model=PdfRecord)
 async def upload_lab_pdf(
     petId: str = Form(...),
+    title: str = Form(...),
+    memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
-    if file.content_type not in (
-        "application/pdf",
-        "application/octet-stream",
-    ):
-        raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
-
-    url = await save_pdf_to_s3(category="lab", pet_id=petId, file=file)
-    record = _make_document_record(
-        category="lab",
-        pet_id=petId,
-        filename=file.filename,
-        url=url,
+    """
+    검사결과 PDF 업로드
+    """
+    if file.content_type not in ("application/pdf",):
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+    return _build_pdf_record(
+        store=LAB_STORE,
+        prefix="labs",
+        petId=petId,
+        title=title,
+        memo=memo,
+        file=file,
     )
 
-    store = _get_store("lab")
-    store.setdefault(petId, []).append(record)
 
-    return record
-
-
-# -------------------------------------------------------------------
-# 증명서(Cert) PDF 업로드
-#  - iOS: POST /api/cert/upload-pdf (multipart/form-data)
-#  - Form 필드: petId, file
-#  - 응답: DocumentRecord (Lab 과 동일한 구조)
-# -------------------------------------------------------------------
-
-
-@app.post("/api/cert/upload-pdf", response_model=DocumentRecord)
+@app.post("/cert/upload-pdf", response_model=PdfRecord)
+@app.post("/api/cert/upload-pdf", response_model=PdfRecord)
 async def upload_cert_pdf(
     petId: str = Form(...),
+    title: str = Form(...),
+    memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
-    if file.content_type not in (
-        "application/pdf",
-        "application/octet-stream",
-    ):
-        raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
-
-    url = await save_pdf_to_s3(category="cert", pet_id=petId, file=file)
-    record = _make_document_record(
-        category="cert",
-        pet_id=petId,
-        filename=file.filename,
-        url=url,
+    """
+    증명서 PDF 업로드
+    """
+    if file.content_type not in ("application/pdf",):
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
+    return _build_pdf_record(
+        store=CERT_STORE,
+        prefix="certs",
+        petId=petId,
+        title=title,
+        memo=memo,
+        file=file,
     )
 
-    store = _get_store("cert")
-    store.setdefault(petId, []).append(record)
 
-    return record
+# =========================
+# 병원 영수증 OCR → 진료기록 DTO
+# (현재는 STUB: OCR/제미니 없이 더미값 반환)
+# =========================
 
-
-# -------------------------------------------------------------------
-# (선택) OCR + Gemini 분석 엔드포인트 (추가 기능용, 안 쓰면 무시)
-#  - iOS 에서 나중에 쓸 수 있게 기본 형태만 둠
-# -------------------------------------------------------------------
-
-
-class AnalysisRequest(BaseModel):
-    petId: str
-    s3Url: str | None = None
-    text: str | None = None
-
-
-class AnalysisResponse(BaseModel):
-    summary: str
-    weight: float | None = None
-    memo: str | None = None
-
-
-@app.post("/api/analyze", response_model=AnalysisResponse)
-async def analyze_document(payload: AnalysisRequest):
+@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponseDTO)
+async def analyze_receipt(
+    petId: str = Form(...),
+    image: UploadFile = File(...),
+):
     """
-    OCR/Gemini 사용해서 진료/검사 내용을 요약하고,
-    체중 등의 정보를 추출하는 엔드포인트(기본 골격만).
+    병원 영수증 이미지 업로드 + 분석
+    - 이미지 원본은 S3에 저장
+    - 현재는 STUB_MODE 기준으로 더미 분석 결과 반환
     """
-    if not genai or not settings.GEMINI_ENABLED:
-        # Gemini 비활성화 시에는 간단한 더미 응답
-        return AnalysisResponse(
-            summary="AI 분석 기능이 비활성화된 상태입니다.",
-            weight=None,
-            memo=None,
+    if image.content_type not in ("image/jpeg", "image/png", "image/heic", "image/heif"):
+        # iOS에서 heic로 올 수 있으니 넉넉히 허용
+        raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
+
+    # 1) S3에 영수증 이미지 저장
+    key = upload_file_to_s3(prefix=f"receipts/{petId}", file=image, content_type=image.content_type)
+    s3_url = create_presigned_url(key)
+
+    # 2) 실제라면 여기서 Google OCR + Gemini 호출해서 파싱
+    if settings.stub_mode or not settings.gemini_enabled:
+        # 더미 분석 결과
+        parsed = ReceiptParsedDTO(
+            clinicName="해랑동물병원",
+            visitDate=datetime.now().strftime("%Y-%m-%d"),
+            diseaseName="예방접종",
+            symptomsSummary="정기 예방 접종 방문",
+            items=[
+                ReceiptItemDTO(name="DHPPI", price=30000),
+                ReceiptItemDTO(name="Corona", price=25000),
+                ReceiptItemDTO(name="Nexgard Spectra 7.5~15kg", price=26000),
+            ],
+            totalAmount=81000,
         )
+        notes = "STUB_MODE: 실제 OCR 없이 더미 데이터입니다."
+    else:
+        # TODO: Google Vision / Gemini 연동 로직 구현
+        # 지금은 구조만 맞춰두고, 나중에 진짜 분석 붙이면 됨
+        parsed = ReceiptParsedDTO(
+            clinicName=None,
+            visitDate=None,
+            diseaseName=None,
+            symptomsSummary=None,
+            items=[],
+            totalAmount=None,
+        )
+        notes = "분석 로직 미구현 상태입니다."
 
-    prompt = (
-        "아래 텍스트는 반려동물 진료/검사 결과입니다. "
-        "飼い主에게 설명하듯이 한국어로 짧게 요약해 주세요.\n\n"
+    return ReceiptAnalyzeResponseDTO(
+        petId=petId,
+        s3Url=s3_url,
+        parsed=parsed,
+        notes=notes,
     )
-    text = payload.text or payload.s3Url or ""
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    result = model.generate_content(prompt + text)
-    summary = result.text if hasattr(result, "text") else "요약 생성 실패"
-
-    return AnalysisResponse(summary=summary)
-
-
-# -------------------------------------------------------------------
-# Uvicorn 로컬 실행용
-# -------------------------------------------------------------------
-
-if __name__ == "_main_":
-    import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
