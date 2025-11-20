@@ -241,9 +241,19 @@ async def upload_lab_pdf_alias(
     return await upload_lab_pdf(petId=petId, file=file)
 
 
+
+
 # =========================================
 # 증명서(Certificate) PDF 업로드 (필요 시)
 # =========================================
+
+@app.post("/api/cert/upload-pdf")
+async def upload_lab_pdf_alias(
+    petId: str = Form(...),
+    file: UploadFile = File(...),
+):
+    return await upload_cert_pdf(petId=petId, file=file)
+
 
 @app.post("/certificates/upload-pdf")
 async def upload_certificate_pdf(
