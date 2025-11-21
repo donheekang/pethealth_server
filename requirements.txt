@@ -4,3 +4,4 @@ boto3==1.34.162
 google-cloud-vision==3.8.0
 pydantic-settings==2.4.0
 google-generativeai==0.8.1
+python-multipart==0.0.9
