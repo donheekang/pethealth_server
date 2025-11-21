@@ -6,6 +6,7 @@ import json
 import uuid
 import tempfile
 from datetime import datetime
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -161,7 +162,7 @@ def parse_receipt_kor(text: str) -> dict:
     # 금액 패턴
     amt_pattern = re.compile(r"(\d{1,3}(,\d{3})*)\s*원")
 
-    items = []
+    items: List[Dict] = []
     total_amount = 0
 
     for line in lines:
@@ -223,7 +224,14 @@ def health():
 #       * POST /api/receipt/upload
 #       * (구버전) POST /api/receipt/analyze
 #    - multipart: petId(text), file(file) 또는 image(file)
-#    - OCR 실패해도 500 던지지 않고 200 + ocrError 로 응답
+#    - OCR 실패해도 500 던지지 않고 200 + notes 로 응답
+#    - 응답 구조는 iOS DTO 에 맞춰서:
+#        {
+#          "petId": ...,
+#          "s3Url": ...,
+#          "parsed": { clinicName, visitDate, items[{name,price}], totalAmount, ... },
+#          "notes": rawText
+#        }
 # ------------------------------------------
 
 @app.post("/receipt/upload")
@@ -234,17 +242,16 @@ def health():
 @app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
-    file: UploadFile | None = File(None),
-    image: UploadFile | None = File(None),
+    file: Optional[UploadFile] = File(None),
+    image: Optional[UploadFile] = File(None),
 ):
     """
     영수증 이미지 업로드 + Vision OCR (되면 사용, 실패해도 200 응답)
     S3 key: receipts/{petId}/{id}.jpg
     iOS가 file 이나 image 어떤 이름으로 보내도 처리.
     """
-    upload: UploadFile | None = file or image
+    upload: Optional[UploadFile] = file or image
     if upload is None:
-        # 아예 파일이 안 온 경우
         raise HTTPException(status_code=400, detail="no file or image field")
 
     rec_id = str(uuid.uuid4())
@@ -266,7 +273,7 @@ async def upload_receipt(
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR 시도 (실패해도 500 안 던짐)
+    # 2) OCR 시도
     ocr_text = ""
     parsed = {
         "hospitalName": "",
@@ -274,9 +281,8 @@ async def upload_receipt(
         "items": [],
         "totalAmount": 0,
     }
-    ocr_error = None
+    tmp_path: Optional[str] = None
 
-    tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
         with os.fdopen(fd, "wb") as tmp:
@@ -285,26 +291,52 @@ async def upload_receipt(
         ocr_text = run_vision_ocr(tmp_path)
         parsed = parse_receipt_kor(ocr_text)
 
-    except Exception as e:
-        ocr_error = f"{e}"
+    except Exception:
+        # OCR 실패해도 그냥 비워두고 진행
+        pass
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    # ---------- DTO 구조에 맞게 매핑 ----------
+    visit_at = parsed.get("visitAt")
+    visit_date: Optional[str] = None
+    if visit_at:
+        # "2025-11-20T12:51:00" -> "2025-11-20"
+        visit_date = visit_at.split("T")[0]
+
+    dto_items: List[Dict] = []
+    for it in parsed.get("items", []):
+        dto_items.append(
+            {
+                "name": it.get("name"),
+                "price": it.get("amount"),
+            }
+        )
+
+    total_amount = parsed.get("totalAmount")
+
+    # iOS DTO:
+    # struct ReceiptAnalyzeResponseDTO {
+    #   let petId: String
+    #   let s3Url: String
+    #   let parsed: ReceiptParsedDTO
+    #   let notes: String?
+    # }
 
     return {
-        "id": rec_id,
         "petId": petId,
-        "hospitalName": parsed["hospitalName"],
-        "visitAt": parsed["visitAt"],
-        "items": parsed["items"],          # [ { name, amount }, ... ]
-        "totalAmount": parsed["totalAmount"],
         "s3Url": file_url,
-        "rawText": ocr_text,
-        "ocrError": ocr_error,             # 실패 시 에러 문자열, 성공 시 null
-        "createdAt": created_at,
+        "parsed": {
+            "clinicName": parsed.get("hospitalName"),
+            "visitDate": visit_date,
+            "diseaseName": None,
+            "symptomsSummary": None,
+            "items": dto_items,
+            "totalAmount": total_amount,
+        },
+        "notes": ocr_text,
     }
 
 
@@ -321,7 +353,7 @@ async def upload_receipt(
 async def upload_lab_pdf(
     petId: str = Form(...),
     title: str = Form("검사결과"),
-    memo: str | None = Form(None),
+    memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
     lab_id = str(uuid.uuid4())
@@ -353,7 +385,7 @@ async def upload_lab_pdf(
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form("증명서"),
-    memo: str | None = Form(None),
+    memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
     cert_id = str(uuid.uuid4())
@@ -390,7 +422,7 @@ def get_lab_list(petId: str = Query(...)):
         Prefix=prefix,
     )
 
-    items: list[dict] = []
+    items: List[Dict] = []
     if "Contents" in response:
         for obj in response["Contents"]:
             key = obj["Key"]  # lab/{petId}/{id}.pdf
@@ -438,7 +470,7 @@ def get_cert_list(petId: str = Query(...)):
         Prefix=prefix,
     )
 
-    items: list[dict] = []
+    items: List[Dict] = []
     if "Contents" in response:
         for obj in response["Contents"]:
             key = obj["Key"]  # cert/{petId}/{id}.pdf
