@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     GEMINI_ENABLED: str = "false"
     STUB_MODE: str = "false"
 
+
 settings = Settings()
 
 
@@ -221,7 +222,7 @@ def health():
 #    - iOS:
 #       * POST /api/receipt/upload
 #       * (구버전) POST /api/receipt/analyze
-#    - multipart: petId(text), file(file)
+#    - multipart: petId(text), file(file) 또는 image(file)
 #    - OCR 실패해도 500 던지지 않고 200 + ocrError 로 응답
 # ------------------------------------------
 
@@ -229,25 +230,32 @@ def health():
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
-@app.post("/api/receipt/analyze")   # 🔥 옛날 iOS 경로까지 모두 허용
+@app.post("/api/receipt/analyze")   # 옛날 iOS 경로까지 모두 허용
 @app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    image: UploadFile | None = File(None),
 ):
     """
     영수증 이미지 업로드 + Vision OCR (되면 사용, 실패해도 200 응답)
     S3 key: receipts/{petId}/{id}.jpg
+    iOS가 file 이나 image 어떤 이름으로 보내도 처리.
     """
+    upload: UploadFile | None = file or image
+    if upload is None:
+        # 아예 파일이 안 온 경우
+        raise HTTPException(status_code=400, detail="no file or image field")
+
     rec_id = str(uuid.uuid4())
-    _, ext = os.path.splitext(file.filename or "")
+    _, ext = os.path.splitext(upload.filename or "")
     if not ext:
         ext = ".jpg"
 
     key = f"receipts/{petId}/{rec_id}{ext}"
 
     # 파일 데이터 읽기
-    data = await file.read()
+    data = await upload.read()
     file_like = io.BytesIO(data)
     file_like.seek(0)
 
@@ -255,7 +263,7 @@ async def upload_receipt(
     file_url = upload_to_s3(
         file_like,
         key,
-        content_type=file.content_type or "image/jpeg",
+        content_type=upload.content_type or "image/jpeg",
     )
 
     # 2) OCR 시도 (실패해도 500 안 던짐)
