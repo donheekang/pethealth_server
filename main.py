@@ -1,417 +1,322 @@
 from __future__ import annotations
 
 import os
-import uuid
 import json
-from datetime import datetime, timezone
-from typing import Optional, List
+import io
+import tempfile
+from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from google.cloud import vision
+import boto3
+from botocore.exceptions import NoCredentialsError
 from pydantic_settings import BaseSettings
 
-import boto3
-from botocore.client import Config
-from botocore.exceptions import BotoCoreError, ClientError
-
-
-# ============================================================
-#  환경 설정
-# ============================================================
+# ------------------------------------------
+# SETTINGS
+# ------------------------------------------
 
 class Settings(BaseSettings):
-    aws_access_key_id: Optional[str] = None
-    aws_secret_access_key: Optional[str] = None
-    aws_region: str = "ap-northeast-2"
-    s3_bucket_name: str
+    AWS_ACCESS_KEY_ID: str
+    AWS_SECRET_ACCESS_KEY: str
+    AWS_REGION: str
+    S3_BUCKET_NAME: str
 
-    gemini_api_key: Optional[str] = None
-    gemini_enabled: bool = False
-
-    google_application_credentials: Optional[str] = None
-
-    # True면 OCR/Gemini 비활성 + 더미 데이터
-    stub_mode: bool = False
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
+    # 서비스 계정 JSON "내용" 전체를 넣어둘 환경변수
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""
+    GEMINI_ENABLED: str = "false"
+    STUB_MODE: str = "false"  # 필요하면 테스트용
 
 settings = Settings()
 
+# ------------------------------------------
+# S3 CLIENT
+# ------------------------------------------
 
-# ============================================================
-#  FastAPI & CORS
-# ============================================================
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    region_name=settings.AWS_REGION,
+)
 
-app = FastAPI(title="PetHealth+ Backend")
+
+def upload_to_s3(file_obj, key: str, content_type: str | None = None) -> str:
+    """
+    주어진 file-like 객체를 S3에 업로드하고 presigned URL 반환
+    """
+    if content_type is None:
+        content_type = "application/octet-stream"
+
+    try:
+        s3_client.upload_fileobj(
+            file_obj,
+            settings.S3_BUCKET_NAME,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+            ExpiresIn=3600,
+        )
+        return url
+
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {str(e)}")
+
+
+# ------------------------------------------
+# GOOGLE VISION OCR
+# ------------------------------------------
+
+def get_vision_client() -> vision.ImageAnnotatorClient:
+    """
+    Render 환경변수 GOOGLE_APPLICATION_CREDENTIALS 에
+    서비스계정 JSON '문자열'이 들어있다는 전제
+    """
+    json_str = settings.GOOGLE_APPLICATION_CREDENTIALS
+
+    if not json_str:
+        raise Exception("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 비어있습니다.")
+
+    try:
+        info = json.loads(json_str)
+        client = vision.ImageAnnotatorClient.from_service_account_info(info)
+        return client
+    except Exception as e:
+        raise Exception(f"OCR 클라이언트 생성 실패: {e}")
+
+
+def run_vision_ocr(image_path: str) -> str:
+    """
+    Google Vision OCR 실행 후 전체 텍스트 반환
+    """
+    client = get_vision_client()
+
+    with open(image_path, "rb") as f:
+        content = f.read()
+
+    image = vision.Image(content=content)
+    response = client.text_detection(image=image)
+
+    if response.error.message:
+        raise Exception(f"OCR 에러: {response.error.message}")
+
+    texts = response.text_annotations
+    if not texts:
+        return ""
+
+    return texts[0].description
+
+
+# ------------------------------------------
+# FASTAPI APP 기본 설정
+# ------------------------------------------
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
 )
 
-
-# ============================================================
-#  S3 유틸
-# ============================================================
-
-def get_s3_client():
-    if not settings.aws_access_key_id or not settings.aws_secret_access_key:
-        raise RuntimeError("AWS credentials missing")
-    return boto3.client(
-        "s3",
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-        region_name=settings.aws_region,
-        config=Config(s3={"addressing_style": "path"}),
-    )
-
-
-def upload_bytes_to_s3(
-    data: bytes,
-    key: str,
-    content_type: str,
-    metadata: Optional[dict] = None,
-) -> str:
-    try:
-        s3 = get_s3_client()
-        extra = {"ContentType": content_type}
-        if metadata:
-            extra["Metadata"] = metadata
-
-        s3.put_object(
-            Bucket=settings.s3_bucket_name,
-            Key=key,
-            Body=data,
-            **extra,
-        )
-
-        # presigned URL
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.s3_bucket_name, "Key": key},
-            ExpiresIn=7 * 24 * 3600,
-        )
-        return url
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(status_code=500, detail=f"S3 upload error: {e}")
-        # ============================================================
-#  OCR / Gemini 초기화 (서버 죽지 않도록 보호)
-# ============================================================
-
-# Vision
-try:
-    from google.cloud import vision  # type: ignore
-except Exception as e:
-    print("⚠️ google.cloud.vision import 실패:", e)
-    vision = None
-
-# Gemini
-try:
-    import google.generativeai as genai  # type: ignore
-except Exception as e:
-    print("⚠️ google.generativeai import 실패:", e)
-    genai = None
-
-
-# Vision Client
-vision_client: Optional["vision.ImageAnnotatorClient"] = None
-if vision is not None:
-    try:
-        if settings.google_application_credentials:
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.google_application_credentials
-        vision_client = vision.ImageAnnotatorClient()
-        print("✅ Vision OCR 초기화 성공")
-    except Exception as e:
-        print("⚠️ Vision OCR 초기화 실패:", e)
-        vision_client = None
-
-
-# Gemini Client
-if settings.gemini_enabled and settings.gemini_api_key and genai is not None:
-    try:
-        genai.configure(api_key=settings.gemini_api_key)
-        print("✅ Gemini 초기화 성공")
-    except Exception as e:
-        print("⚠️ Gemini 초기화 실패:", e)
-        settings.gemini_enabled = False
-else:
-    settings.gemini_enabled = False
-
-
-# ============================================================
-#  OCR 함수
-# ============================================================
-
-async def run_vision_ocr(image_bytes: bytes) -> str:
-    """ Vision OCR → 원문 텍스트 """
-    if settings.stub_mode:
-        return "테스트 OCR 결과 입니다."
-
-    if vision_client is None:
-        raise HTTPException(status_code=500, detail="Vision OCR 사용 불가 (환경 설정 오류)")
-
-    try:
-        img = vision.Image(content=image_bytes)
-        response = vision_client.text_detection(image=img)
-        if response.error.message:
-            raise RuntimeError(response.error.message)
-
-        texts = [t.description for t in response.text_annotations]
-        return texts[0] if texts else ""
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR 오류: {e}")
-
-
-# ============================================================
-#  Gemini (LLM) 파싱
-# ============================================================
-
-async def parse_with_gemini(ocr_text: str) -> dict:
-    """
-    OCR 결과를 기반으로 병원명/날짜/항목/금액 파싱
-    """
-    if settings.stub_mode:
-        return {
-            "clinicName": "테스트동물병원",
-            "timestamp": "2025-11-20 12:30",
-            "items": [
-                {"name": "DHPPi", "price": 30000},
-                {"name": "Corona", "price": 25000},
-            ],
-            "totalAmount": 55000,
-        }
-
-    if not settings.gemini_enabled or genai is None:
-        raise HTTPException(status_code=500, detail="Gemini 사용 불가 (환경 설정 오류)")
-
-    prompt = f"""
-다음 OCR 텍스트에서 병원명, 날짜/시간, 진료 항목과 금액을 JSON으로 정확하게 추출하라.
-
-OCR 텍스트:
-{ocr_text}
-
-JSON 구조:
-{{
-  "clinicName": "...",
-  "timestamp": "YYYY-MM-DD HH:MM",
-  "items": [
-      {{"name": "...", "price": 0000}}
-  ],
-  "totalAmount": 0000
-}}
-"""
-
-    try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        parsed = json.loads(response.text)
-        return parsed
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini 파싱 오류: {e}")
-        # ============================================================
-#  데이터 모델
-# ============================================================
-
-class ReceiptParsed(BaseModel):
-    clinicName: Optional[str]
-    timestamp: Optional[str]
-    items: List[dict] = []
-    totalAmount: Optional[int]
-
-
-class ReceiptAnalyzeResponse(BaseModel):
-    petId: str
-    s3Url: str
-    parsed: ReceiptParsed
-    notes: Optional[str] = None
-
-
-class PdfRecord(BaseModel):
-    id: str
-    petId: str
-    title: str
-    memo: Optional[str] = None
-    s3Url: str
-    createdAt: str
-
-
-# ============================================================
-#  헬스 체크
-# ============================================================
-
+# 루트 & 헬스체크
 @app.get("/")
-async def root():
-    return {"msg": "PetHealth+ server alive"}
-
+def root():
+    return {"status": "ok", "message": "PetHealth+ Server Running"}
 
 @app.get("/health")
 @app.get("/api/health")
-async def health():
+def health():
+    return {"status": "ok"}
+
+
+# ------------------------------------------
+# 1) 영수증 이미지 업로드 + OCR
+#    /receipt/upload, /api/receipt/upload
+# ------------------------------------------
+
+@app.post("/receipt/upload")
+@app.post("/api/receipt/upload")
+async def upload_receipt(file: UploadFile = File(...)):
+    """
+    영수증 이미지 업로드 + Vision OCR 수행
+    - 이미지 S3 업로드
+    - /tmp 에 임시 파일 저장 후 OCR
+    - ocrText 와 fileUrl 을 함께 반환
+    """
+
+    # 파일 확장자
+    _, ext = os.path.splitext(file.filename)
+    if not ext:
+        ext = ".jpg"
+
+    key = f"receipts/{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+
+    # 파일 내용을 메모리로 읽기
+    data = await file.read()
+
+    # 1) S3 업로드
+    file_like = io.BytesIO(data)
+    file_like.seek(0)
+    file_url = upload_to_s3(
+        file_like,
+        key,
+        content_type=file.content_type or "image/jpeg",
+    )
+
+    # 2) OCR용 임시 파일 생성
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        ocr_text = run_vision_ocr(tmp_path)
+    except Exception as e:
+        # 여기서 에러 문구를 그대로 보내면 네가 지금 보는
+        # "Vision OCR 사용 불가 (환경 설정 오류)" 같은 팝업이 뜨는 부분
+        raise HTTPException(
+            status_code=500,
+            detail=f"Vision OCR 사용 불가 (환경 설정 오류): {e}",
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
     return {
-        "status": "ok",
-        "ocr": vision_client is not None,
-        "gemini": settings.gemini_enabled,
-        "stub": settings.stub_mode,
+        "id": key,
+        "fileUrl": file_url,
+        "fileName": file.filename,
+        "ocrText": ocr_text,
+        "type": "receipt",
     }
 
 
-# ============================================================
-#  1) 영수증 분석 (OCR → Gemini → S3 저장)
-# ============================================================
+# ------------------------------------------
+# 2) 검사결과 PDF 업로드
+#    /lab/upload-pdf, /api/lab/upload-pdf
+# ------------------------------------------
 
-@app.post("/api/receipt/analyze", response_model=ReceiptAnalyzeResponse)
-async def analyze_receipt(
-    petId: str = Form(...),
-    image: UploadFile = File(...)
-):
-    print("📥 /api/receipt/analyze 요청 들어옴")
+@app.post("/lab/upload-pdf")
+@app.post("/api/lab/upload-pdf")
+async def upload_lab_pdf(file: UploadFile = File(...)):
+    """
+    검사결과 PDF 업로드
+    """
+    filename = f"labs/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    file_like = file.file  # PDF는 스트림 그대로 사용
+    file_url = upload_to_s3(file_like, filename, content_type="application/pdf")
 
-    img_bytes = await image.read()
-
-    # OCR 수행
-    ocr_text = await run_vision_ocr(img_bytes)
-
-    # Gemini 파싱
-    parsed = await parse_with_gemini(ocr_text)
-
-    # S3 저장
-    object_key = f"receipt/{petId}/{uuid.uuid4()}.jpg"
-    s3_url = upload_bytes_to_s3(
-        img_bytes,
-        object_key,
-        content_type="image/jpeg",
-    )
-
-    response = ReceiptAnalyzeResponse(
-        petId=petId,
-        s3Url=s3_url,
-        parsed=ReceiptParsed(**parsed),
-        notes=ocr_text[:500]
-    )
-    return response
+    return {
+        "id": filename,
+        "fileUrl": file_url,
+        "fileName": file.filename,
+        "type": "lab",
+    }
 
 
-# ============================================================
-#  2) 검사결과 PDF 업로드
-# ============================================================
+# ------------------------------------------
+# 3) 증명서 PDF 업로드
+#    /cert/upload-pdf, /api/cert/upload-pdf
+# ------------------------------------------
 
-@app.post("/api/lab/upload-pdf", response_model=PdfRecord)
-async def upload_lab_pdf(
-    petId: str = Form(...),
-    title: str = Form(...),
-    memo: Optional[str] = Form(None),
-    file: UploadFile = File(...)
-):
-    print("📥 /api/lab/upload-pdf 요청")
+@app.post("/cert/upload-pdf")
+@app.post("/api/cert/upload-pdf")
+async def upload_cert_pdf(file: UploadFile = File(...)):
+    """
+    증명서 PDF 업로드
+    """
+    filename = f"certs/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    file_like = file.file
+    file_url = upload_to_s3(file_like, filename, content_type="application/pdf")
 
-    pdf_bytes = await file.read()
+    return {
+        "id": filename,
+        "fileUrl": file_url,
+        "fileName": file.filename,
+        "type": "cert",
+    }
 
-    object_key = f"lab/{petId}/{uuid.uuid4()}.pdf"
-    s3_url = upload_bytes_to_s3(
-        pdf_bytes,
-        object_key,
-        content_type="application/pdf",
-    )
 
-    return PdfRecord(
-        id=str(uuid.uuid4()),
-        petId=petId,
-        title=title,
-        memo=memo,
-        s3Url=s3_url,
-        createdAt=datetime.now(timezone.utc).isoformat()
-    )
+# ------------------------------------------
+# 4) 검사결과 리스트
+#    /labs/list, /api/labs/list
+# ------------------------------------------
+
+@app.get("/labs/list")
 @app.get("/api/labs/list")
-async def list_labs(petId: str):
-    s3 = get_s3_client()
-
-    prefix = f"lab/{petId}/"
-    objects = s3.list_objects_v2(Bucket=settings.s3_bucket_name, Prefix=prefix)
-
-    results = []
-    for obj in objects.get("Contents", []):
-        key = obj["Key"]
-
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.s3_bucket_name, "Key": key},
-            ExpiresIn=7*24*3600,
-        )
-
-        results.append({
-            "id": key.split("/")[-1].replace(".pdf", ""),
-            "petId": petId,
-            "title": "검사결과",
-            "memo": None,
-            "s3Url": url,
-            "createdAt": obj["LastModified"].isoformat(),
-        })
-
-    return results
-
-# ============================================================
-#  3) 증명서 PDF 업로드
-# ============================================================
-
-@app.post("/api/cert/upload-pdf", response_model=PdfRecord)
-async def upload_cert_pdf(
-    petId: str = Form(...),
-    title: str = Form(...),
-    memo: Optional[str] = Form(None),
-    file: UploadFile = File(...)
-):
-    print("📥 /api/cert/upload-pdf 요청")
-
-    pdf_bytes = await file.read()
-
-    object_key = f"cert/{petId}/{uuid.uuid4()}.pdf"
-    s3_url = upload_bytes_to_s3(
-        pdf_bytes,
-        object_key,
-        content_type="application/pdf",
+def get_labs_list():
+    """
+    S3 labs/ 폴더의 PDF 목록 조회
+    """
+    response = s3_client.list_objects_v2(
+        Bucket=settings.S3_BUCKET_NAME,
+        Prefix="labs/",
     )
 
-    return PdfRecord(
-        id=str(uuid.uuid4()),
-        petId=petId,
-        title=title,
-        memo=memo,
-        s3Url=s3_url,
-        createdAt=datetime.now(timezone.utc).isoformat()
-    )
+    items = []
+    if "Contents" in response:
+        for obj in response["Contents"]:
+            key = obj["Key"]
+            if key.endswith(".pdf"):
+                url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                    ExpiresIn=3600,
+                )
+                items.append(
+                    {
+                        "id": key,
+                        "fileName": key.split("/")[-1],
+                        "fileUrl": url,
+                    }
+                )
+
+    return {"items": items}
+
+
+# ------------------------------------------
+# 5) 증명서 리스트
+#    /cert/list, /api/cert/list
+# ------------------------------------------
+
+@app.get("/cert/list")
 @app.get("/api/cert/list")
-async def list_certs(petId: str):
-    s3 = get_s3_client()
+def get_cert_list():
+    """
+    S3 certs/ 폴더의 PDF 목록 조회
+    """
+    response = s3_client.list_objects_v2(
+        Bucket=settings.S3_BUCKET_NAME,
+        Prefix="certs/",
+    )
 
-    prefix = f"cert/{petId}/"
-    objects = s3.list_objects_v2(Bucket=settings.s3_bucket_name, Prefix=prefix)
+    items = []
+    if "Contents" in response:
+        for obj in response["Contents"]:
+            key = obj["Key"]
+            if key.endswith(".pdf"):
+                url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                    ExpiresIn=3600,
+                )
+                items.append(
+                    {
+                        "id": key,
+                        "fileName": key.split("/")[-1],
+                        "fileUrl": url,
+                    }
+                )
 
-    results = []
-    for obj in objects.get("Contents", []):
-        key = obj["Key"]
-
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": settings.s3_bucket_name, "Key": key},
-            ExpiresIn=7*24*3600,
-        )
-
-        results.append({
-            "id": key.split("/")[-1].replace(".pdf", ""),
-            "petId": petId,
-            "title": "증명서",
-            "memo": None,
-            "s3Url": url,
-            "createdAt": obj["LastModified"].isoformat(),
-        })
-
-    return results
+    return {"items": items}
