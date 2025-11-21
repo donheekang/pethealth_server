@@ -15,6 +15,12 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from pydantic_settings import BaseSettings
 
+# Gemini (google-generativeai) - 설치 안 되어 있어도 서버가 죽지 않게 try/except
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
 
 # ------------------------------------------
 # SETTINGS
@@ -26,10 +32,13 @@ class Settings(BaseSettings):
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # 서비스 계정 JSON 내용 또는 JSON 파일 경로
+    # 서비스 계정 JSON 내용 또는 JSON 파일 경로 (Vision OCR)
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
+    # Gemini 사용 여부 + API Key
     GEMINI_ENABLED: str = "false"
+    GEMINI_API_KEY: str = ""
+
     STUB_MODE: str = "false"
 
 
@@ -129,8 +138,54 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------
-# 영수증 OCR 결과 파싱
+# 영수증 OCR 결과 파싱 (정규식 Fallback)
 # ------------------------------------------
+
+def guess_hospital_name(lines: List[str]) -> str:
+    """
+    병원명 추론: 키워드 + 위치 + 형태 기반으로 대략 고르기
+    """
+    keywords = [
+        "동물병원", "동물 병원", "동물의료", "동물메디컬", "동물 메디컬",
+        "동물클리닉", "동물 클리닉",
+        "애견병원", "애완동물병원", "펫병원", "펫 병원",
+        "종합동물병원", "동물의원", "동물병의원"
+    ]
+
+    best_line = None
+    best_score = -1
+
+    for idx, line in enumerate(lines):
+        score = 0
+        text = line.replace(" ", "")
+
+        # 1) 키워드 점수
+        if any(k in text for k in keywords):
+            score += 5
+
+        # 2) 위치 점수 (위쪽일수록 가산점)
+        if idx <= 4:
+            score += 2
+
+        # 3) 주소/전화번호처럼 보이면 감점
+        if any(x in line for x in ["TEL", "전화", "FAX", "팩스", "도로명"]):
+            score -= 2
+        digit_count = sum(c.isdigit() for c in line)
+        if digit_count >= 8:
+            score -= 1
+
+        # 4) 길이 너무 짧거나 너무 길면 감점
+        if len(line) < 2 or len(line) > 25:
+            score -= 1
+
+        if score > best_score:
+            best_score = score
+            best_line = line
+
+    if best_line is None and lines:
+        return lines[0]
+    return best_line or ""
+
 
 def parse_receipt_kor(text: str) -> dict:
     """
@@ -139,18 +194,20 @@ def parse_receipt_kor(text: str) -> dict:
     - visitAt
     - items [{ name, amount }]
     - totalAmount
-    로 대략 파싱
+    로 대략 파싱 (정규식 기반 fallback)
     """
     import re
 
+    # 공백 줄 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    hospital_name = lines[0] if lines else ""
+    # 1) 병원명
+    hospital_name = guess_hospital_name(lines)
 
-    # 날짜/시간
+    # 2) 날짜/시간: 2025.11.20 12:51, 2025-11-20 12:51, 2025년 11월 20일 12:51 등
     visit_at = None
     dt_pattern = re.compile(
-        r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})[^\d]{0,3}(\d{1,2}):(\d{2})"
+        r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
     )
     for line in lines:
         m = dt_pattern.search(line)
@@ -159,16 +216,20 @@ def parse_receipt_kor(text: str) -> dict:
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%dT%H:%M:%S")
             break
 
-    # 금액 패턴
-    amt_pattern = re.compile(r"(\d{1,3}(,\d{3})*)\s*원")
+    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원 모두 허용)
+    amt_pattern = re.compile(
+        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\s*원)?\s*$"
+    )
 
     items: List[Dict] = []
     total_amount = 0
+    candidate_totals: List[int] = []
 
     for line in lines:
         m = amt_pattern.search(line)
         if not m:
             continue
+
         amount_str = m.group(1).replace(",", "")
         try:
             amount = int(amount_str)
@@ -176,13 +237,25 @@ def parse_receipt_kor(text: str) -> dict:
             continue
 
         name = line[:m.start()].strip()
+        lowered = name.replace(" ", "")
+
+        # 합계/총액 줄은 total 후보
+        if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액"]):
+            candidate_totals.append(amount)
+            continue
+
         if not name:
             name = "항목"
 
         items.append({"name": name, "amount": amount})
 
-    if items:
+    # 4) totalAmount 결정
+    if candidate_totals:
+        total_amount = max(candidate_totals)
+    elif items:
         total_amount = sum(i["amount"] for i in items)
+    else:
+        total_amount = 0
 
     return {
         "hospitalName": hospital_name,
@@ -190,6 +263,103 @@ def parse_receipt_kor(text: str) -> dict:
         "items": items,
         "totalAmount": total_amount,
     }
+
+
+# ------------------------------------------
+# Gemini LLM 를 이용한 AI 파싱
+# ------------------------------------------
+
+def parse_receipt_ai(raw_text: str) -> Optional[dict]:
+    """
+    Gemini로 영수증 텍스트를 파싱해서
+    ReceiptParsedDTO 에 맞는 dict 리턴:
+    {
+      "clinicName": str | null,
+      "visitDate": "YYYY-MM-DD" | null,
+      "diseaseName": str | null,
+      "symptomsSummary": str | null,
+      "items": [ { "name": str, "price": int | null }, ... ],
+      "totalAmount": int | null
+    }
+    실패하면 None 리턴 (fallback 은 정규식 파서)
+    """
+    if settings.GEMINI_ENABLED.lower() != "true":
+        return None
+    if not settings.GEMINI_API_KEY:
+        return None
+    if genai is None:
+        return None
+
+    try:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+
+        model = genai.GenerativeModel("gemini-1.5-flash")
+
+        prompt = f"""
+너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+
+다음은 OCR로 읽은 영수증 텍스트야:
+
+\"\"\"{raw_text}\"\"\"
+
+
+이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
+한국어로 되어 있어도 상관 없지만, 키 이름은 반드시 아래와 같아야 해.
+
+반드시 이 JSON "한 개"만, 추가 설명 없이 순수 JSON으로만 출력해.
+
+형식:
+{{
+  "clinicName": string or null,
+  "visitDate": string or null,   // 형식: "YYYY-MM-DD"
+  "diseaseName": string or null,
+  "symptomsSummary": string or null,
+  "items": [
+    {{
+      "name": string,
+      "price": integer or null
+    }},
+    ...
+  ],
+  "totalAmount": integer or null
+}}
+"""
+
+        resp = model.generate_content(prompt)
+        text = resp.text.strip()
+
+        # 혹시 ⁠ json ...  ⁠ 같은 마크다운이 섞여 있을 수 있으니 정리
+        if "```" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1:
+                text = text[start:end+1]
+
+        data = json.loads(text)
+
+        # 최소 키 검증
+        for key in ["clinicName", "visitDate", "items", "totalAmount"]:
+            if key not in data:
+                # 핵심 키 빠져 있으면 실패 취급
+                return None
+
+        # items가 없거나 이상하면 리스트로 정규화
+        if not isinstance(data.get("items"), list):
+            data["items"] = []
+
+        # 각 item의 필드 보정
+        fixed_items = []
+        for it in data["items"]:
+            name = it.get("name") if isinstance(it, dict) else None
+            price = it.get("price") if isinstance(it, dict) else None
+            fixed_items.append({"name": name, "price": price})
+        data["items"] = fixed_items
+
+        return data
+
+    except Exception:
+        # AI 파싱 실패하면 그냥 None (정규식 fallback 사용)
+        return None
 
 
 # ------------------------------------------
@@ -224,8 +394,8 @@ def health():
 #       * POST /api/receipt/upload
 #       * (구버전) POST /api/receipt/analyze
 #    - multipart: petId(text), file(file) 또는 image(file)
-#    - OCR 실패해도 500 던지지 않고 200 + notes 로 응답
-#    - 응답 구조는 iOS DTO 에 맞춰서:
+#    - OCR → AI 파싱 우선 → 실패 시 정규식 파싱
+#    - 응답은 iOS DTO 에 맞춰:
 #        {
 #          "petId": ...,
 #          "s3Url": ...,
@@ -246,7 +416,7 @@ async def upload_receipt(
     image: Optional[UploadFile] = File(None),
 ):
     """
-    영수증 이미지 업로드 + Vision OCR (되면 사용, 실패해도 200 응답)
+    영수증 이미지 업로드 + Vision OCR + (옵션) Gemini AI 분석
     S3 key: receipts/{petId}/{id}.jpg
     iOS가 file 이나 image 어떤 이름으로 보내도 처리.
     """
@@ -273,49 +443,61 @@ async def upload_receipt(
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR 시도
+    # 2) OCR 실행
     ocr_text = ""
-    parsed = {
-        "hospitalName": "",
-        "visitAt": None,
-        "items": [],
-        "totalAmount": 0,
-    }
     tmp_path: Optional[str] = None
-
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
         with os.fdopen(fd, "wb") as tmp:
             tmp.write(data)
 
         ocr_text = run_vision_ocr(tmp_path)
-        parsed = parse_receipt_kor(ocr_text)
 
     except Exception:
-        # OCR 실패해도 그냥 비워두고 진행
-        pass
-
+        # OCR 실패해도 빈 문자열
+        ocr_text = ""
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    # ---------- DTO 구조에 맞게 매핑 ----------
-    visit_at = parsed.get("visitAt")
-    visit_date: Optional[str] = None
-    if visit_at:
-        # "2025-11-20T12:51:00" -> "2025-11-20"
-        visit_date = visit_at.split("T")[0]
+    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
+    parsed_for_dto: dict
 
-    dto_items: List[Dict] = []
-    for it in parsed.get("items", []):
-        dto_items.append(
-            {
-                "name": it.get("name"),
-                "price": it.get("amount"),
-            }
-        )
+    ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
+    if ai_parsed:
+        # 바로 DTO 구조에 맞는 형태
+        parsed_for_dto = ai_parsed
+    else:
+        # 정규식 파싱 (이전 방식)
+        fallback = parse_receipt_kor(ocr_text) if ocr_text else {
+            "hospitalName": "",
+            "visitAt": None,
+            "items": [],
+            "totalAmount": 0,
+        }
 
-    total_amount = parsed.get("totalAmount")
+        visit_at = fallback.get("visitAt")
+        visit_date: Optional[str] = None
+        if visit_at:
+            visit_date = visit_at.split("T")[0]
+
+        dto_items: List[Dict] = []
+        for it in fallback.get("items", []):
+            dto_items.append(
+                {
+                    "name": it.get("name"),
+                    "price": it.get("amount"),
+                }
+            )
+
+        parsed_for_dto = {
+            "clinicName": fallback.get("hospitalName"),
+            "visitDate": visit_date,
+            "diseaseName": None,
+            "symptomsSummary": None,
+            "items": dto_items,
+            "totalAmount": fallback.get("totalAmount"),
+        }
 
     # iOS DTO:
     # struct ReceiptAnalyzeResponseDTO {
@@ -328,14 +510,7 @@ async def upload_receipt(
     return {
         "petId": petId,
         "s3Url": file_url,
-        "parsed": {
-            "clinicName": parsed.get("hospitalName"),
-            "visitDate": visit_date,
-            "diseaseName": None,
-            "symptomsSummary": None,
-            "items": dto_items,
-            "totalAmount": total_amount,
-        },
+        "parsed": parsed_for_dto,
         "notes": ocr_text,
     }
 
