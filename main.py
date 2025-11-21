@@ -25,8 +25,7 @@ class Settings(BaseSettings):
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # 서비스 계정 JSON "내용" 전체
-    GOOGLE_APPLICATION_CREDENTIALS: str = ""
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""  # 서비스계정 JSON 내용
     GEMINI_ENABLED: str = "false"
     STUB_MODE: str = "false"
 
@@ -132,20 +131,20 @@ def health():
 
 # ------------------------------------------
 # 1) 진료기록 OCR (영수증 이미지)
-#    ※ iOS에서 실제 호출하는 경로에 맞게 수정 필요
-#    일단 /receipt/upload /api/receipt/upload 으로 둠
+#    receipt / receipts + api/ 둘 다 받기
 # ------------------------------------------
 
 @app.post("/receipt/upload")
+@app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
+@app.post("/api/receipts/upload")
 async def upload_receipt(
     petId: str = Form(...),
     file: UploadFile = File(...),
 ):
     """
     영수증 이미지 업로드 + Vision OCR
-    - 이미지: receipts/{petId}/{id}.jpg
-    - 응답: OCR 텍스트 포함
+    - S3 key: receipts/{petId}/{id}.jpg
     """
     rec_id = str(uuid.uuid4())
     _, ext = os.path.splitext(file.filename or "")
@@ -164,7 +163,6 @@ async def upload_receipt(
         content_type=file.content_type or "image/jpeg",
     )
 
-    # OCR용 임시 파일
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
@@ -184,8 +182,6 @@ async def upload_receipt(
 
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # iOS 쪽에서 뭐로 받을지는 나중에 맞춰야 하지만,
-    # 일단 공통 필드 구조 맞춰서 반환
     return {
         "id": rec_id,
         "petId": petId,
@@ -198,12 +194,13 @@ async def upload_receipt(
 
 # ------------------------------------------
 # 2) 검사결과 PDF 업로드
-#    /lab/upload-pdf, /api/lab/upload-pdf
-#    → iOS가 기대하는 구조: LabRecord 한 개
+#    lab / labs + api/ 모두 받기
 # ------------------------------------------
 
 @app.post("/lab/upload-pdf")
+@app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
+@app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
     title: str = Form("검사결과"),
@@ -217,7 +214,6 @@ async def upload_lab_pdf(
 
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 🔥 iOS 팝업 raw에 찍힌 구조에 맞춤
     return {
         "id": lab_id,
         "petId": petId,
@@ -230,11 +226,13 @@ async def upload_lab_pdf(
 
 # ------------------------------------------
 # 3) 증명서 PDF 업로드
-#    /cert/upload-pdf, /api/cert/upload-pdf
+#    cert / certs + api/ 모두 받기
 # ------------------------------------------
 
 @app.post("/cert/upload-pdf")
+@app.post("/certs/upload-pdf")
 @app.post("/api/cert/upload-pdf")
+@app.post("/api/certs/upload-pdf")
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form("증명서"),
@@ -260,13 +258,14 @@ async def upload_cert_pdf(
 
 # ------------------------------------------
 # 4) 검사결과 리스트
-#    /lab/list, /api/lab/list  (단수 lab)
-#    쿼리: ?petId=...
-#    응답: [ { id, petId, title, memo, s3Url, createdAt }, ... ]
+#    /lab/list, /labs/list, /api/lab/list, /api/labs/list
+#    ?petId=...  (원래 쓰던 쿼리 그대로)
 # ------------------------------------------
 
 @app.get("/lab/list")
+@app.get("/labs/list")
 @app.get("/api/lab/list")
+@app.get("/api/labs/list")
 def get_lab_list(petId: str = Query(...)):
     prefix = f"lab/{petId}/"
 
@@ -301,18 +300,19 @@ def get_lab_list(petId: str = Query(...)):
                 }
             )
 
-    # 🔥 iOS는 배열 자체를 기대하므로 items 만 반환
+    # iOS는 배열 그대로 기대하고 있어서 items만 반환
     return items
 
 
 # ------------------------------------------
 # 5) 증명서 리스트
-#    /cert/list, /api/cert/list
-#    쿼리: ?petId=...
+#    /cert/list, /certs/list, /api/cert/list, /api/certs/list
 # ------------------------------------------
 
 @app.get("/cert/list")
+@app.get("/certs/list")
 @app.get("/api/cert/list")
+@app.get("/api/certs/list")
 def get_cert_list(petId: str = Query(...)):
     prefix = f"cert/{petId}/"
 
