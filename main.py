@@ -25,11 +25,11 @@ class Settings(BaseSettings):
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # 서비스 계정 JSON 내용 또는 파일 경로
+    # 서비스 계정 JSON 내용 또는 JSON 파일 경로
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
     GEMINI_ENABLED: str = "false"
-    STUB_MODE: str = "false"   # 필요하면 테스트용으로 사용
+    STUB_MODE: str = "false"
 
 settings = Settings()
 
@@ -80,19 +80,19 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
     GOOGLE_APPLICATION_CREDENTIALS:
       - 서비스 계정 JSON '내용'일 수도 있고
       - JSON 파일 경로일 수도 있음
-    둘 다 지원하게 구성
+    둘 다 지원
     """
     cred_value = settings.GOOGLE_APPLICATION_CREDENTIALS
     if not cred_value:
         raise Exception("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 비어있습니다.")
 
-    # 1) JSON 내용으로 시도
+    # 1) JSON 내용 시도
     try:
         info = json.loads(cred_value)
         client = vision.ImageAnnotatorClient.from_service_account_info(info)
         return client
     except json.JSONDecodeError:
-        # 2) JSON이 아니면 '파일 경로'로 간주
+        # 2) JSON이 아니면 경로로 간주
         if not os.path.exists(cred_value):
             raise Exception(
                 "GOOGLE_APPLICATION_CREDENTIALS가 JSON도 아니고, "
@@ -127,18 +127,18 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------
-# 영수증 OCR 결과 파싱 (병원명 / 시간 / 항목 / 금액)
+# 영수증 OCR 결과 파싱
+#  - 병원명 / 방문시간 / 항목 리스트 / 총액
 # ------------------------------------------
 
 def parse_receipt_kor(text: str) -> dict:
     """
     한국 동물병원 영수증 OCR 텍스트를
-    - 병원명
-    - 방문시간
-    - 항목 리스트(이름+금액)
-    - 총액
-    으로 대략 파싱
-    (완벽한 건 아니고, 기본 구조 뽑기용)
+    - hospitalName
+    - visitAt
+    - items [{ name, amount }]
+    - totalAmount
+    로 대략 파싱
     """
     import re
 
@@ -146,7 +146,7 @@ def parse_receipt_kor(text: str) -> dict:
 
     hospital_name = lines[0] if lines else ""
 
-    # 날짜/시간 (2025-11-19 08:26 / 2025.11.19 08:26 / 2025년 11월 19일 08:26 등)
+    # 날짜/시간 (2025-11-19 08:26 / 2025.11.19 08:26 / 2025년 11월 19일 08:26)
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})[^\d]{0,3}(\d{1,2}):(\d{2})"
@@ -219,11 +219,9 @@ def health():
 
 # ------------------------------------------
 # 1) 진료기록 OCR (영수증 업로드)
-#    - 여러 경로를 동시에 열어둠:
-#      /receipt/upload
-#      /receipts/upload
-#      /api/receipt/upload
-#      /api/receipts/upload
+#    - iOS: POST /api/receipt/upload
+#    - multipart: petId(text), file(file)
+#    - OCR 실패해도 500 던지지 않고 200 + ocrError 로 응답
 # ------------------------------------------
 
 @app.post("/receipt/upload")
@@ -235,9 +233,8 @@ async def upload_receipt(
     file: UploadFile = File(...),
 ):
     """
-    영수증 이미지 업로드 + Vision OCR 실행
-    - S3 key: receipts/{petId}/{id}.jpg
-    - 응답: 병원명 / 시간 / 항목 / 금액 + 원본 OCR 텍스트 + S3 URL
+    영수증 이미지 업로드 + Vision OCR (되면 사용, 실패해도 200 응답)
+    S3 key: receipts/{petId}/{id}.jpg
     """
     rec_id = str(uuid.uuid4())
     _, ext = os.path.splitext(file.filename or "")
@@ -251,14 +248,23 @@ async def upload_receipt(
     file_like = io.BytesIO(data)
     file_like.seek(0)
 
-    # 1) S3 업로드
+    # 1) S3 업로드 (항상 수행)
     file_url = upload_to_s3(
         file_like,
         key,
         content_type=file.content_type or "image/jpeg",
     )
 
-    # 2) OCR용 임시 파일
+    # 2) OCR 시도 (실패해도 500 안 던짐)
+    ocr_text = ""
+    parsed = {
+        "hospitalName": "",
+        "visitAt": None,
+        "items": [],
+        "totalAmount": 0,
+    }
+    ocr_error = None
+
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=ext)
@@ -266,21 +272,19 @@ async def upload_receipt(
             tmp.write(data)
 
         ocr_text = run_vision_ocr(tmp_path)
+        parsed = parse_receipt_kor(ocr_text)
 
     except Exception as e:
-        # 여기서 예외 메시지 전체를 내보내면 팝업으로 그대로 보임
-        raise HTTPException(
-            status_code=500,
-            detail=f"Vision OCR 사용 불가 (환경 설정 오류): {e}",
-        )
+        # Vision 세팅 문제, OCR 실패 등 → 앱이 죽지 않도록 에러만 문자열로 전달
+        ocr_error = f"{e}"
+
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    parsed = parse_receipt_kor(ocr_text)
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 👉 iOS 진료기록용 응답 구조
+    # 👉 iOS ReceiptAnalyzeResponseDTO에 맞게 사용하면 됨
     return {
         "id": rec_id,
         "petId": petId,
@@ -290,16 +294,15 @@ async def upload_receipt(
         "totalAmount": parsed["totalAmount"],
         "s3Url": file_url,
         "rawText": ocr_text,
+        "ocrError": ocr_error,             # 실패 시 에러 문자열, 성공 시 null
         "createdAt": created_at,
     }
 
 
 # ------------------------------------------
 # 2) 검사결과 PDF 업로드
-#    - 여러 경로 지원:
-#      /lab/upload-pdf, /labs/upload-pdf,
-#      /api/lab/upload-pdf, /api/labs/upload-pdf
-#    - iOS 구조: PdfRecord 1개
+#    - iOS: POST /api/lab/upload-pdf
+#    - 응답: PdfRecord 1개
 # ------------------------------------------
 
 @app.post("/lab/upload-pdf")
@@ -318,7 +321,7 @@ async def upload_lab_pdf(
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 👉 PdfRecord와 맞는 구조
+    # PdfRecord 구조와 동일
     return {
         "id": lab_id,
         "petId": petId,
@@ -331,8 +334,8 @@ async def upload_lab_pdf(
 
 # ------------------------------------------
 # 3) 증명서 PDF 업로드
-#    - /cert/upload-pdf, /certs/upload-pdf,
-#      /api/cert/upload-pdf, /api/certs/upload-pdf
+#    - iOS: POST /api/cert/upload-pdf
+#    - 응답: PdfRecord 1개
 # ------------------------------------------
 
 @app.post("/cert/upload-pdf")
@@ -351,7 +354,6 @@ async def upload_cert_pdf(
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 👉 PdfRecord와 동일 구조
     return {
         "id": cert_id,
         "petId": petId,
@@ -365,7 +367,6 @@ async def upload_cert_pdf(
 # ------------------------------------------
 # 4) 검사결과 리스트
 #    - iOS: GET /api/labs/list?petId=...
-#    - 여분: /lab/list, /labs/list, /api/lab/list, /api/labs/list 모두 열어둠
 #    - 응답: [ PdfRecord ]
 # ------------------------------------------
 
@@ -408,14 +409,13 @@ def get_lab_list(petId: str = Query(...)):
                 }
             )
 
-    # 👉 [PdfRecord] 형태로 바로 디코딩 가능
+    # 그대로 [PdfRecord]로 디코딩 가능
     return items
 
 
 # ------------------------------------------
 # 5) 증명서 리스트
 #    - iOS: GET /api/cert/list?petId=...
-#    - 여분: /cert/list, /certs/list, /api/cert/list, /api/certs/list
 #    - 응답: [ PdfRecord ]
 # ------------------------------------------
 
