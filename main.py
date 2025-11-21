@@ -128,7 +128,6 @@ def run_vision_ocr(image_path: str) -> str:
 
 # ------------------------------------------
 # 영수증 OCR 결과 파싱
-#  - 병원명 / 방문시간 / 항목 리스트 / 총액
 # ------------------------------------------
 
 def parse_receipt_kor(text: str) -> dict:
@@ -146,7 +145,7 @@ def parse_receipt_kor(text: str) -> dict:
 
     hospital_name = lines[0] if lines else ""
 
-    # 날짜/시간 (2025-11-19 08:26 / 2025.11.19 08:26 / 2025년 11월 19일 08:26)
+    # 날짜/시간
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})[^\d]{0,3}(\d{1,2}):(\d{2})"
@@ -158,7 +157,7 @@ def parse_receipt_kor(text: str) -> dict:
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%dT%H:%M:%S")
             break
 
-    # 금액 패턴 (숫자+원)
+    # 금액 패턴
     amt_pattern = re.compile(r"(\d{1,3}(,\d{3})*)\s*원")
 
     items = []
@@ -219,7 +218,9 @@ def health():
 
 # ------------------------------------------
 # 1) 진료기록 OCR (영수증 업로드)
-#    - iOS: POST /api/receipt/upload
+#    - iOS:
+#       * POST /api/receipt/upload
+#       * (구버전) POST /api/receipt/analyze
 #    - multipart: petId(text), file(file)
 #    - OCR 실패해도 500 던지지 않고 200 + ocrError 로 응답
 # ------------------------------------------
@@ -228,6 +229,8 @@ def health():
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
+@app.post("/api/receipt/analyze")   # 🔥 옛날 iOS 경로까지 모두 허용
+@app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
     file: UploadFile = File(...),
@@ -248,7 +251,7 @@ async def upload_receipt(
     file_like = io.BytesIO(data)
     file_like.seek(0)
 
-    # 1) S3 업로드 (항상 수행)
+    # 1) S3 업로드
     file_url = upload_to_s3(
         file_like,
         key,
@@ -275,7 +278,6 @@ async def upload_receipt(
         parsed = parse_receipt_kor(ocr_text)
 
     except Exception as e:
-        # Vision 세팅 문제, OCR 실패 등 → 앱이 죽지 않도록 에러만 문자열로 전달
         ocr_error = f"{e}"
 
     finally:
@@ -284,7 +286,6 @@ async def upload_receipt(
 
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 👉 iOS ReceiptAnalyzeResponseDTO에 맞게 사용하면 됨
     return {
         "id": rec_id,
         "petId": petId,
@@ -321,7 +322,6 @@ async def upload_lab_pdf(
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
-    # PdfRecord 구조와 동일
     return {
         "id": lab_id,
         "petId": petId,
@@ -409,7 +409,6 @@ def get_lab_list(petId: str = Query(...)):
                 }
             )
 
-    # 그대로 [PdfRecord]로 디코딩 가능
     return items
 
 
