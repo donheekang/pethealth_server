@@ -4,14 +4,16 @@ import os
 import json
 import io
 import tempfile
+import uuid
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import vision
 import boto3
 from botocore.exceptions import NoCredentialsError
 from pydantic_settings import BaseSettings
+
 
 # ------------------------------------------
 # SETTINGS
@@ -23,12 +25,13 @@ class Settings(BaseSettings):
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # 서비스 계정 JSON "내용" 전체를 넣어둘 환경변수
+    # 서비스 계정 JSON "내용" 전체
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
     GEMINI_ENABLED: str = "false"
-    STUB_MODE: str = "false"  # 필요하면 테스트용
+    STUB_MODE: str = "false"
 
 settings = Settings()
+
 
 # ------------------------------------------
 # S3 CLIENT
@@ -42,13 +45,8 @@ s3_client = boto3.client(
 )
 
 
-def upload_to_s3(file_obj, key: str, content_type: str | None = None) -> str:
-    """
-    주어진 file-like 객체를 S3에 업로드하고 presigned URL 반환
-    """
-    if content_type is None:
-        content_type = "application/octet-stream"
-
+def upload_to_s3(file_obj, key: str, content_type: str) -> str:
+    """파일 업로드 + presigned URL 반환"""
     try:
         s3_client.upload_fileobj(
             file_obj,
@@ -60,7 +58,7 @@ def upload_to_s3(file_obj, key: str, content_type: str | None = None) -> str:
         url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-            ExpiresIn=3600,
+            ExpiresIn=7 * 24 * 3600,  # 7일
         )
         return url
 
@@ -75,12 +73,7 @@ def upload_to_s3(file_obj, key: str, content_type: str | None = None) -> str:
 # ------------------------------------------
 
 def get_vision_client() -> vision.ImageAnnotatorClient:
-    """
-    Render 환경변수 GOOGLE_APPLICATION_CREDENTIALS 에
-    서비스계정 JSON '문자열'이 들어있다는 전제
-    """
     json_str = settings.GOOGLE_APPLICATION_CREDENTIALS
-
     if not json_str:
         raise Exception("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 비어있습니다.")
 
@@ -93,9 +86,6 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
 
 
 def run_vision_ocr(image_path: str) -> str:
-    """
-    Google Vision OCR 실행 후 전체 텍스트 반환
-    """
     client = get_vision_client()
 
     with open(image_path, "rb") as f:
@@ -115,7 +105,7 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------
-# FASTAPI APP 기본 설정
+# APP 기본 설정
 # ------------------------------------------
 
 app = FastAPI()
@@ -128,10 +118,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 루트 & 헬스체크
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "PetHealth+ Server Running"}
+
 
 @app.get("/health")
 @app.get("/api/health")
@@ -140,88 +131,100 @@ def health():
 
 
 # ------------------------------------------
-# 1) 영수증 이미지 업로드 + OCR
-#    /receipt/upload, /api/receipt/upload
+# 1) 진료기록 OCR (영수증 이미지)
+#    ※ iOS에서 실제 호출하는 경로에 맞게 수정 필요
+#    일단 /receipt/upload /api/receipt/upload 으로 둠
 # ------------------------------------------
 
 @app.post("/receipt/upload")
 @app.post("/api/receipt/upload")
-async def upload_receipt(file: UploadFile = File(...)):
+async def upload_receipt(
+    petId: str = Form(...),
+    file: UploadFile = File(...),
+):
     """
-    영수증 이미지 업로드 + Vision OCR 수행
-    - 이미지 S3 업로드
-    - /tmp 에 임시 파일 저장 후 OCR
-    - ocrText 와 fileUrl 을 함께 반환
+    영수증 이미지 업로드 + Vision OCR
+    - 이미지: receipts/{petId}/{id}.jpg
+    - 응답: OCR 텍스트 포함
     """
-
-    # 파일 확장자
-    _, ext = os.path.splitext(file.filename)
+    rec_id = str(uuid.uuid4())
+    _, ext = os.path.splitext(file.filename or "")
     if not ext:
         ext = ".jpg"
 
-    key = f"receipts/{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+    key = f"receipts/{petId}/{rec_id}{ext}"
 
-    # 파일 내용을 메모리로 읽기
     data = await file.read()
-
-    # 1) S3 업로드
     file_like = io.BytesIO(data)
     file_like.seek(0)
+
     file_url = upload_to_s3(
         file_like,
         key,
         content_type=file.content_type or "image/jpeg",
     )
 
-    # 2) OCR용 임시 파일 생성
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
+    # OCR용 임시 파일
+    tmp_path = None
     try:
+        fd, tmp_path = tempfile.mkstemp(suffix=ext)
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(data)
+
         ocr_text = run_vision_ocr(tmp_path)
+
     except Exception as e:
-        # 여기서 에러 문구를 그대로 보내면 네가 지금 보는
-        # "Vision OCR 사용 불가 (환경 설정 오류)" 같은 팝업이 뜨는 부분
         raise HTTPException(
             status_code=500,
             detail=f"Vision OCR 사용 불가 (환경 설정 오류): {e}",
         )
     finally:
-        try:
+        if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
-        except FileNotFoundError:
-            pass
 
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # iOS 쪽에서 뭐로 받을지는 나중에 맞춰야 하지만,
+    # 일단 공통 필드 구조 맞춰서 반환
     return {
-        "id": key,
-        "fileUrl": file_url,
-        "fileName": file.filename,
-        "ocrText": ocr_text,
-        "type": "receipt",
+        "id": rec_id,
+        "petId": petId,
+        "title": "진료기록",
+        "memo": ocr_text,
+        "s3Url": file_url,
+        "createdAt": created_at,
     }
 
 
 # ------------------------------------------
 # 2) 검사결과 PDF 업로드
 #    /lab/upload-pdf, /api/lab/upload-pdf
+#    → iOS가 기대하는 구조: LabRecord 한 개
 # ------------------------------------------
 
 @app.post("/lab/upload-pdf")
 @app.post("/api/lab/upload-pdf")
-async def upload_lab_pdf(file: UploadFile = File(...)):
-    """
-    검사결과 PDF 업로드
-    """
-    filename = f"labs/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
-    file_like = file.file  # PDF는 스트림 그대로 사용
-    file_url = upload_to_s3(file_like, filename, content_type="application/pdf")
+async def upload_lab_pdf(
+    petId: str = Form(...),
+    title: str = Form("검사결과"),
+    memo: str | None = Form(None),
+    file: UploadFile = File(...),
+):
+    lab_id = str(uuid.uuid4())
+    key = f"lab/{petId}/{lab_id}.pdf"
 
+    file_url = upload_to_s3(file.file, key, content_type="application/pdf")
+
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # 🔥 iOS 팝업 raw에 찍힌 구조에 맞춤
     return {
-        "id": filename,
-        "fileUrl": file_url,
-        "fileName": file.filename,
-        "type": "lab",
+        "id": lab_id,
+        "petId": petId,
+        "title": title,
+        "memo": memo,
+        "s3Url": file_url,
+        "createdAt": created_at,
     }
 
 
@@ -232,91 +235,116 @@ async def upload_lab_pdf(file: UploadFile = File(...)):
 
 @app.post("/cert/upload-pdf")
 @app.post("/api/cert/upload-pdf")
-async def upload_cert_pdf(file: UploadFile = File(...)):
-    """
-    증명서 PDF 업로드
-    """
-    filename = f"certs/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
-    file_like = file.file
-    file_url = upload_to_s3(file_like, filename, content_type="application/pdf")
+async def upload_cert_pdf(
+    petId: str = Form(...),
+    title: str = Form("증명서"),
+    memo: str | None = Form(None),
+    file: UploadFile = File(...),
+):
+    cert_id = str(uuid.uuid4())
+    key = f"cert/{petId}/{cert_id}.pdf"
+
+    file_url = upload_to_s3(file.file, key, content_type="application/pdf")
+
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
     return {
-        "id": filename,
-        "fileUrl": file_url,
-        "fileName": file.filename,
-        "type": "cert",
+        "id": cert_id,
+        "petId": petId,
+        "title": title,
+        "memo": memo,
+        "s3Url": file_url,
+        "createdAt": created_at,
     }
 
 
 # ------------------------------------------
 # 4) 검사결과 리스트
-#    /labs/list, /api/labs/list
+#    /lab/list, /api/lab/list  (단수 lab)
+#    쿼리: ?petId=...
+#    응답: [ { id, petId, title, memo, s3Url, createdAt }, ... ]
 # ------------------------------------------
 
-@app.get("/labs/list")
-@app.get("/api/labs/list")
-def get_labs_list():
-    """
-    S3 labs/ 폴더의 PDF 목록 조회
-    """
+@app.get("/lab/list")
+@app.get("/api/lab/list")
+def get_lab_list(petId: str = Query(...)):
+    prefix = f"lab/{petId}/"
+
     response = s3_client.list_objects_v2(
         Bucket=settings.S3_BUCKET_NAME,
-        Prefix="labs/",
+        Prefix=prefix,
     )
 
     items = []
     if "Contents" in response:
         for obj in response["Contents"]:
-            key = obj["Key"]
-            if key.endswith(".pdf"):
-                url = s3_client.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                    ExpiresIn=3600,
-                )
-                items.append(
-                    {
-                        "id": key,
-                        "fileName": key.split("/")[-1],
-                        "fileUrl": url,
-                    }
-                )
+            key = obj["Key"]  # lab/{petId}/{id}.pdf
+            if not key.endswith(".pdf"):
+                continue
 
-    return {"items": items}
+            file_id = os.path.splitext(key.split("/")[-1])[0]
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                ExpiresIn=7 * 24 * 3600,
+            )
+            created_at = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+
+            items.append(
+                {
+                    "id": file_id,
+                    "petId": petId,
+                    "title": "검사결과",
+                    "memo": None,
+                    "s3Url": url,
+                    "createdAt": created_at,
+                }
+            )
+
+    # 🔥 iOS는 배열 자체를 기대하므로 items 만 반환
+    return items
 
 
 # ------------------------------------------
 # 5) 증명서 리스트
 #    /cert/list, /api/cert/list
+#    쿼리: ?petId=...
 # ------------------------------------------
 
 @app.get("/cert/list")
 @app.get("/api/cert/list")
-def get_cert_list():
-    """
-    S3 certs/ 폴더의 PDF 목록 조회
-    """
+def get_cert_list(petId: str = Query(...)):
+    prefix = f"cert/{petId}/"
+
     response = s3_client.list_objects_v2(
         Bucket=settings.S3_BUCKET_NAME,
-        Prefix="certs/",
+        Prefix=prefix,
     )
 
     items = []
     if "Contents" in response:
         for obj in response["Contents"]:
-            key = obj["Key"]
-            if key.endswith(".pdf"):
-                url = s3_client.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                    ExpiresIn=3600,
-                )
-                items.append(
-                    {
-                        "id": key,
-                        "fileName": key.split("/")[-1],
-                        "fileUrl": url,
-                    }
-                )
+            key = obj["Key"]  # cert/{petId}/{id}.pdf
+            if not key.endswith(".pdf"):
+                continue
 
-    return {"items": items}
+            file_id = os.path.splitext(key.split("/")[-1])[0]
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                ExpiresIn=7 * 24 * 3600,
+            )
+            created_at = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+
+            items.append(
+                {
+                    "id": file_id,
+                    "petId": petId,
+                    "title": "증명서",
+                    "memo": None,
+                    "s3Url": url,
+                    "createdAt": created_at,
+                }
+            )
+
+    return items
