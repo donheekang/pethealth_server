@@ -1,9 +1,6 @@
 fastapi
-uvicorn
-python-multipart
+uvicorn[standard]
 boto3
-pydantic
-pydantic-settings
 google-cloud-vision
-Pillow
-python-dotenv
+pydantic-settings
+google-generativeai
