@@ -168,7 +168,7 @@ def guess_hospital_name(lines: List[str]) -> str:
             score += 2
 
         # 3) 주소/전화번호처럼 보이면 감점
-        if any(x in line for x in ["TEL", "전화", "FAX", "팩스", "도로명"]):
+        if any(x in line for x in ["TEL", "전화", "FAX", "팩스", "도로명", "주소"]):
             score -= 2
         digit_count = sum(c.isdigit() for c in line)
         if digit_count >= 8:
@@ -189,11 +189,11 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트를 구조화:
-    - hospitalName
-    - visitAt  (YYYY-MM-DD HH:MM 또는 None)
-    - items    [{ name, amount }]
-    - totalAmount
+    한국 동물병원 영수증 파서 (강화 버전)
+    - '진료/미용 내역' 이후 구간만 항목 후보로 사용
+    - 사업자등록번호/전화번호/날짜/발행일/결제요청/소계/합계/카드/과세/비과세 등은 항목에서 제외
+    - 금액이 1,000원 미만인 줄은 무시
+    - '이름 줄 + 다음 줄에 금액만 있는 경우'를 하나의 항목으로 결합
     """
     import re
 
@@ -203,58 +203,104 @@ def parse_receipt_kor(text: str) -> dict:
     # 1) 병원명
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 날짜/시간: 2025.11.20 12:51, 2025-11-20 12:51, 2025년 11월 20일 12:51 등
-    visit_at = None
-    dt_pattern = re.compile(
-        r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
-    )
+    # 2) 날짜 후보들 수집 → 가장 이른 날짜 선택
+    date_regex = re.compile(r"(20\d{2})[.\-/년 ]+(\d{1,2})[.\-/월 ]+(\d{1,2})")
+    date_candidates: List[datetime] = []
+
     for line in lines:
-        m = dt_pattern.search(line)
+        m = date_regex.search(line)
         if m:
-            y, mo, d, h, mi = map(int, m.groups())
-            # iOS 쪽에서 "yyyy-MM-dd HH:mm" 형식도 처리하므로 T 대신 공백 사용
-            visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
+            y, mo, d = map(int, m.groups())
+            try:
+                date_candidates.append(datetime(y, mo, d))
+            except ValueError:
+                pass
+
+    visit_at: Optional[str] = None
+    if date_candidates:
+        first_date = sorted(date_candidates)[0]
+        visit_at = first_date.strftime("%Y-%m-%d %H:%M")
+
+    # 3) "진료/미용 내역" 이후 구간을 항목 후보로 설정
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        compact = line.replace(" ", "")
+        if any(k in compact for k in ["진료및미용", "진료및미용내역", "진료내역", "진료및미용내역"]):
+            start_idx = idx + 1
             break
 
-    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원)
-    amt_pattern = re.compile(
-        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s(원)?\s*$"
-    )
+    # 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원)
+    amt_pattern = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s(원)?$")
+
+    # 항목으로 쓰지 않을 키워드
+    skip_keywords = [
+        "사업자등록번호", "사업자등록", "등록번호",
+        "전화번호", "TEL", "팩스", "FAX",
+        "고객명", "고객이름", "고객", "주소",
+        "날짜", "일자", "발행일", "결제일", "기간",
+        "합계", "소계", "총액", "총금액",
+        "과세", "비과세", "부가세",
+        "결제요청", "카드", "현금", "영수증",
+    ]
 
     items: List[Dict] = []
     candidate_totals: List[int] = []
 
-    for line in lines:
-        m = amt_pattern.search(line)
-        if not m:
+    current_name: Optional[str] = None
+
+    for idx, raw_line in enumerate(lines):
+        if idx < start_idx:
+            # 진료/미용 내역 이전은 항목으로 보지 않음 (단, total 후보는 나중에 따로 처리)
             continue
 
-        amount_str = m.group(1).replace(",", "")
+        line = raw_line.lstrip("*").strip()
+        if not line:
+            continue
+
+        # 먼저 금액 패턴 찾기
+        m = amt_pattern.search(line)
+        if not m:
+            # 금액이 없는 줄인데, '항목 이름'일 수 있음
+            # 숫자가 거의 없고, skip 키워드도 없으면 다음 줄 금액과 묶기 위해 저장
+            has_digit = any(c.isdigit() for c in line)
+            compact = line.replace(" ", "")
+            if (not has_digit) and (not any(k in compact for k in skip_keywords)):
+                current_name = line
+            continue
+
+        # 금액 추출
         try:
-            amount = int(amount_str)
+            amount = int(m.group(1).replace(",", ""))
         except ValueError:
             continue
 
-        name = line[:m.start()].strip()
-        lowered = name.replace(" ", "")
+        # 너무 작은 금액(예: 1원, 11원 등)은 OCR 잡음으로 보고 무시
+        if amount < 1000:
+            continue
 
-        # 합계/총액 줄은 total 후보
-        if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액"]):
+        # 이름 부분
+        name_part = line[:m.start()].strip()
+        name = name_part or current_name or ""
+
+        compact_name = name.replace(" ", "")
+
+        # 소계/합계/결제요청/카드 등은 total 후보로만 사용
+        if any(k in compact_name for k in skip_keywords):
             candidate_totals.append(amount)
+            current_name = None
             continue
 
         if not name:
-            name = "항목"
+            name = "기타"
 
         items.append({"name": name, "amount": amount})
+        current_name = None
 
-    # 4) totalAmount 결정
+    # total 계산
     if candidate_totals:
         total_amount = max(candidate_totals)
-    elif items:
-        total_amount = sum(i["amount"] for i in items)
     else:
-        total_amount = 0
+        total_amount = sum(i["amount"] for i in items) if items else 0
 
     return {
         "hospitalName": hospital_name,
@@ -280,7 +326,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
       "items": [ { "name": str, "price": int | null }, ... ],
       "totalAmount": int | null
     }
-    실패하면 None 리턴 (fallback 은 정규식 파서)
+    실패하면 None 리턴
     """
     if settings.GEMINI_ENABLED.lower() != "true":
         return None
@@ -347,8 +393,12 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
         fixed_items = []
         for it in data["items"]:
-            name = it.get("name") if isinstance(it, dict) else None
-            price = it.get("price") if isinstance(it, dict) else None
+            if isinstance(it, dict):
+                name = it.get("name")
+                price = it.get("price")
+            else:
+                name = None
+                price = None
             fixed_items.append({"name": name, "price": price})
         data["items"] = fixed_items
 
@@ -443,42 +493,60 @@ async def upload_receipt(
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
-    ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
-    if ai_parsed:
-        parsed_for_dto = ai_parsed
+    # 3) Fallback 정규식 파서 (항목/금액은 여기 것이 기준)
+    if ocr_text:
+        fallback = parse_receipt_kor(ocr_text)
     else:
-        fallback = parse_receipt_kor(ocr_text) if ocr_text else {
+        fallback = {
             "hospitalName": "",
             "visitAt": None,
             "items": [],
             "totalAmount": 0,
         }
 
+    # 4) Gemini AI 파싱 (병원명/날짜 위주로만 활용)
+    ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
+
+    # clinicName
+    clinic_name = None
+    if ai_parsed and ai_parsed.get("clinicName"):
+        clinic_name = ai_parsed["clinicName"]
+    else:
+        clinic_name = fallback.get("hospitalName") or "동물병원"
+
+    # visitDate (YYYY-MM-DD)
+    visit_date: Optional[str] = None
+    if ai_parsed and ai_parsed.get("visitDate"):
+        visit_date = ai_parsed["visitDate"]
+    else:
         visit_at = fallback.get("visitAt")
-        visit_date: Optional[str] = None
         if visit_at:
-            # "YYYY-MM-DD HH:MM" 이면 그대로, "YYYY-MM-DDTHH:MM"이면 날짜만 등
-            # iOS 쪽에서 길이 10/초과 여부로 처리
-            visit_date = visit_at
+            visit_date = visit_at.split(" ")[0]
 
-        dto_items: List[Dict] = []
-        for it in fallback.get("items", []):
-            dto_items.append(
-                {
-                    "name": it.get("name"),
-                    "price": it.get("amount"),
-                }
-            )
+    # disease / symptoms 는 Gemini 있으면 사용, 없으면 None
+    disease_name = ai_parsed.get("diseaseName") if ai_parsed else None
+    symptoms_summary = ai_parsed.get("symptomsSummary") if ai_parsed else None
 
-        parsed_for_dto = {
-            "clinicName": fallback.get("hospitalName"),
-            "visitDate": visit_date,
-            "diseaseName": None,
-            "symptomsSummary": None,
-            "items": dto_items,
-            "totalAmount": fallback.get("totalAmount"),
-        }
+    # 항목/금액은 항상 fallback 정규식 결과 사용
+    dto_items: List[Dict] = []
+    for it in fallback.get("items", []):
+        dto_items.append(
+            {
+                "name": it.get("name"),
+                "price": it.get("amount"),
+            }
+        )
+
+    total_amount = fallback.get("totalAmount")
+
+    parsed_for_dto = {
+        "clinicName": clinic_name,
+        "visitDate": visit_date,
+        "diseaseName": disease_name,
+        "symptomsSummary": symptoms_summary,
+        "items": dto_items,
+        "totalAmount": total_amount,
+    }
 
     return {
         "petId": petId,
@@ -490,8 +558,6 @@ async def upload_receipt(
 
 # ------------------------------------------
 # 2) 검사결과 PDF 업로드
-#    - iOS: POST /api/lab/upload-pdf
-#    - 응답: PdfRecord 1개 (키: s3Url)
 # ------------------------------------------
 
 @app.post("/lab/upload-pdf")
@@ -515,15 +581,13 @@ async def upload_lab_pdf(
         "petId": petId,
         "title": title,
         "memo": memo,
-        "s3Url": file_url,          # iOS PdfRecord.s3Url 로 매핑
+        "s3Url": file_url,          # iOS PdfRecord.s3Url
         "createdAt": created_at,
     }
 
 
 # ------------------------------------------
 # 3) 증명서 PDF 업로드
-#    - iOS: POST /api/cert/upload-pdf
-#    - 응답: PdfRecord 1개 (키: s3Url)
 # ------------------------------------------
 
 @app.post("/cert/upload-pdf")
@@ -547,15 +611,13 @@ async def upload_cert_pdf(
         "petId": petId,
         "title": title,
         "memo": memo,
-        "s3Url": file_url,          # s3Url 로 통일
+        "s3Url": file_url,          # iOS PdfRecord.s3Url
         "createdAt": created_at,
     }
 
 
 # ------------------------------------------
 # 4) 검사결과 리스트
-#    - iOS: GET /api/labs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: s3Url)
 # ------------------------------------------
 
 @app.get("/lab/list")
@@ -602,8 +664,6 @@ def get_lab_list(petId: str = Query(...)):
 
 # ------------------------------------------
 # 5) 증명서 리스트
-#    - iOS: GET /api/certs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: s3Url)
 # ------------------------------------------
 
 @app.get("/cert/list")
