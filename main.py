@@ -328,7 +328,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        # ⁠ json ... ⁠ 같은 마크다운이 섞여 있을 수 있으니 정리
+        # ⁠ json ...  ⁠ 같은 마크다운이 섞여 있을 수 있으니 정리
         if "```" in text:
             start = text.find("{")
             end = text.rfind("}")
@@ -387,17 +387,6 @@ def health():
 
 # ------------------------------------------
 # 1) 진료기록 OCR (영수증 업로드)
-#    - iOS:
-#       * POST /api/receipt/analyze
-#    - multipart: petId(text), image(file)
-#    - OCR → AI 파싱 우선 → 실패 시 정규식 파싱
-#    - 응답:
-#        {
-#          "petId": ...,
-#          "s3Url": ...,
-#          "parsed": { clinicName, visitDate, items[{name,price}], totalAmount, ... },
-#          "notes": rawText
-#        }
 # ------------------------------------------
 
 @app.post("/receipt/upload")
@@ -501,7 +490,7 @@ async def upload_receipt(
 # ------------------------------------------
 # 2) 검사결과 PDF 업로드
 #    - iOS: POST /api/lab/upload-pdf
-#    - 응답: PdfRecord 1개 (키: url)
+#    - 응답: PdfRecord 1개 (키: s3Url)
 # ------------------------------------------
 
 @app.post("/lab/upload-pdf")
@@ -525,7 +514,7 @@ async def upload_lab_pdf(
         "petId": petId,
         "title": title,
         "memo": memo,
-        "url": file_url,          # 🔥 iOS PdfRecord.s3Url ← "url" 키로 디코딩
+        "s3Url": file_url,          # 🔥 iOS PdfRecord.s3Url 로 매핑
         "createdAt": created_at,
     }
 
@@ -533,7 +522,7 @@ async def upload_lab_pdf(
 # ------------------------------------------
 # 3) 증명서 PDF 업로드
 #    - iOS: POST /api/cert/upload-pdf
-#    - 응답: PdfRecord 1개 (키: url)
+#    - 응답: PdfRecord 1개 (키: s3Url)
 # ------------------------------------------
 
 @app.post("/cert/upload-pdf")
@@ -557,7 +546,7 @@ async def upload_cert_pdf(
         "petId": petId,
         "title": title,
         "memo": memo,
-        "url": file_url,          # 🔥 여기도 url
+        "s3Url": file_url,          # 🔥 s3Url 로 통일
         "createdAt": created_at,
     }
 
@@ -565,7 +554,7 @@ async def upload_cert_pdf(
 # ------------------------------------------
 # 4) 검사결과 리스트
 #    - iOS: GET /api/labs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: url)
+#    - 응답: [ PdfRecord ] (키: s3Url)
 # ------------------------------------------
 
 @app.get("/lab/list")
@@ -602,7 +591,7 @@ def get_lab_list(petId: str = Query(...)):
                     "petId": petId,
                     "title": "검사결과",
                     "memo": None,
-                    "url": url,      # 🔥 리스트도 url
+                    "s3Url": url,      # 🔥 리스트도 s3Url
                     "createdAt": created_at,
                 }
             )
@@ -612,8 +601,8 @@ def get_lab_list(petId: str = Query(...)):
 
 # ------------------------------------------
 # 5) 증명서 리스트
-#    - iOS: GET /api/cert/list?petId=...
-#    - 응답: [ PdfRecord ] (키: url)
+#    - iOS: GET /api/certs/list?petId=...
+#    - 응답: [ PdfRecord ] (키: s3Url)
 # ------------------------------------------
 
 @app.get("/cert/list")
@@ -650,7 +639,7 @@ def get_cert_list(petId: str = Query(...)):
                     "petId": petId,
                     "title": "증명서",
                     "memo": None,
-                    "url": url,      # 🔥 여기도 url
+                    "s3Url": url,      # 🔥 여기도 s3Url
                     "createdAt": created_at,
                 }
             )
