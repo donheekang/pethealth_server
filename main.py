@@ -189,12 +189,11 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트를
+    한국 동물병원 영수증 OCR 텍스트를 구조화:
     - hospitalName
-    - visitAt
-    - items [{ name, amount }]
+    - visitAt  (YYYY-MM-DD HH:MM 또는 None)
+    - items    [{ name, amount }]
     - totalAmount
-    로 대략 파싱 (정규식 기반 fallback)
     """
     import re
 
@@ -213,16 +212,16 @@ def parse_receipt_kor(text: str) -> dict:
         m = dt_pattern.search(line)
         if m:
             y, mo, d, h, mi = map(int, m.groups())
-            visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%dT%H:%M:%S")
+            # iOS 쪽에서 "yyyy-MM-dd HH:mm" 형식도 처리하므로 T 대신 공백 사용
+            visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
 
-    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원 모두 허용)
+    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원)
     amt_pattern = re.compile(
-        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\s*원)?\s*$"
+        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s(원)?\s*$"
     )
 
     items: List[Dict] = []
-    total_amount = 0
     candidate_totals: List[int] = []
 
     for line in lines:
@@ -459,7 +458,9 @@ async def upload_receipt(
         visit_at = fallback.get("visitAt")
         visit_date: Optional[str] = None
         if visit_at:
-            visit_date = visit_at.split("T")[0]
+            # "YYYY-MM-DD HH:MM" 이면 그대로, "YYYY-MM-DDTHH:MM"이면 날짜만 등
+            # iOS 쪽에서 길이 10/초과 여부로 처리
+            visit_date = visit_at
 
         dto_items: List[Dict] = []
         for it in fallback.get("items", []):
@@ -514,7 +515,7 @@ async def upload_lab_pdf(
         "petId": petId,
         "title": title,
         "memo": memo,
-        "s3Url": file_url,          # 🔥 iOS PdfRecord.s3Url 로 매핑
+        "s3Url": file_url,          # iOS PdfRecord.s3Url 로 매핑
         "createdAt": created_at,
     }
 
@@ -546,7 +547,7 @@ async def upload_cert_pdf(
         "petId": petId,
         "title": title,
         "memo": memo,
-        "s3Url": file_url,          # 🔥 s3Url 로 통일
+        "s3Url": file_url,          # s3Url 로 통일
         "createdAt": created_at,
     }
 
@@ -591,7 +592,7 @@ def get_lab_list(petId: str = Query(...)):
                     "petId": petId,
                     "title": "검사결과",
                     "memo": None,
-                    "s3Url": url,      # 🔥 리스트도 s3Url
+                    "s3Url": url,
                     "createdAt": created_at,
                 }
             )
@@ -639,7 +640,7 @@ def get_cert_list(petId: str = Query(...)):
                     "petId": petId,
                     "title": "증명서",
                     "memo": None,
-                    "s3Url": url,      # 🔥 여기도 s3Url
+                    "s3Url": url,
                     "createdAt": created_at,
                 }
             )
