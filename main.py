@@ -5,6 +5,7 @@ import io
 import json
 import uuid
 import tempfile
+import re
 from datetime import datetime
 from typing import Optional, List, Dict
 
@@ -80,6 +81,26 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
         raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {str(e)}")
+
+
+# ------------------------------------------
+# 유틸: 파일명 정리
+# ------------------------------------------
+
+def sanitize_filename(filename: str, default: str) -> str:
+    """
+    확장자 제거 + 위험 문자 제거 + 너무 긴 경우 자르기
+    """
+    name = os.path.splitext(filename or "")[0].strip()
+    if not name:
+        name = default
+
+    # 한글/영문/숫자/공백/._- 만 허용, 나머지는 _
+    name = re.sub(r"[^\w\-.가-힣 ]", "_", name)
+    # 너무 길면 잘라주기
+    if len(name) > 80:
+        name = name[:80]
+    return name or default
 
 
 # ------------------------------------------
@@ -327,7 +348,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        # ⁠ json ...  ⁠ 같은 마크다운이 섞여 있을 수 있으니 정리
+        # 마크다운 코드블록 제거
         if "```" in text:
             start = text.find("{")
             end = text.rfind("}")
@@ -459,7 +480,6 @@ async def upload_receipt(
         visit_date: Optional[str] = None
         if visit_at:
             # "YYYY-MM-DD HH:MM" 이면 그대로, "YYYY-MM-DDTHH:MM"이면 날짜만 등
-            # iOS 쪽에서 길이 10/초과 여부로 처리
             visit_date = visit_at
 
         dto_items: List[Dict] = []
@@ -500,12 +520,22 @@ async def upload_receipt(
 @app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
-    title: str = Form("검사결과"),
+    title: str = Form("검사결과"),   # iOS에서 file 이름으로 넘겨도 됨
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
+    """
+    검사결과 PDF 업로드.
+    - S3 key: lab/{petId}/{uuid}_{원본파일명}.pdf
+    - 응답 title: 원본파일명(확장자 제거)
+    """
     lab_id = str(uuid.uuid4())
-    key = f"lab/{petId}/{lab_id}.pdf"
+
+    # 원본 파일명 기준으로 title 정리
+    original_name = file.filename or title or "검사결과"
+    safe_title = sanitize_filename(original_name, default="검사결과")
+
+    key = f"lab/{petId}/{lab_id}_{safe_title}.pdf"
 
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
@@ -513,9 +543,9 @@ async def upload_lab_pdf(
     return {
         "id": lab_id,
         "petId": petId,
-        "title": title,
+        "title": safe_title,      # iOS PdfRecord.title
         "memo": memo,
-        "s3Url": file_url,          # iOS PdfRecord.s3Url 로 매핑
+        "s3Url": file_url,        # iOS PdfRecord.s3Url
         "createdAt": created_at,
     }
 
@@ -536,8 +566,17 @@ async def upload_cert_pdf(
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
+    """
+    증명서 PDF 업로드.
+    - S3 key: cert/{petId}/{uuid}_{원본파일명}.pdf
+    - 응답 title: 원본파일명(확장자 제거)
+    """
     cert_id = str(uuid.uuid4())
-    key = f"cert/{petId}/{cert_id}.pdf"
+
+    original_name = file.filename or title or "증명서"
+    safe_title = sanitize_filename(original_name, default="증명서")
+
+    key = f"cert/{petId}/{cert_id}_{safe_title}.pdf"
 
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
     created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
@@ -545,9 +584,9 @@ async def upload_cert_pdf(
     return {
         "id": cert_id,
         "petId": petId,
-        "title": title,
+        "title": safe_title,
         "memo": memo,
-        "s3Url": file_url,          # s3Url 로 통일
+        "s3Url": file_url,
         "createdAt": created_at,
     }
 
@@ -555,7 +594,7 @@ async def upload_cert_pdf(
 # ------------------------------------------
 # 4) 검사결과 리스트
 #    - iOS: GET /api/labs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: s3Url)
+#    - 응답: [ PdfRecord ]
 # ------------------------------------------
 
 @app.get("/lab/list")
@@ -570,32 +609,46 @@ def get_lab_list(petId: str = Query(...)):
         Prefix=prefix,
     )
 
+    contents = response.get("Contents", [])
+
+    # 최신 업로드가 위로 오도록 LastModified 기준 정렬
+    contents.sort(key=lambda obj: obj["LastModified"], reverse=True)
+
     items: List[Dict] = []
-    if "Contents" in response:
-        for obj in response["Contents"]:
-            key = obj["Key"]  # lab/{petId}/{id}.pdf
-            if not key.endswith(".pdf"):
-                continue
+    for obj in contents:
+        key = obj["Key"]  # lab/{petId}/{uuid}_{title}.pdf
+        if not key.endswith(".pdf"):
+            continue
 
-            file_id = os.path.splitext(key.split("/")[-1])[0]
+        filename = os.path.basename(key)         # uuid_title.pdf
+        base = os.path.splitext(filename)[0]     # uuid_title
 
-            url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=7 * 24 * 3600,
-            )
-            created_at = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+        # uuid_ 뒤에 오는 부분이 실제 title
+        parts = base.split("_", 1)
+        if len(parts) == 2:
+            display_title = parts[1]
+            file_id = parts[0]
+        else:
+            display_title = base
+            file_id = base
 
-            items.append(
-                {
-                    "id": file_id,
-                    "petId": petId,
-                    "title": "검사결과",
-                    "memo": None,
-                    "s3Url": url,
-                    "createdAt": created_at,
-                }
-            )
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+            ExpiresIn=7 * 24 * 3600,
+        )
+        created_at = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+
+        items.append(
+            {
+                "id": file_id,
+                "petId": petId,
+                "title": display_title,   # ↔️ 파일명 기반 title
+                "memo": None,
+                "s3Url": url,
+                "createdAt": created_at,
+            }
+        )
 
     return items
 
@@ -603,7 +656,7 @@ def get_lab_list(petId: str = Query(...)):
 # ------------------------------------------
 # 5) 증명서 리스트
 #    - iOS: GET /api/certs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: s3Url)
+#    - 응답: [ PdfRecord ]
 # ------------------------------------------
 
 @app.get("/cert/list")
@@ -618,31 +671,42 @@ def get_cert_list(petId: str = Query(...)):
         Prefix=prefix,
     )
 
+    contents = response.get("Contents", [])
+    contents.sort(key=lambda obj: obj["LastModified"], reverse=True)
+
     items: List[Dict] = []
-    if "Contents" in response:
-        for obj in response["Contents"]:
-            key = obj["Key"]  # cert/{petId}/{id}.pdf
-            if not key.endswith(".pdf"):
-                continue
+    for obj in contents:
+        key = obj["Key"]  # cert/{petId}/{uuid}_{title}.pdf
+        if not key.endswith(".pdf"):
+            continue
 
-            file_id = os.path.splitext(key.split("/")[-1])[0]
+        filename = os.path.basename(key)
+        base = os.path.splitext(filename)[0]
 
-            url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=7 * 24 * 3600,
-            )
-            created_at = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+        parts = base.split("_", 1)
+        if len(parts) == 2:
+            display_title = parts[1]
+            file_id = parts[0]
+        else:
+            display_title = base
+            file_id = base
 
-            items.append(
-                {
-                    "id": file_id,
-                    "petId": petId,
-                    "title": "증명서",
-                    "memo": None,
-                    "s3Url": url,
-                    "createdAt": created_at,
-                }
-            )
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+            ExpiresIn=7 * 24 * 3600,
+        )
+        created_at = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+
+        items.append(
+            {
+                "id": file_id,
+                "petId": petId,
+                "title": display_title,
+                "memo": None,
+                "s3Url": url,
+                "createdAt": created_at,
+            }
+        )
 
     return items
