@@ -11,6 +11,7 @@ from typing import Optional, List, Dict
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import vision
+from condition_tags import CONDITION_TAGS, ConditionTagConfig
 import boto3
 from botocore.exceptions import NoCredentialsError
 from pydantic_settings import BaseSettings
