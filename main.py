@@ -4,29 +4,22 @@ import os
 import io
 import json
 import uuid
-import tempfile
 from datetime import datetime
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-# Vision OCR (선택적으로 사용)
-try:
-    from google.cloud import vision  # google-cloud-vision
-except ImportError:
-    vision = None
+import boto3
+from botocore.exceptions import NoCredentialsError
+from pydantic_settings import BaseSettings
 
-# (나중에 증상 태그 등 쓸 때를 대비해서 남겨둠)
+# condition_tags 가 없어도 서버 깨지지 않도록 방어
 try:
     from condition_tags import CONDITION_TAGS, ConditionTagConfig  # noqa: F401
 except ImportError:
     CONDITION_TAGS = []
-    ConditionTagConfig = object
-
-import boto3
-from botocore.exceptions import NoCredentialsError
-from pydantic_settings import BaseSettings
+    ConditionTagConfig = None
 
 # Gemini (google-generativeai)
 try:
@@ -34,31 +27,31 @@ try:
 except ImportError:
     genai = None
 
+import re
+
 
 # ------------------------------------------
 # SETTINGS
 # ------------------------------------------
 
 class Settings(BaseSettings):
-    # AWS
+    # AWS S3
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # Vision OCR용 서비스 계정 JSON 내용 또는 파일 경로
-    GOOGLE_APPLICATION_CREDENTIALS: str = ""
-
-    # Gemini 사용 여부 + API Key
-    GEMINI_ENABLED: str = "false"  # "true" 이면 사용
+    # Gemini
+    GEMINI_ENABLED: str = "true"        # "true" / "false"
     GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash-lite"
 
-    # 개발용 스텁
+    # 선택: Vertex용 값이지만, 현재 코드는 직접 사용 안 함
+    GCP_PROJECT_ID: str = ""
+    GCP_LOCATION: str = "us-central1"
+
+    # 로컬 테스트용 (외부 API 안 부르고 더미 응답)
     STUB_MODE: str = "false"
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"   # GCP_PROJECT_ID 같은 추가 env 있어도 무시
 
 
 settings = Settings()
@@ -102,65 +95,57 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
 
 
 # ------------------------------------------
-# GOOGLE VISION OCR (옵션)
+# Gemini 기반 OCR (이미지 → 텍스트)
 # ------------------------------------------
 
-def get_vision_client() -> vision.ImageAnnotatorClient:
+def extract_receipt_text_ai(image_bytes: bytes) -> str:
     """
-    GOOGLE_APPLICATION_CREDENTIALS:
-      - 서비스 계정 JSON '내용'일 수도 있고
-      - JSON 파일 경로일 수도 있음
-    둘 다 지원
+    Gemini 2.5 Flash-Lite 로 영수증 이미지에서 텍스트를 추출
     """
-    if vision is None:
-        raise RuntimeError("VISION_DISABLED")
-
-    cred_value = settings.GOOGLE_APPLICATION_CREDENTIALS
-    if not cred_value:
-        # 환경변수 비어 있으면 Vision 안 쓰고 건너뜀
-        raise RuntimeError("VISION_DISABLED")
-
-    # 1) JSON 내용 시도
-    try:
-        info = json.loads(cred_value)
-        client = vision.ImageAnnotatorClient.from_service_account_info(info)
-        return client
-    except json.JSONDecodeError:
-        # 2) JSON이 아니면 경로로 간주
-        if not os.path.exists(cred_value):
-            raise RuntimeError(
-                "VISION_DISABLED"
-            )
-        client = vision.ImageAnnotatorClient.from_service_account_file(cred_value)
-        return client
-    except Exception as e:
-        raise RuntimeError(f"OCR 클라이언트 생성 실패: {e}")
-
-
-def run_vision_ocr(image_path: str) -> str:
-    """
-    Google Vision OCR로 텍스트 추출
-    """
-    client = get_vision_client()
-
-    with open(image_path, "rb") as f:
-        content = f.read()
-
-    image = vision.Image(content=content)
-    response = client.text_detection(image=image)
-
-    if response.error.message:
-        raise RuntimeError(f"OCR 에러: {response.error.message}")
-
-    texts = response.text_annotations
-    if not texts:
+    if settings.STUB_MODE.lower() == "true":
+        # 개발용: 실제 호출 안 하고 더미 리턴
         return ""
 
-    return texts[0].description
+    if settings.GEMINI_ENABLED.lower() != "true":
+        return ""
+    if not settings.GEMINI_API_KEY:
+        return ""
+    if genai is None:
+        return ""
+
+    genai.configure(api_key=settings.GEMINI_API_KEY)
+    model_name = settings.GEMINI_MODEL_NAME or "gemini-2.5-flash-lite"
+    model = genai.GenerativeModel(model_name)
+
+    prompt = """
+다음 이미지는 한국 동물병원 영수증입니다.
+이미지 안에 보이는 텍스트를 가능한 한 그대로 줄 단위로 써 주세요.
+
+•⁠  ⁠항목 순서는 영수증에 나온 순서대로 유지해 주세요.
+•⁠  ⁠숫자, 쉼표, '원' 같은 표기도 그대로 적어 주세요.
+•⁠  ⁠불필요한 설명은 쓰지 말고, 텍스트만 출력하세요.
+"""
+
+    try:
+        resp = model.generate_content(
+            [
+                prompt,
+                {
+                    "mime_type": "image/jpeg",
+                    "data": image_bytes,
+                },
+            ]
+        )
+        text = (resp.text or "").strip()
+        return text
+    except Exception as e:
+        print("extract_receipt_text_ai error:", e)
+        return ""
 
 
 # ------------------------------------------
-# 영수증 OCR 결과 파싱 (정규식 Fallback)
+# 영수증 텍스트 파싱 보조: 병원명 추론 / 정규식 파서
+# (Gemini 실패 시 fallback 용)
 # ------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
@@ -211,14 +196,12 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트를 구조화:
+    한국 동물병원 영수증 텍스트를 구조화:
     - hospitalName
     - visitAt  (YYYY-MM-DD HH:MM 또는 None)
     - items    [{ name, amount }]
     - totalAmount
     """
-    import re
-
     # 공백 줄 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
@@ -237,9 +220,9 @@ def parse_receipt_kor(text: str) -> dict:
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
 
-    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원)
+    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ₩30,000 / 30,000원)
     amt_pattern = re.compile(
-        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s*(?:원)?\s*$"
+        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s*(원)?\s*$"
     )
 
     items: List[Dict] = []
@@ -286,8 +269,50 @@ def parse_receipt_kor(text: str) -> dict:
 
 
 # ------------------------------------------
-# Gemini 2.5 Flash-Lite 로 AI 파싱
+# Gemini 기반 구조화 파싱 (텍스트 → DTO)
 # ------------------------------------------
+
+JUNK_ITEM_KEYWORDS = [
+    "사업자", "등록번호", "전화", "tel", "fax", "팩스",
+    "serial", "영수증", "영 수 증",
+    "합계", "총액", "총 금액", "총금액", "합계금액", "소계",
+    "부가세", "비과세", "과세공급가액",
+    "결제요청", "요청금액", "결제일", "발행일",
+    "카드", "현금", "승인", "매입", "가맹점", "전표번호",
+]
+
+
+def is_junk_item(name: Optional[str], price: Optional[int]) -> bool:
+    """
+    Gemini가 만들어 준 items 중에서
+    영수증 메타데이터/쓰레기 줄은 걸러내기 위한 필터
+    """
+    if not name:
+        return True
+
+    text = name.strip()
+    if not text:
+        return True
+
+    # '항목' 같은 의미 없는 이름은 버리기
+    if text in ["항목", "상품", "비고", "내역"]:
+        return True
+
+    # 한글/영문이 하나도 없고 숫자/쉼표/원만 있으면 버리기 (예: '30,000')
+    if re.fullmatch(r"[0-9,\s]+원?", text):
+        return True
+
+    # 메타데이터 키워드 포함하면 버리기
+    for kw in JUNK_ITEM_KEYWORDS:
+        if kw.replace(" ", "").lower() in text.replace(" ", "").lower():
+            return True
+
+    # 금액이 0 또는 음수인 경우 버리기
+    if price is not None and price <= 0:
+        return True
+
+    return False
+
 
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
@@ -295,7 +320,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     ReceiptParsedDTO 에 맞는 dict 리턴:
     {
       "clinicName": str | null,
-      "visitDate": "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" | null,
+      "visitDate": "YYYY-MM-DD" | null,
       "diseaseName": str | null,
       "symptomsSummary": str | null,
       "items": [ { "name": str, "price": int | null }, ... ],
@@ -310,57 +335,62 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     if genai is None:
         return None
 
-    try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
+    genai.configure(api_key=settings.GEMINI_API_KEY)
+    model_name = settings.GEMINI_MODEL_NAME or "gemini-2.5-flash-lite"
+    model = genai.GenerativeModel(model_name)
 
-        # Google AI Studio 키를 쓴다는 전제 → 모델명만 사용
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    prompt = f"""
+너는 한국 '동물병원 영수증'만 다루는 전문가야.
 
-        prompt = f"""
-너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+아래 텍스트는 OCR로 읽은 영수증 전문이야. 이 텍스트를 분석해서
+'진짜 진료 항목'만 골라서 JSON으로 정리해.
 
-다음은 OCR로 읽은 영수증 원문이야:
+영수증 텍스트:
 
 \"\"\"{raw_text}\"\"\"
 
 
-요구사항:
+### 1. clinicName
+•⁠  ⁠'동물병원', '동물 메디컬', '동물클리닉' 등으로 끝나는 상호를 찾고,
+•⁠  ⁠가장 병원명에 가까운 한 줄만 선택해.
+•⁠  ⁠없으면 null.
 
-1.⁠ ⁠병원명(clinicName)
-   - '동물병원', '동물 병원' 같은 너무 일반적인 이름만 있으면
-     가능한 한 전체 상호명을 그대로 써줘.
-     예) '해랑동물병원', '행복한우리동물의료센터' 등.
-   - 진짜 상호명이 보이지 않으면 null 로 둬도 된다.
+### 2. visitDate
+•⁠  ⁠실제 진료를 받은 날짜 1개만 골라.
+•⁠  ⁠'발행일', '결제일' 말고 '진료일' 또는 문맥상 방문 날짜로 보이는 것.
+•⁠  ⁠형식은 반드시 "YYYY-MM-DD" 로만 출력.
 
-2.⁠ ⁠visitDate
-   - "YYYY-MM-DD" 형식 또는 "YYYY-MM-DD HH:MM" 형식 중 하나로.
-   - 영수증에 날짜·시간이 여러 개 있으면
-     "진료일/방문일" 의미에 가장 가까운 것을 선택해.
-   - 아무 정보가 없으면 null.
+### 3. items
+•⁠  ⁠아래 조건을 모두 만족하는 줄들만 항목으로 만든다:
+  - 백신/약/검사/처방 등 의료 서비스나 약품명
+    예: "DHPPi", "Corona", "Nexgard Spectra 7.5~15kg"
+  - '사업자등록번호', '전화번호', '발행일', '결제요청', '합계', '총액', '부가세',
+    '과세공급가액', '카드', '현금' 같은 메타 정보는 절대로 항목으로 넣지 않는다.
+  - '항목', '상품', '비고', '내역' 같은 일반 단어만 있는 줄도 버린다.
 
-3.⁠ ⁠items
-   - 실제 진료/약/예방접종 등 과금된 항목을 한 줄씩 넣어줘.
-   - 예: 종합백신, 코로나, 넥스가드, 처치료 등.
-   - 영수증의 메타 정보(사업자번호, 전화번호, 합계, 부가세 등)는
-     items 에 넣지 마.
-   - price 는 정수(원 단위)로, 금액이 없으면 null.
+•⁠  ⁠각 항목의 name:
+  - 영수증 안에 적힌 설명을 그대로 사용한다.
+  - 예: "DHPPi", "Corona", "Nexgard Spectra 7.5~15kg"
 
-4.⁠ ⁠totalAmount
-   - '합계', '총액', '결제요청' 등으로 보이는 최종 결제 금액.
-   - 찾지 못하면 null.
+•⁠  ⁠각 항목의 price:
+  - 한 줄에 '단가 30,000  수량 1  금액 30,000'처럼 쓰여 있으면
+    '금액'에 해당하는 최종 금액(여기서는 30000)을 사용한다.
+  - 숫자 형식: 쉼표 제거 후 정수. 예: 30,000원 → 30000
+  - 금액을 확실히 알 수 없으면 null.
 
-5.⁠ ⁠diseaseName / symptomsSummary
-   - 영수증에 병명이나 증상 요약이 보이면 간단히 채우고,
-   - 없으면 null 로 둬.
+### 4. totalAmount
+•⁠  ⁠'합계', '총액', '총 금액', '총금액'에 해당하는 값을 찾아서 정수로 넣어라.
+•⁠  ⁠없다면 items 의 price 들을 합산해서 넣어라.
+•⁠  ⁠예: 81,000원 → 81000
 
-반드시 아래 형식의 JSON "한 개"만, 추가 설명 없이 순수 JSON으로만 출력해.
+### 5. 출력 형식
+반드시 아래 형식의 JSON "한 개"만, 설명 없이 출력해.
 
-형식:
 {{
   "clinicName": string or null,
   "visitDate": string or null,
-  "diseaseName": string or null,
-  "symptomsSummary": string or null,
+  "diseaseName": null,
+  "symptomsSummary": null,
   "items": [
     {{
       "name": string,
@@ -371,10 +401,10 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 }}
 """
 
+    try:
         resp = model.generate_content(prompt)
-        text = resp.text.strip()
+        text = (resp.text or "").strip()
 
-        # ⁠ json ...  ⁠ 같은 마크다운 감싸기 제거
         if "```" in text:
             start = text.find("{")
             end = text.rfind("}")
@@ -383,28 +413,39 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
         data = json.loads(text)
 
-        # 최소 키 검증
         for key in ["clinicName", "visitDate", "items", "totalAmount"]:
             if key not in data:
                 return None
 
-        # items 정규화
-        if not isinstance(data.get("items"), list):
-            data["items"] = []
+        raw_items = data.get("items") or []
+        cleaned_items: List[dict] = []
 
-        fixed_items = []
-        for it in data["items"]:
+        for it in raw_items:
             if not isinstance(it, dict):
                 continue
             name = it.get("name")
             price = it.get("price")
-            fixed_items.append({"name": name, "price": price})
-        data["items"] = fixed_items
+            if isinstance(price, str):
+                try:
+                    price = int(price.replace(",", ""))
+                except Exception:
+                    price = None
+
+            if is_junk_item(name, price):
+                continue
+
+            cleaned_items.append({"name": name, "price": price})
+
+        data["items"] = cleaned_items
+
+        # totalAmount 재계산 (AI가 이상치 준 경우 대비)
+        if (data.get("totalAmount") is None or data["totalAmount"] == 0) and cleaned_items:
+            data["totalAmount"] = sum((p["price"] or 0) for p in cleaned_items)
 
         return data
 
-    except Exception:
-        # Gemini 에러 나면 조용히 Fallback
+    except Exception as e:
+        print("parse_receipt_ai error:", e)
         return None
 
 
@@ -435,7 +476,7 @@ def health():
 
 
 # ------------------------------------------
-# 1) 진료기록 OCR (영수증 업로드)
+# 1) 영수증 업로드 + Gemini 분석
 # ------------------------------------------
 
 @app.post("/receipt/upload")
@@ -450,7 +491,7 @@ async def upload_receipt(
     image: Optional[UploadFile] = File(None),
 ):
     """
-    영수증 이미지 업로드 + Vision OCR + (옵션) Gemini AI 분석
+    영수증 이미지 업로드 + S3 저장 + Gemini OCR + Gemini 파싱
     S3 key: receipts/{petId}/{id}.jpg
     iOS가 file 이나 image 어떤 이름으로 보내도 처리.
     """
@@ -477,30 +518,31 @@ async def upload_receipt(
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR 실행 (Vision 없으면 그냥 빈 문자열)
-    ocr_text = ""
-    tmp_path: Optional[str] = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(suffix=ext)
-        with os.fdopen(fd, "wb") as tmp:
-            tmp.write(data)
+    # STUB_MODE 이면 여기서 바로 빈 결과 리턴
+    if settings.STUB_MODE.lower() == "true":
+        parsed_for_dto = {
+            "clinicName": None,
+            "visitDate": None,
+            "diseaseName": None,
+            "symptomsSummary": None,
+            "items": [],
+            "totalAmount": None,
+        }
+        return {
+            "petId": petId,
+            "s3Url": file_url,
+            "parsed": parsed_for_dto,
+            "notes": "",
+        }
 
-        try:
-            ocr_text = run_vision_ocr(tmp_path)
-        except RuntimeError:
-            # Vision 비활성화/에러 → OCR 텍스트 없이 Gemini에게 바로 이미지 안 넘기고,
-            # (현재 구조상 텍스트만 쓰므로, 이 경우엔 AI 파싱도 스킵되고 fallback 으로 감)
-            ocr_text = ""
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    # 2) Gemini로 텍스트 추출
+    ocr_text = extract_receipt_text_ai(data)
 
-    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
+    # 3) Gemini AI 파싱 시도 → 실패하면 정규식 fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
     if ai_parsed:
         parsed_for_dto = ai_parsed
     else:
-        # OCR 텍스트가 없거나, Gemini 파싱 실패하면 정규식 파서
         fallback = parse_receipt_kor(ocr_text) if ocr_text else {
             "hospitalName": "",
             "visitAt": None,
@@ -511,8 +553,7 @@ async def upload_receipt(
         visit_at = fallback.get("visitAt")
         visit_date: Optional[str] = None
         if visit_at:
-            # "YYYY-MM-DD HH:MM" 그대로 사용 (iOS에서 길이 보고 처리)
-            visit_date = visit_at
+            visit_date = visit_at  # "YYYY-MM-DD HH:MM" 그대로
 
         dto_items: List[Dict] = []
         for it in fallback.get("items", []):
@@ -553,7 +594,7 @@ async def upload_receipt(
 @app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
-    title: str = Form("검사결과"),
+    title: str = Form("검사결과"),   # iOS에서 파일명 보내지만, 서버 쪽에서 다시 계산
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
@@ -562,7 +603,7 @@ async def upload_lab_pdf(
     # 원본 파일명(확장자 제거)
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
 
-    # S3 key 에도 파일명을 일부 포함 (safe_base__uuid 형식)
+    # S3 key 에도 파일명을 일부 포함 (나중에 리스트에서 꺼내 쓰기 위함)
     safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
     key = f"lab/{petId}/{safe_base}__{lab_id}.pdf"
 
@@ -587,6 +628,7 @@ async def upload_lab_pdf(
 # ------------------------------------------
 # 3) 증명서 PDF 업로드
 #    - iOS: POST /api/cert/upload-pdf
+#    - 제목: "원본파일명 (YYYY-MM-DD)"
 # ------------------------------------------
 
 @app.post("/cert/upload-pdf")
