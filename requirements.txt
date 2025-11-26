@@ -1,6 +1,25 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.1
-boto3==1.34.162
-pydantic-settings==2.4.0
+fastapi==0.110.0
+uvicorn==0.29.0
+
+# Google Gemini (Vertex AI Python SDK)
+google-genai==0.3.0
+
+# Google Cloud Core (서비스 계정 인증)
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+
+# AWS S3 업로드 관련
+boto3==1.34.34
+botocore==1.34.34
+
+# 이미지 처리용
+Pillow==10.3.0
+
+# PDF 처리할 경우 필요(옵션)
+pypdf==4.1.0
+
+# CORS
 python-multipart==0.0.9
-google-cloud-aiplatform==1.68.0
+
+# JSON
+ujson==5.9.0
