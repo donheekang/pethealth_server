@@ -31,12 +31,13 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: str
 
     # GCP / Vertex AI
-    GCP_PROJECT_ID: str
+    # 프로젝트 ID가 없으면 서버는 뜨되 Gemini 기능만 비활성화
+    GCP_PROJECT_ID: Optional[str] = None
     GCP_LOCATION: str = "us-central1"
     GEMINI_MODEL_NAME: str = "gemini-2.5-flash-lite"
 
     # 기타
-    STUB_MODE: str = "false"  # 필요하면 개발용 스텁에 활용
+    STUB_MODE: str = "false"
 
     class Config:
         env_file = ".env"
@@ -86,21 +87,48 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
 # Vertex AI / Gemini 초기화
 # ------------------------------------------
 
+gemini_model: Optional[GenerativeModel] = None
+
 try:
-    vertexai.init(project=settings.GCP_PROJECT_ID, location=settings.GCP_LOCATION)
-    gemini_model: Optional[GenerativeModel] = GenerativeModel(
-        settings.GEMINI_MODEL_NAME
-    )
-except Exception as e:  # 초기화 실패 시 대비
+    if settings.GCP_PROJECT_ID:
+        vertexai.init(
+            project=settings.GCP_PROJECT_ID,
+            location=settings.GCP_LOCATION,
+        )
+        gemini_model = GenerativeModel(settings.GEMINI_MODEL_NAME)
+        print(f"[Vertex AI] Gemini 모델 초기화 완료: {settings.GEMINI_MODEL_NAME}")
+    else:
+        print("[Vertex AI] GCP_PROJECT_ID 가 없어 Gemini 비활성화 상태입니다.")
+except Exception as e:
     print(f"[Vertex AI] 초기화 실패: {e}")
     gemini_model = None
+
+
+def _to_int_safe(value) -> Optional[int]:
+    """
+    문자열/숫자에서 숫자만 골라서 int로 변환.
+    '81,000원' -> 81000
+    변환 실패시 None
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
 
 
 def parse_receipt_with_gemini(image_bytes: bytes) -> dict:
     """
     영수증 이미지 1장을 Gemini 2.5 Flash-Lite로 OCR + 구조화해서 반환.
 
-    반환 예시 스키마:
+    반환 스키마:
     {
       "clinicName": str | null,
       "visitDate": "YYYY-MM-DD" | null,
@@ -154,12 +182,11 @@ def parse_receipt_with_gemini(image_bytes: bytes) -> dict:
         },
     )
 
-    # response.text 는 순수 JSON 문자열이어야 함
     text = response.text.strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # 혹시 ⁠ json  ⁠ 같이 감싸져 온 경우 대비
+        # 혹시 ⁠ json  ⁠ 같은 마크다운이 감싸져 있을 경우 대비
         if "{" in text and "}" in text:
             text = text[text.find("{"): text.rfind("}") + 1]
             data = json.loads(text)
@@ -181,21 +208,17 @@ def parse_receipt_with_gemini(image_bytes: bytes) -> dict:
             if not isinstance(it, dict):
                 continue
             name = it.get("name")
-            price = it.get("price")
+            price = _to_int_safe(it.get("price"))
             fixed_items.append(
                 {
                     "name": name,
-                    "price": int(price) if isinstance(price, (int, float, str)) and str(price).isdigit() else price,
+                    "price": price,
                 }
             )
     data["items"] = fixed_items
 
     # totalAmount 정수 보정
-    total = data.get("totalAmount")
-    if isinstance(total, (int, float)):
-        data["totalAmount"] = int(total)
-    elif isinstance(total, str) and total.isdigit():
-        data["totalAmount"] = int(total)
+    data["totalAmount"] = _to_int_safe(data.get("totalAmount"))
 
     return data
 
@@ -228,17 +251,6 @@ def health():
 
 # ------------------------------------------
 # 1) 진료기록 OCR (영수증 업로드)
-#    - iOS 호환을 위해 기존 엔드포인트 이름 유지
-#    - 응답 parsed 스키마:
-#      {
-#        "clinicName": str | null,
-#        "visitDate": "YYYY-MM-DD" 또는 "YYYY-MM-DD HH:MM" | null,
-#        "diseaseName": null,
-#        "symptomsSummary": null,
-#        "items": [ { "name": str, "price": int | null }, ... ],
-#        "totalAmount": int | null,
-#        "paymentMethod": str | null
-#      }
 # ------------------------------------------
 
 @app.post("/receipt/upload")
@@ -283,10 +295,8 @@ async def upload_receipt(
     )
 
     # Gemini로 OCR + 구조화
-    try:
-        ai_parsed = parse_receipt_with_gemini(data)
-    except Exception as e:
-        print(f"[Gemini] 영수증 파싱 실패: {e}")
+    if gemini_model is None:
+        # Gemini 미초기화시 비어 있는 기본값으로 응답
         ai_parsed = {
             "clinicName": None,
             "visitDate": None,
@@ -295,6 +305,19 @@ async def upload_receipt(
             "totalAmount": None,
             "paymentMethod": None,
         }
+    else:
+        try:
+            ai_parsed = parse_receipt_with_gemini(data)
+        except Exception as e:
+            print(f"[Gemini] 영수증 파싱 실패: {e}")
+            ai_parsed = {
+                "clinicName": None,
+                "visitDate": None,
+                "visitTime": None,
+                "items": [],
+                "totalAmount": None,
+                "paymentMethod": None,
+            }
 
     # iOS DTO 형식으로 변환
     visit_date = ai_parsed.get("visitDate")
@@ -328,16 +351,12 @@ async def upload_receipt(
         "petId": petId,
         "s3Url": file_url,
         "parsed": parsed_for_dto,
-        # notes는 예전엔 OCR 원문이었는데 이제는 선택적으로 사용
         "notes": None,
     }
 
 
 # ------------------------------------------
 # 2) 검사결과 PDF 업로드
-#    - iOS: POST /api/lab/upload-pdf
-#    - 응답: PdfRecord 1개 (키: s3Url)
-#    - 제목: "원본파일명 (YYYY-MM-DD)"
 # ------------------------------------------
 
 @app.post("/lab/upload-pdf")
@@ -346,16 +365,13 @@ async def upload_receipt(
 @app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
-    title: str = Form("검사결과"),   # iOS에서 파일명 보내지만, 서버 쪽에서 다시 계산
+    title: str = Form("검사결과"),
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
     lab_id = str(uuid.uuid4())
 
-    # 원본 파일명(확장자 제거)
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
-
-    # S3 key 에도 파일명을 일부 포함 (나중에 리스트에서 꺼내 쓰기 위함)
     safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
     key = f"lab/{petId}/{safe_base}__{lab_id}.pdf"
 
@@ -379,8 +395,6 @@ async def upload_lab_pdf(
 
 # ------------------------------------------
 # 3) 증명서 PDF 업로드
-#    - iOS: POST /api/cert/upload-pdf
-#    - 제목: "원본파일명 (YYYY-MM-DD)"
 # ------------------------------------------
 
 @app.post("/cert/upload-pdf")
@@ -419,8 +433,6 @@ async def upload_cert_pdf(
 
 # ------------------------------------------
 # 4) 검사결과 리스트
-#    - iOS: GET /api/labs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: s3Url)
 # ------------------------------------------
 
 @app.get("/lab/list")
@@ -448,7 +460,6 @@ def get_lab_list(petId: str = Query(...)):
             base_title = "검사결과"
             file_id = name_no_ext
 
-            # 새 패턴: safe_base__uuid
             if "__" in name_no_ext:
                 safe_base, file_id = name_no_ext.rsplit("__", 1)
                 base_title = safe_base.replace("_", " ")
@@ -481,7 +492,6 @@ def get_lab_list(petId: str = Query(...)):
 
 # ------------------------------------------
 # 5) 증명서 리스트
-#    - iOS: GET /api/certs/list?petId=...
 # ------------------------------------------
 
 @app.get("/cert/list")
