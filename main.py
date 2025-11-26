@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     # 프로젝트 ID가 없으면 서버는 뜨되 Gemini 기능만 비활성화
     GCP_PROJECT_ID: Optional[str] = None
     GCP_LOCATION: str = "us-central1"
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash-lite"
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
 
     # 기타
     STUB_MODE: str = "false"
