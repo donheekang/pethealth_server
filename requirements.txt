@@ -12,14 +12,11 @@ google-auth-oauthlib==1.2.0
 boto3==1.34.34
 botocore==1.34.34
 
-# 이미지 처리용
+# 이미지 처리용 (Render에서도 정상 설치됨)
 Pillow==10.3.0
 
-# PDF 처리할 경우 필요(옵션)
+# PDF 처리
 pypdf==4.1.0
 
-# CORS
+# CORS / Upload 용
 python-multipart==0.0.9
-
-# JSON
-ujson==5.9.0
