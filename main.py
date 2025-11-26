@@ -4,19 +4,23 @@ import os
 import io
 import json
 import uuid
+import tempfile
 from datetime import datetime
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 
+# AWS S3
 import boto3
 from botocore.exceptions import NoCredentialsError
+
+# Settings
 from pydantic_settings import BaseSettings
 
-# Vertex AI / Gemini
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+# Gemini (Vertex AI Image + Text)
+from google.genai import types
+from google.genai import Client
 
 
 # ------------------------------------------
@@ -24,23 +28,18 @@ from vertexai.generative_models import GenerativeModel, Part
 # ------------------------------------------
 
 class Settings(BaseSettings):
-    # AWS S3
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # GCP / Vertex AI
-    # 프로젝트 ID가 없으면 서버는 뜨되 Gemini 기능만 비활성화
-    GCP_PROJECT_ID: Optional[str] = None
+    # GCP / Gemini
+    GCP_PROJECT_ID: str
     GCP_LOCATION: str = "us-central1"
     GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+    GOOGLE_APPLICATION_CREDENTIALS_JSON: str = ""
 
-    # 기타
     STUB_MODE: str = "false"
-
-    class Config:
-        env_file = ".env"
 
 
 settings = Settings()
@@ -59,9 +58,6 @@ s3_client = boto3.client(
 
 
 def upload_to_s3(file_obj, key: str, content_type: str) -> str:
-    """
-    file-like 객체를 S3에 업로드하고 presigned URL 반환
-    """
     try:
         s3_client.upload_fileobj(
             file_obj,
@@ -73,154 +69,95 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
         url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-            ExpiresIn=7 * 24 * 3600,  # 7일
+            ExpiresIn=7 * 24 * 3600,
         )
         return url
 
-    except NoCredentialsError:
-        raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {str(e)}")
 
 
 # ------------------------------------------
-# Vertex AI / Gemini 초기화
+# GEMINI CLIENT (Vertex AI)
 # ------------------------------------------
 
-gemini_model: Optional[GenerativeModel] = None
-
-try:
-    if settings.GCP_PROJECT_ID:
-        vertexai.init(
-            project=settings.GCP_PROJECT_ID,
-            location=settings.GCP_LOCATION,
-        )
-        gemini_model = GenerativeModel(settings.GEMINI_MODEL_NAME)
-        print(f"[Vertex AI] Gemini 모델 초기화 완료: {settings.GEMINI_MODEL_NAME}")
-    else:
-        print("[Vertex AI] GCP_PROJECT_ID 가 없어 Gemini 비활성화 상태입니다.")
-except Exception as e:
-    print(f"[Vertex AI] 초기화 실패: {e}")
-    gemini_model = None
-
-
-def _to_int_safe(value) -> Optional[int]:
-    """
-    문자열/숫자에서 숫자만 골라서 int로 변환.
-    '81,000원' -> 81000
-    변환 실패시 None
-    """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    s = str(value)
-    digits = "".join(ch for ch in s if ch.isdigit())
-    if not digits:
-        return None
+def get_gemini_client() -> Client:
     try:
-        return int(digits)
-    except ValueError:
-        return None
+        service_info = json.loads(settings.GOOGLE_APPLICATION_CREDENTIALS_JSON)
+    except:
+        raise Exception("GOOGLE_APPLICATION_CREDENTIALS_JSON 파싱 실패")
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/gcp_key.json"
+    with open("/tmp/gcp_key.json", "w") as f:
+        f.write(json.dumps(service_info))
+
+    client = Client(
+        vertexai=True,
+        project=settings.GCP_PROJECT_ID,
+        location=settings.GCP_LOCATION,
+    )
+    return client
 
 
-def parse_receipt_with_gemini(image_bytes: bytes) -> dict:
-    """
-    영수증 이미지 1장을 Gemini 2.5 Flash-Lite로 OCR + 구조화해서 반환.
+# ------------------------------------------
+# Gemini로 영수증 이미지 직접 분석하기
+# ------------------------------------------
 
-    반환 스키마:
-    {
-      "clinicName": str | null,
-      "visitDate": "YYYY-MM-DD" | null,
-      "visitTime": "HH:MM" | null,
-      "items": [
-        {"name": str, "price": int | null},
-        ...
-      ],
-      "totalAmount": int | null,
-      "paymentMethod": str | null
-    }
-    """
-    if gemini_model is None:
-        raise RuntimeError("Gemini 모델이 초기화되지 않았습니다.")
-
-    image_part = Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+def analyze_receipt_with_gemini(image_bytes: bytes) -> dict:
+    client = get_gemini_client()
 
     prompt = """
-다음 이미지는 한국 반려동물 병원 영수증입니다.
-이미지에서 직접 OCR을 수행하고 영수증 내용을 분석해 아래 JSON 형식으로만 출력하세요.
+당신은 한국 동물병원 영수증을 분석해 구조화하는 AI입니다.
 
-형식 (키 이름 반드시 동일해야 합니다):
+절대 “동물병원”과 같이 일반명사로 요약하지 말고,
+영수증에 적힌 병원명(예: 해랑동물병원, 펫앤아이동물병원 등)을
+그대로 추출하세요.
+
+JSON 형식으로만 출력하세요:
 
 {
   "clinicName": string or null,
-  "visitDate": string or null,   // 방문 날짜, 형식: "YYYY-MM-DD"
-  "visitTime": string or null,   // 방문 시각, 형식: "HH:MM" (24시간제, 앞에 0 포함)
+  "visitDate": string or null,
   "items": [
-    {
-      "name": string,
-      "price": integer or null   // 항목 금액(원 단위, 쉼표 제거한 정수)
-    }
+    { "name": string, "price": integer or null }
   ],
-  "totalAmount": integer or null,   // 총 결제 금액(원 단위, 정수)
-  "paymentMethod": string or null   // "카드", "현금", "계좌이체" 등
+  "totalAmount": integer or null
 }
-
-규칙:
-•⁠  ⁠금액은 모두 '원' 단위의 정수로만 적어주세요. (예: 30000, 81000)
-•⁠  ⁠날짜가 여러 번 나와도 실제 진료/결제일을 선택하세요.
-•⁠  ⁠항목 이름은 가능하면 영수증 상 품명 그대로 적으세요. (예: "DHPPi", "Corona", "Nexgard Spectra 7.5~15kg")
-•⁠  ⁠정보가 없으면 null 을 넣으세요.
-•⁠  ⁠JSON 이외의 설명 텍스트는 절대 추가하지 마세요.
 """
 
-    response = gemini_model.generate_content(
-        [prompt, image_part],
-        generation_config={
-            "temperature": 0.0,
-            "response_mime_type": "application/json",
-        },
+    result = client.models.generate_content(
+        model=settings.GEMINI_MODEL_NAME,
+        contents=[
+            prompt,
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg"
+            )
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=1024,
+        ),
     )
 
-    text = response.text.strip()
+    text = result.text.strip()
+
+    # 코드블록 제거
+    if "```" in text:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
+
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # 혹시 ⁠ json  ⁠ 같은 마크다운이 감싸져 있을 경우 대비
-        if "{" in text and "}" in text:
-            text = text[text.find("{"): text.rfind("}") + 1]
-            data = json.loads(text)
-        else:
-            raise
-
-    # 최소 필드 보정
-    data.setdefault("clinicName", None)
-    data.setdefault("visitDate", None)
-    data.setdefault("visitTime", None)
-    data.setdefault("items", [])
-    data.setdefault("totalAmount", None)
-    data.setdefault("paymentMethod", None)
-
-    # items 정규화
-    fixed_items: List[Dict] = []
-    if isinstance(data.get("items"), list):
-        for it in data["items"]:
-            if not isinstance(it, dict):
-                continue
-            name = it.get("name")
-            price = _to_int_safe(it.get("price"))
-            fixed_items.append(
-                {
-                    "name": name,
-                    "price": price,
-                }
-            )
-    data["items"] = fixed_items
-
-    # totalAmount 정수 보정
-    data["totalAmount"] = _to_int_safe(data.get("totalAmount"))
-
-    return data
+        return json.loads(text)
+    except:
+        return {
+            "clinicName": None,
+            "visitDate": None,
+            "items": [],
+            "totalAmount": None
+        }
 
 
 # ------------------------------------------
@@ -247,111 +184,43 @@ def root():
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
-
-# ------------------------------------------
-# 1) 진료기록 OCR (영수증 업로드)
+    # ------------------------------------------
+# 1) 영수증 업로드 → S3 저장 + Gemini 분석
 # ------------------------------------------
 
-@app.post("/receipt/upload")
-@app.post("/receipts/upload")
-@app.post("/api/receipt/upload")
-@app.post("/api/receipts/upload")
-@app.post("/api/receipt/analyze")   # iOS에서 쓰는 엔드포인트
+@app.post("/api/receipt/analyze")
 @app.post("/api/receipts/analyze")
+@app.post("/receipt/upload")
 async def upload_receipt(
     petId: str = Form(...),
-    file: Optional[UploadFile] = File(None),
-    image: Optional[UploadFile] = File(None),
+    file: UploadFile = File(...),
 ):
-    """
-    영수증 이미지 업로드 + Gemini 2.5 Flash-Lite로 OCR + 구조화.
-    S3 key: receipts/{petId}/{id}.jpg
-    iOS가 file 이나 image 어떤 이름으로 보내도 처리.
-    """
-    upload: Optional[UploadFile] = file or image
-    if upload is None:
-        raise HTTPException(status_code=400, detail="no file or image field")
-
-    # 파일 읽기
-    data = await upload.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty file")
-
-    # S3 업로드
     rec_id = str(uuid.uuid4())
-    _, ext = os.path.splitext(upload.filename or "")
+    _, ext = os.path.splitext(file.filename or "")
     if not ext:
         ext = ".jpg"
+
     key = f"receipts/{petId}/{rec_id}{ext}"
 
+    # 파일 읽기
+    data = await file.read()
     file_like = io.BytesIO(data)
     file_like.seek(0)
 
+    # 1) S3 업로드
     file_url = upload_to_s3(
         file_like,
         key,
-        content_type=upload.content_type or "image/jpeg",
+        content_type=file.content_type or "image/jpeg"
     )
 
-    # Gemini로 OCR + 구조화
-    if gemini_model is None:
-        # Gemini 미초기화시 비어 있는 기본값으로 응답
-        ai_parsed = {
-            "clinicName": None,
-            "visitDate": None,
-            "visitTime": None,
-            "items": [],
-            "totalAmount": None,
-            "paymentMethod": None,
-        }
-    else:
-        try:
-            ai_parsed = parse_receipt_with_gemini(data)
-        except Exception as e:
-            print(f"[Gemini] 영수증 파싱 실패: {e}")
-            ai_parsed = {
-                "clinicName": None,
-                "visitDate": None,
-                "visitTime": None,
-                "items": [],
-                "totalAmount": None,
-                "paymentMethod": None,
-            }
-
-    # iOS DTO 형식으로 변환
-    visit_date = ai_parsed.get("visitDate")
-    visit_time = ai_parsed.get("visitTime")
-    visit_date_for_dto: Optional[str] = None
-    if visit_date and visit_time:
-        visit_date_for_dto = f"{visit_date} {visit_time}"
-    elif visit_date:
-        visit_date_for_dto = visit_date
-
-    dto_items: List[Dict] = []
-    for it in ai_parsed.get("items", []):
-        dto_items.append(
-            {
-                "name": it.get("name"),
-                "price": it.get("price"),
-            }
-        )
-
-    parsed_for_dto = {
-        "clinicName": ai_parsed.get("clinicName"),
-        "visitDate": visit_date_for_dto,
-        "diseaseName": None,
-        "symptomsSummary": None,
-        "items": dto_items,
-        "totalAmount": ai_parsed.get("totalAmount"),
-        "paymentMethod": ai_parsed.get("paymentMethod"),
-    }
+    # 2) Gemini로 이미지 직접 분석
+    ai_parsed = analyze_receipt_with_gemini(data)
 
     return {
         "petId": petId,
         "s3Url": file_url,
-        "parsed": parsed_for_dto,
-        "notes": None,
+        "parsed": ai_parsed,
     }
 
 
@@ -359,10 +228,7 @@ async def upload_receipt(
 # 2) 검사결과 PDF 업로드
 # ------------------------------------------
 
-@app.post("/lab/upload-pdf")
-@app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
-@app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
     title: str = Form("검사결과"),
@@ -373,9 +239,10 @@ async def upload_lab_pdf(
 
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
     safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
-    key = f"lab/{petId}/{safe_base}__{lab_id}.pdf"
 
-    file_url = upload_to_s3(file.file, key, content_type="application/pdf")
+    key = f"lab/{petId}/{safe_base}_{lab_id}.pdf"
+
+    file_url = upload_to_s3(file.file, key, "application/pdf")
 
     created_at_dt = datetime.utcnow()
     created_at_iso = created_at_dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -397,10 +264,7 @@ async def upload_lab_pdf(
 # 3) 증명서 PDF 업로드
 # ------------------------------------------
 
-@app.post("/cert/upload-pdf")
-@app.post("/certs/upload-pdf")
 @app.post("/api/cert/upload-pdf")
-@app.post("/api/certs/upload-pdf")
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form("증명서"),
@@ -411,9 +275,10 @@ async def upload_cert_pdf(
 
     original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
     safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
-    key = f"cert/{petId}/{safe_base}__{cert_id}.pdf"
 
-    file_url = upload_to_s3(file.file, key, content_type="application/pdf")
+    key = f"cert/{petId}/{safe_base}_{cert_id}.pdf"
+
+    file_url = upload_to_s3(file.file, key, "application/pdf")
 
     created_at_dt = datetime.utcnow()
     created_at_iso = created_at_dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -435,9 +300,6 @@ async def upload_cert_pdf(
 # 4) 검사결과 리스트
 # ------------------------------------------
 
-@app.get("/lab/list")
-@app.get("/labs/list")
-@app.get("/api/lab/list")
 @app.get("/api/labs/list")
 def get_lab_list(petId: str = Query(...)):
     prefix = f"lab/{petId}/"
@@ -455,17 +317,17 @@ def get_lab_list(petId: str = Query(...)):
                 continue
 
             filename = key.split("/")[-1]
-            name_no_ext = os.path.splitext(filename)[0]
+            name_no_ext = filename[:-4]
 
             base_title = "검사결과"
             file_id = name_no_ext
 
-            if "__" in name_no_ext:
-                safe_base, file_id = name_no_ext.rsplit("__", 1)
+            if "_" in name_no_ext:
+                safe_base, file_id = name_no_ext.split("_", 1)
                 base_title = safe_base.replace("_", " ")
 
             created_dt = obj["LastModified"]
-            created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            created_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
             date_str = created_dt.strftime("%Y-%m-%d")
 
             display_title = f"{base_title} ({date_str})"
@@ -476,16 +338,14 @@ def get_lab_list(petId: str = Query(...)):
                 ExpiresIn=7 * 24 * 3600,
             )
 
-            items.append(
-                {
-                    "id": file_id,
-                    "petId": petId,
-                    "title": display_title,
-                    "memo": None,
-                    "s3Url": url,
-                    "createdAt": created_at_iso,
-                }
-            )
+            items.append({
+                "id": file_id,
+                "petId": petId,
+                "title": display_title,
+                "memo": None,
+                "s3Url": url,
+                "createdAt": created_iso,
+            })
 
     return items
 
@@ -494,9 +354,6 @@ def get_lab_list(petId: str = Query(...)):
 # 5) 증명서 리스트
 # ------------------------------------------
 
-@app.get("/cert/list")
-@app.get("/certs/list")
-@app.get("/api/cert/list")
 @app.get("/api/certs/list")
 def get_cert_list(petId: str = Query(...)):
     prefix = f"cert/{petId}/"
@@ -514,17 +371,17 @@ def get_cert_list(petId: str = Query(...)):
                 continue
 
             filename = key.split("/")[-1]
-            name_no_ext = os.path.splitext(filename)[0]
+            name_no_ext = filename[:-4]
 
             base_title = "증명서"
             file_id = name_no_ext
 
-            if "__" in name_no_ext:
-                safe_base, file_id = name_no_ext.rsplit("__", 1)
+            if "_" in name_no_ext:
+                safe_base, file_id = name_no_ext.split("_", 1)
                 base_title = safe_base.replace("_", " ")
 
             created_dt = obj["LastModified"]
-            created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            created_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
             date_str = created_dt.strftime("%Y-%m-%d")
 
             display_title = f"{base_title} ({date_str})"
@@ -535,15 +392,13 @@ def get_cert_list(petId: str = Query(...)):
                 ExpiresIn=7 * 24 * 3600,
             )
 
-            items.append(
-                {
-                    "id": file_id,
-                    "petId": petId,
-                    "title": display_title,
-                    "memo": None,
-                    "s3Url": url,
-                    "createdAt": created_at_iso,
-                }
-            )
+            items.append({
+                "id": file_id,
+                "petId": petId,
+                "title": display_title,
+                "memo": None,
+                "s3Url": url,
+                "createdAt": created_iso,
+            })
 
     return items
