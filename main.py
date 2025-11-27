@@ -11,14 +11,11 @@ from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
-# Google Vision (Legacy Support)
 from google.cloud import vision
 import boto3
 from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-# 이미지 처리를 위한 라이브러리 (Gemini Vision용) - pip install Pillow 필요
-from PIL import Image
 
 # 🔥 새로 만든 태그 파일 Import (없을 경우 대비하여 예외처리)
 try:
@@ -98,92 +95,7 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
 
 
 # ------------------------------------------
-# 3. GEMINI VISION (이미지 직접 분석 - NEW)
-# ------------------------------------------
-
-def analyze_receipt_image_with_gemini(image_bytes: bytes) -> Optional[dict]:
-    """
-    이미지 바이너리를 Gemini에게 직접 보내서 영수증 정보를 추출
-    (OCR 텍스트 추출 과정을 건너뛰고 이미지 자체를 이해함)
-    """
-    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
-        return None
-
-    try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
-
-        # Bytes -> PIL Image 변환
-        try:
-            img = Image.open(io.BytesIO(image_bytes))
-        except Exception:
-            return None # 이미지 파일이 아님
-
-        prompt = """
-        이 이미지는 한국 동물병원 영수증이야.
-        이미지를 분석해서 다음 정보를 정확한 JSON으로 추출해줘.
-        
-        1. 병원명 (clinicName): 상단에 있는 병원 이름
-        2. 방문일자 (visitDate): 날짜 (YYYY-MM-DD 형식). 시간은 제외.
-        3. 진료항목 (items): 품목명(name)과 금액(price). 
-           - '합계', '부가세', '총액', '카드', '현금' 같은 결제 정보는 제외하고 순수 진료 항목만 추출해.
-           - 금액에 '원'이나 콤마(,)는 제거하고 정수형(Integer)으로 줘.
-        4. 총결제금액 (totalAmount): 최종 합계 금액.
-
-        [출력 JSON 형식]
-        {
-          "clinicName": "OO동물병원",
-          "visitDate": "2023-10-25",
-          "items": [
-            {"name": "초진 진찰료", "price": 5000},
-            {"name": "종합백신", "price": 25000}
-          ],
-          "totalAmount": 30000
-        }
-        
-        오직 JSON만 출력해. 마크다운이나 설명은 쓰지 마.
-        """
-
-        # 이미지와 프롬프트를 함께 전송
-        response = model.generate_content([prompt, img])
-        text = response.text.strip()
-
-        # Markdown 처리
-        if "⁠  " in text:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1:
-                text = text[start:end+1]
-
-        data = json.loads(text)
-        
-        # 데이터 정제 (안전장치)
-        safe_items = []
-        if "items" in data and isinstance(data["items"], list):
-            for it in data["items"]:
-                if isinstance(it, dict):
-                    # 금액 정제
-                    price_val = str(it.get("price", "0")).replace(",", "").replace("원", "").strip()
-                    try:
-                        final_price = int(float(price_val)) # 1000.0 같은 경우 대비
-                    except:
-                        final_price = 0
-                        
-                    safe_items.append({
-                        "name": str(it.get("name", "항목")),
-                        "price": final_price
-                    })
-        data["items"] = safe_items
-        
-        return data
-
-    except Exception as e:
-        print(f"Gemini Vision Error: {e}")
-        return None
-
-
-# ------------------------------------------
-# 4. GOOGLE VISION OCR (Legacy Support)
+# 3. GOOGLE VISION OCR
 # ------------------------------------------
 
 def get_vision_client() -> vision.ImageAnnotatorClient:
@@ -227,7 +139,7 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------
-# 5. 영수증 파싱 로직 (기존 코드 유지)
+# 4. 영수증 파싱 로직 (기존 코드 유지)
 # ------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
@@ -359,7 +271,7 @@ def parse_receipt_kor(text: str) -> dict:
 
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
-    Gemini를 이용한 영수증 AI 파싱 (텍스트 기반 - 백업용)
+    Gemini를 이용한 영수증 AI 파싱
     """
     if settings.GEMINI_ENABLED.lower() != "true":
         return None
@@ -370,6 +282,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
+        # 환경변수 모델명 사용
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
@@ -401,7 +314,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         text = resp.text.strip()
 
         # Markdown json 태그 제거
-        if "  ⁠" in text:
+        if "⁠  " in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
@@ -433,7 +346,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
 
 # ------------------------------------------
-# 6. AI Care (태그 헬퍼 & DTO) - 🔥 새로 추가된 부분
+# 5. AI Care (태그 헬퍼 & DTO) - 🔥 새로 추가된 부분
 # ------------------------------------------
 
 def get_tags_definition_for_prompt() -> str:
@@ -492,10 +405,10 @@ class AICareResponse(BaseModel):
 
 
 # ------------------------------------------
-# 7. FASTAPI APP SETUP
+# 6. FASTAPI APP SETUP
 # ------------------------------------------
 
-app = FastAPI(title="PetHealth+ Server", version="2.0.0")
+app = FastAPI(title="PetHealth+ Server", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -518,10 +431,10 @@ def health():
 
 
 # ------------------------------------------
-# 8. ENDPOINTS
+# 7. ENDPOINTS
 # ------------------------------------------
 
-# (1) 영수증 업로드 & 분석 (Gemini Vision 적용 - 개선된 로직)
+# (1) 영수증 업로드 & 분석 (기존 기능)
 @app.post("/receipt/upload")
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
@@ -556,48 +469,45 @@ async def upload_receipt(
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 🔥 1순위: Gemini Vision으로 이미지 직접 분석 (OCR 불량 해결)
-    parsed_data = analyze_receipt_image_with_gemini(data)
-    
-    notes = "AI Vision 분석 완료"
+    # 2) OCR 실행
+    ocr_text = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            ocr_text = run_vision_ocr(tmp.name)
+    except Exception:
+        ocr_text = ""
 
-    # 🔥 2순위: Vision 실패 시 기존 OCR + Text AI 방식 (백업)
-    if not parsed_data:
-        print("Vision failed, fallback to OCR")
-        try:
-            with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
-                tmp.write(data)
-                tmp.flush()
-                ocr_text = run_vision_ocr(tmp.name)
-            
-            # Text AI 시도
-            parsed_data = parse_receipt_ai(ocr_text)
-            
-            # Text AI도 실패하면 정규식
-            if not parsed_data:
-                fallback = parse_receipt_kor(ocr_text)
-                items = [{"name": "항목", "price": fallback["totalAmount"]}] if fallback["totalAmount"] else []
-                parsed_data = {
-                    "clinicName": fallback["hospitalName"],
-                    "visitDate": fallback["visitAt"],
-                    "diseaseName": None,
-                    "symptomsSummary": None,
-                    "items": items,
-                    "totalAmount": fallback["totalAmount"]
-                }
-            notes = "OCR 분석 (Vision 실패)"
-        except Exception as e:
-            print(f"Fallback Error: {e}")
-            parsed_data = {
-                "clinicName": "", "visitDate": "", "items": [], "totalAmount": 0
-            }
-            notes = "분석 실패"
+    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
+    ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
+    
+    if ai_parsed:
+        parsed_for_dto = ai_parsed
+    else:
+        fallback = parse_receipt_kor(ocr_text) if ocr_text else {
+            "hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0
+        }
+
+        # 정규식 결과 DTO 변환
+        dto_items = []
+        for it in fallback.get("items", []):
+            dto_items.append({"name": it.get("name"), "price": it.get("amount")})
+
+        parsed_for_dto = {
+            "clinicName": fallback.get("hospitalName"),
+            "visitDate": fallback.get("visitAt"),
+            "diseaseName": None,
+            "symptomsSummary": None,
+            "items": dto_items,
+            "totalAmount": fallback.get("totalAmount"),
+        }
 
     return {
         "petId": petId,
         "s3Url": file_url,
-        "parsed": parsed_data,
-        "notes": notes
+        "parsed": parsed_for_dto,
+        "notes": ocr_text,
     }
 
 
@@ -823,7 +733,7 @@ async def analyze_pet_health(req: AICareRequest):
         resp = model.generate_content(prompt)
         text = resp.text.strip()
         
-        if "```" in text:
+        if "  ⁠" in text:
             start, end = text.find("{"), text.rfind("}")
             if start != -1 and end != -1:
                 text = text[start:end+1]
