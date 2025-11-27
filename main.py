@@ -542,7 +542,7 @@ async def upload_receipt(
     except Exception:
         ocr_text = ""
 
-    # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
+ # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
 
     use_ai = False
@@ -572,6 +572,11 @@ async def upload_receipt(
             "items": dto_items,
             "totalAmount": fallback.get("totalAmount"),
         }
+
+    # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
+    clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
+    clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
+    parsed_for_dto["clinicName"] = clinic_name
 
     # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
