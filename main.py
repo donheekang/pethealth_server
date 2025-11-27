@@ -193,14 +193,21 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트를 구조화 (정규식 Fallback)
+    한국 동물병원 영수증 OCR 텍스트를 구조화.
+
+    - 병원명: 상단 쪽 텍스트에서 추론
+    - 날짜: yyyy,MM,dd,[HH:MM] 패턴 탐색
+    - 항목: "진료 내역" ~ "소 계/합계" 구간에서
+        *    로 시작하는 줄 → 항목 이름 리스트
+        숫자/콤마/공백만 있는 줄 → 금액 리스트
+      를 뽑아서 순서대로 매칭한다.
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     # 1) 병원명
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 날짜/시간
+    # 2) 방문일시
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
@@ -212,11 +219,9 @@ def parse_receipt_kor(text: str) -> dict:
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
 
-    # 시간 없는 날짜 패턴 추가 (보완)
+    # 시간 없는 날짜
     if not visit_at:
-        dt_pattern_short = re.compile(
-            r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})"
-        )
+        dt_pattern_short = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})")
         for line in lines:
             m = dt_pattern_short.search(line)
             if m:
@@ -224,57 +229,88 @@ def parse_receipt_kor(text: str) -> dict:
                 visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
                 break
 
-    # 3) 금액 패턴 (숫자 뒤 공백/원 없어도 인식되도록 수정 ✅)
-    amt_pattern = re.compile(
-        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(?:원)?\s*$"
-    )
-
-    items: List[Dict] = []
+    # 3) 금액(합계) 후보 – 영수증 전체에서 스캔
+    amt_pattern_total = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(원)?\s*$")
     candidate_totals: List[int] = []
 
     for line in lines:
-        m = amt_pattern.search(line)
+        m = amt_pattern_total.search(line)
         if not m:
             continue
-
         amount_str = m.group(1).replace(",", "")
         try:
             amount = int(amount_str)
         except ValueError:
             continue
 
-        name = line[:m.start()].strip()
-        lowered = name.replace(" ", "")
-
-        # 합계/총액 줄은 total 후보 (소계·결제요청 등 확장 ✅)
-        if any(
-            k in lowered
-            for k in [
-                "합계",
-                "총액",
-                "총금액",
-                "합계금액",
-                "소계",
-                "소개",  # '소   계'가 OCR에서 소개로 나올 수 있음
-                "결제요청",
-                "결제금액",
-                "청구금액",
-                "승인금액",
-            ]
-        ):
+        lowered = line.replace(" ", "")
+        if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액", "결제요청"]):
             candidate_totals.append(amount)
+
+    # 4) 진료 항목 영역 추출
+    start_idx = None
+    for i, line in enumerate(lines):
+        if "[날짜" in line:
+            start_idx = i + 1
+            break
+        if ("진료" in line and "내역" in line) or ("진료 및" in line and "내역" in line):
+            start_idx = i + 1
+            # 계속 돌면서 [날짜:]가 더 아래에 있으면 거기로 교체
+    if start_idx is None:
+        start_idx = 0
+
+    end_idx = len(lines)
+    for i in range(start_idx, len(lines)):
+        if any(k in lines[i] for k in ["소 계", "소계", "합계", "결제요청"]):
+            end_idx = i
+            break
+
+    item_block = lines[start_idx:end_idx]
+
+    names: List[str] = []
+    prices: List[int] = []
+
+    for line in item_block:
+        # 헤더/설명 줄 스킵
+        if any(k in line for k in ["동물명", "항목", "단가", "수량", "금액"]):
             continue
 
-        if not name:
-            name = "항목"
+        # (1) * 로 시작하는 줄 → 항목 이름
+        if line.startswith("*"):
+            name = line.lstrip("*").strip().strip(".")
+            if name:
+                names.append(name)
+            continue
 
-        items.append({"name": name, "amount": amount})
+        # (2) 숫자/콤마/공백만 있는 줄 → 금액 (단가 / 금액 중 첫 번째만 사용)
+        if re.fullmatch(r"[0-9,\s]+", line):
+            m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)", line)
+            if m:
+                amt = int(m.group(1).replace(",", ""))
+                if amt > 0:
+                    prices.append(amt)
+            continue
 
-    # 4) totalAmount 결정
+        # (3) 텍스트 + 숫자가 한 줄에 같이 있는 패턴 (다른 양식 대비)
+        m = re.search(r"(.+?)\s+(\d{1,3}(?:,\d{3})+|\d+)", line)
+        if m and ":" not in line and "[" not in line:
+            name = m.group(1).strip()
+            amt = int(m.group(2).replace(",", ""))
+            if name:
+                names.append(name)
+                prices.append(amt)
+
+    # 5) 이름-금액 매칭 (이름 수/금액 수 중 짧은 쪽에 맞춰 자르기)
+    items: List[Dict] = []
+    pair_count = min(len(names), len(prices))
+    for i in range(pair_count):
+        items.append({"name": names[i], "amount": prices[i]})
+
+    # 6) totalAmount 결정
     if candidate_totals:
         total_amount = max(candidate_totals)
-    elif items:
-        total_amount = sum(i["amount"] for i in items)
+    elif prices:
+        total_amount = sum(prices)
     else:
         total_amount = 0
 
@@ -506,17 +542,41 @@ async def upload_receipt(
     except Exception:
         ocr_text = ""
 
-    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
+    # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
 
+    use_ai = False
     if ai_parsed:
+        ai_items = ai_parsed.get("items") or []
+        ai_total = ai_parsed.get("totalAmount") or 0
+        # ✅ 항목이 1개 이상이고 합계가 0이 아니어야 "정상"이라고 판단
+        if len(ai_items) > 0 and ai_total > 0:
+            use_ai = True
+
+    if use_ai:
         parsed_for_dto = ai_parsed
     else:
-        fallback = (
-            parse_receipt_kor(ocr_text)
-            if ocr_text
-            else {"hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0}
-        )
+        fallback = parse_receipt_kor(ocr_text) if ocr_text else {
+            "hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0
+        }
+
+        dto_items = []
+        for it in fallback.get("items", []):
+            dto_items.append({"name": it.get("name"), "price": it.get("amount")})
+
+        parsed_for_dto = {
+            "clinicName": fallback.get("hospitalName"),
+            "visitDate": fallback.get("visitAt"),
+            "diseaseName": None,
+            "symptomsSummary": None,
+            "items": dto_items,
+            "totalAmount": fallback.get("totalAmount"),
+        }
+
+    # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
+    clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
+    clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
+    parsed_for_dto["clinicName"] = clinic_name
 
         # 정규식 결과 DTO 변환
         dto_items = []
