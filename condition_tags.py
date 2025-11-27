@@ -22,6 +22,81 @@ class ConditionTagConfig:
     group: str          # 상위 그룹 (dermatology / cardiology 등)
     keywords: List[str] # OCR/병명에서 매칭할 키워드 목록 (한/영 섞어서)
 
+# ------------------------------------------------------------------
+    # 10) 예방접종 및 웰니스 (Preventive / Wellness)
+    # ------------------------------------------------------------------
+
+    # 1. 종합백신 (가장 기본)
+    "prevent_vaccine_comprehensive": ConditionTagConfig(
+        code="prevent_vaccine_comprehensive",
+        label="예방접종 · 종합백신(DHPPL/FVRCP)",
+        species="both",
+        group="preventive",
+        keywords=[
+            "종합백신", "혼합백신", "기초접종", "추가접종",
+            "DHPPL", "DA2PP", "DHPP",  # 강아지
+            "FVRCP", "3종 백신", "4종 백신", "5종 백신" # 고양이/강아지
+        ],
+    ),
+
+    # 2. 코로나 (사용자 질문 반영)
+    "prevent_vaccine_corona": ConditionTagConfig(
+        code="prevent_vaccine_corona",
+        label="예방접종 · 코로나 장염 백신",
+        species="dog", # 고양이 전염성복막염(FIP) 백신은 드물므로 주로 강아지용
+        group="preventive",
+        keywords=[
+            "코로나", "코로나 장염", "Corona", "Canine Coronavirus",
+            "CV 백신", "장염 예방"
+        ],
+    ),
+
+    # 3. 켄넬코프 / 인플루엔자 (호흡기 관련)
+    "prevent_vaccine_respiratory": ConditionTagConfig(
+        code="prevent_vaccine_respiratory",
+        label="예방접종 · 켄넬코프/인플루엔자",
+        species="dog",
+        group="preventive",
+        keywords=[
+            "켄넬코프", "기관지염", "Kennel Cough", "Bordetella",
+            "인플루엔자", "신종플루", "독감", "CIV", "Canine Influenza"
+        ],
+    ),
+
+    # 4. 광견병 (법정 의무)
+    "prevent_vaccine_rabies": ConditionTagConfig(
+        code="prevent_vaccine_rabies",
+        label="예방접종 · 광견병",
+        species="both",
+        group="preventive",
+        keywords=[
+            "광견병", "Rabies", "광견병 주사", "보강 접종"
+        ],
+    ),
+
+    # 5. 심장사상충 예방 (약/주사)
+    "prevent_heartworm": ConditionTagConfig(
+        code="prevent_heartworm",
+        label="예방 · 심장사상충 예방",
+        species="both", # 고양이도 하긴 함
+        group="preventive",
+        keywords=[
+            "심장사상충 예방", "하트가드", "넥스가드", "애드보킷", "레볼루션",
+            "프로하트", "Heartworm Prevention"
+        ],
+    ),
+
+    # 6. 외부기생충 (진드기)
+    "prevent_external_parasite": ConditionTagConfig(
+        code="prevent_external_parasite",
+        label="예방 · 외부기생충(진드기)",
+        species="both",
+        group="preventive",
+        keywords=[
+            "외부기생충", "진드기", "벼룩", "브라벡토", "프론트라인",
+            "Flea", "Tick"
+        ],
+    ),
 
 CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
     # ------------------------------------------------------------------
