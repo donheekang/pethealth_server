@@ -255,7 +255,6 @@ def parse_receipt_kor(text: str) -> dict:
             break
         if ("진료" in line and "내역" in line) or ("진료 및" in line and "내역" in line):
             start_idx = i + 1
-            # 계속 돌면서 [날짜:]가 더 아래에 있으면 거기로 교체
     if start_idx is None:
         start_idx = 0
 
@@ -291,7 +290,7 @@ def parse_receipt_kor(text: str) -> dict:
                     prices.append(amt)
             continue
 
-        # (3) 텍스트 + 숫자가 한 줄에 같이 있는 패턴 (다른 양식 대비)
+        # (3) 텍스트 + 숫자가 한 줄에 같이 있는 패턴
         m = re.search(r"(.+?)\s+(\d{1,3}(?:,\d{3})+|\d+)", line)
         if m and ":" not in line and "[" not in line:
             name = m.group(1).strip()
@@ -300,7 +299,7 @@ def parse_receipt_kor(text: str) -> dict:
                 names.append(name)
                 prices.append(amt)
 
-    # 5) 이름-금액 매칭 (이름 수/금액 수 중 짧은 쪽에 맞춰 자르기)
+    # 5) 이름-금액 매칭
     items: List[Dict] = []
     pair_count = min(len(names), len(prices))
     for i in range(pair_count):
@@ -367,11 +366,11 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         text = resp.text.strip()
 
         # Markdown 코드블록 안에 있을 경우 정리
-        if "⁠  " in text:
+        if "⁠  " in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
-                text = text[start : end + 1]
+                text = text[start: end + 1]
 
         data = json.loads(text)
 
@@ -422,7 +421,6 @@ def get_tags_definition_for_prompt() -> str:
     return "\n".join(lines)
 
 
-# DTO Models for AI Analysis
 class PetProfileDTO(BaseModel):
     name: str
     species: str
@@ -542,14 +540,14 @@ async def upload_receipt(
     except Exception:
         ocr_text = ""
 
- # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
+    # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
 
     use_ai = False
     if ai_parsed:
         ai_items = ai_parsed.get("items") or []
         ai_total = ai_parsed.get("totalAmount") or 0
-        # ✅ 항목이 1개 이상이고 합계가 0이 아니어야 "정상"이라고 판단
+        # 항목이 1개 이상이고 합계가 0이 아니어야 "정상"
         if len(ai_items) > 0 and ai_total > 0:
             use_ai = True
 
@@ -557,7 +555,10 @@ async def upload_receipt(
         parsed_for_dto = ai_parsed
     else:
         fallback = parse_receipt_kor(ocr_text) if ocr_text else {
-            "hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0
+            "hospitalName": "",
+            "visitAt": None,
+            "items": [],
+            "totalAmount": 0,
         }
 
         dto_items = []
@@ -573,29 +574,10 @@ async def upload_receipt(
             "totalAmount": fallback.get("totalAmount"),
         }
 
-    # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
+    # 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
-
-    # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
-    clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
-    clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
-    parsed_for_dto["clinicName"] = clinic_name
-
-        # 정규식 결과 DTO 변환
-        dto_items = []
-        for it in fallback.get("items", []):
-            dto_items.append({"name": it.get("name"), "price": it.get("amount")})
-
-        parsed_for_dto = {
-            "clinicName": fallback.get("hospitalName"),
-            "visitDate": fallback.get("visitAt"),
-            "diseaseName": None,
-            "symptomsSummary": None,
-            "items": dto_items,
-            "totalAmount": fallback.get("totalAmount"),
-        }
 
     return {
         "petId": petId,
@@ -816,11 +798,11 @@ async def analyze_pet_health(req: AICareRequest):
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        if "  ⁠" in text:
+        if "  ⁠" in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
-                text = text[start : end + 1]
+                text = text[start: end + 1]
 
         data = json.loads(text)
 
