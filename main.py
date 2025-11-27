@@ -5,15 +5,16 @@ import io
 import json
 import uuid
 import tempfile
+import re
 from datetime import datetime
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import vision
-from condition_tags import CONDITION_TAGS, ConditionTagConfig
 import boto3
 from botocore.exceptions import NoCredentialsError
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 # Gemini (google-generativeai) - 설치 안 되어 있어도 서버가 죽지 않게 try/except
@@ -24,30 +25,35 @@ except ImportError:
 
 
 # ------------------------------------------
-# SETTINGS
+# 1. SETTINGS (환경 변수 연동)
 # ------------------------------------------
 
 class Settings(BaseSettings):
+    # AWS S3
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # 서비스 계정 JSON 내용 또는 JSON 파일 경로 (Vision OCR)
+    # Google Vision OCR (JSON 내용 or 파일 경로)
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
-    # Gemini 사용 여부 + API Key
-    GEMINI_ENABLED: str = "false"
+    # Google Gemini AI
+    GEMINI_ENABLED: str = "true"
     GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash"  # 환경변수 없을 시 기본값
 
+    # 기타
     STUB_MODE: str = "false"
 
+    class Config:
+        env_file = ".env"  # .env 파일이 있다면 로드
 
 settings = Settings()
 
 
 # ------------------------------------------
-# AWS S3 CLIENT
+# 2. AWS S3 CLIENT
 # ------------------------------------------
 
 s3_client = boto3.client(
@@ -84,7 +90,7 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
 
 
 # ------------------------------------------
-# GOOGLE VISION OCR
+# 3. GOOGLE VISION OCR
 # ------------------------------------------
 
 def get_vision_client() -> vision.ImageAnnotatorClient:
@@ -92,7 +98,6 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
     GOOGLE_APPLICATION_CREDENTIALS:
       - 서비스 계정 JSON '내용'일 수도 있고
       - JSON 파일 경로일 수도 있음
-    둘 다 지원
     """
     cred_value = settings.GOOGLE_APPLICATION_CREDENTIALS
     if not cred_value:
@@ -101,8 +106,7 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
     # 1) JSON 내용 시도
     try:
         info = json.loads(cred_value)
-        client = vision.ImageAnnotatorClient.from_service_account_info(info)
-        return client
+        return vision.ImageAnnotatorClient.from_service_account_info(info)
     except json.JSONDecodeError:
         # 2) JSON이 아니면 경로로 간주
         if not os.path.exists(cred_value):
@@ -110,8 +114,7 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
                 "GOOGLE_APPLICATION_CREDENTIALS가 JSON도 아니고, "
                 f"파일 경로({cred_value})도 아닙니다."
             )
-        client = vision.ImageAnnotatorClient.from_service_account_file(cred_value)
-        return client
+        return vision.ImageAnnotatorClient.from_service_account_file(cred_value)
     except Exception as e:
         raise Exception(f"OCR 클라이언트 생성 실패: {e}")
 
@@ -139,43 +142,29 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------
-# 영수증 OCR 결과 파싱 (정규식 Fallback)
+# 4. 영수증 OCR 파싱 로직 (Regex Fallback)
 # ------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
-    """
-    병원명 추론: 키워드 + 위치 + 형태 기반으로 대략 고르기
-    """
     keywords = [
         "동물병원", "동물 병원", "동물의료", "동물메디컬", "동물 메디컬",
-        "동물클리닉", "동물 클리닉",
-        "애견병원", "애완동물병원", "펫병원", "펫 병원",
+        "동물클리닉", "동물 클리닉", "애견병원", "애완동물병원", "펫병원",
         "종합동물병원", "동물의원", "동물병의원"
     ]
-
     best_line = None
     best_score = -1
 
     for idx, line in enumerate(lines):
         score = 0
         text = line.replace(" ", "")
-
-        # 1) 키워드 점수
         if any(k in text for k in keywords):
             score += 5
-
-        # 2) 위치 점수 (위쪽일수록 가산점)
         if idx <= 4:
             score += 2
-
-        # 3) 주소/전화번호처럼 보이면 감점
-        if any(x in line for x in ["TEL", "전화", "FAX", "팩스", "도로명"]):
+        if any(x in line for x in ["TEL", "전화", "FAX", "도로명"]):
             score -= 2
-        digit_count = sum(c.isdigit() for c in line)
-        if digit_count >= 8:
+        if sum(c.isdigit() for c in line) >= 8:
             score -= 1
-
-        # 4) 길이 너무 짧거나 너무 길면 감점
         if len(line) < 2 or len(line) > 25:
             score -= 1
 
@@ -190,38 +179,33 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트를 구조화:
-    - hospitalName
-    - visitAt  (YYYY-MM-DD HH:MM 또는 None)
-    - items    [{ name, amount }]
-    - totalAmount
+    한국 동물병원 영수증 OCR 텍스트 구조화 (정규식 기반 Fallback)
     """
-    import re
-
-    # 공백 줄 제거
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-    # 1) 병원명
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 날짜/시간: 2025.11.20 12:51, 2025-11-20 12:51, 2025년 11월 20일 12:51 등
+    # 날짜/시간
     visit_at = None
-    dt_pattern = re.compile(
-        r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
-    )
+    dt_pattern = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})")
+    
+    # 시간 없는 날짜 패턴 추가
+    dt_pattern_short = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})")
+
     for line in lines:
         m = dt_pattern.search(line)
         if m:
             y, mo, d, h, mi = map(int, m.groups())
-            # iOS 쪽에서 "yyyy-MM-dd HH:mm" 형식도 처리하므로 T 대신 공백 사용
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
+        
+        # 시간 없으면 날짜만
+        m2 = dt_pattern_short.search(line)
+        if not visit_at and m2:
+             y, mo, d = map(int, m2.groups())
+             visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
 
-    # 3) 금액 패턴: 끝에 오는 숫자 (30,000 / 81000 / ￦30,000 / 30,000원)
-    amt_pattern = re.compile(
-        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s(원)?\s*$"
-    )
-
+    # 금액
+    amt_pattern = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s(원)?\s*$")
     items: List[Dict] = []
     candidate_totals: List[int] = []
 
@@ -229,27 +213,23 @@ def parse_receipt_kor(text: str) -> dict:
         m = amt_pattern.search(line)
         if not m:
             continue
-
         amount_str = m.group(1).replace(",", "")
         try:
             amount = int(amount_str)
         except ValueError:
             continue
-
+        
         name = line[:m.start()].strip()
         lowered = name.replace(" ", "")
-
-        # 합계/총액 줄은 total 후보
+        
         if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액"]):
             candidate_totals.append(amount)
             continue
-
+        
         if not name:
             name = "항목"
-
         items.append({"name": name, "amount": amount})
 
-    # 4) totalAmount 결정
     if candidate_totals:
         total_amount = max(candidate_totals)
     elif items:
@@ -265,71 +245,41 @@ def parse_receipt_kor(text: str) -> dict:
     }
 
 
-# ------------------------------------------
-# Gemini LLM 를 이용한 AI 파싱
-# ------------------------------------------
-
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
-    Gemini로 영수증 텍스트를 파싱해서
-    ReceiptParsedDTO 에 맞는 dict 리턴:
-    {
-      "clinicName": str | null,
-      "visitDate": "YYYY-MM-DD" | null,
-      "diseaseName": str | null,
-      "symptomsSummary": str | null,
-      "items": [ { "name": str, "price": int | null }, ... ],
-      "totalAmount": int | null
-    }
-    실패하면 None 리턴 (fallback 은 정규식 파서)
+    Gemini LLM을 이용한 정밀 파싱
     """
-    if settings.GEMINI_ENABLED.lower() != "true":
-        return None
-    if not settings.GEMINI_API_KEY:
-        return None
-    if genai is None:
+    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY or not genai:
         return None
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
-
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
-너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+        너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+        다음은 OCR로 읽은 영수증 텍스트야:
 
-다음은 OCR로 읽은 영수증 텍스트야:
+        \"\"\"{raw_text}\"\"\"
 
-\"\"\"{raw_text}\"\"\"
+        이 텍스트를 분석해서 아래 JSON 형식으로만 답해줘. 추가 설명 금지.
 
-
-이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
-한국어로 되어 있어도 상관 없지만, 키 이름은 반드시 아래와 같아야 해.
-
-반드시 이 JSON "한 개"만, 추가 설명 없이 순수 JSON으로만 출력해.
-
-형식:
-{{
-  "clinicName": string or null,
-  "visitDate": string or null,   // 형식: "YYYY-MM-DD"
-  "diseaseName": string or null,
-  "symptomsSummary": string or null,
-  "items": [
-    {{
-      "name": string,
-      "price": integer or null
-    }},
-    ...
-  ],
-  "totalAmount": integer or null
-}}
-"""
+        형식:
+        {{
+          "clinicName": string or null,
+          "visitDate": string or null,   // "YYYY-MM-DD" 또는 "YYYY-MM-DD HH:MM"
+          "diseaseName": string or null,
+          "symptomsSummary": string or null,
+          "items": [ {{ "name": string, "price": integer or null }} ],
+          "totalAmount": integer or null
+        }}
+        """
 
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        # ⁠ json ...  ⁠ 같은 마크다운이 섞여 있을 수 있으니 정리
-        if "```" in text:
+        # Markdown Strip
+        if "⁠  " in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
@@ -337,20 +287,18 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
         data = json.loads(text)
 
-        # 최소 키 검증
+        # 필수 키 검증
         for key in ["clinicName", "visitDate", "items", "totalAmount"]:
             if key not in data:
                 return None
-
+        
         # items 정규화
-        if not isinstance(data.get("items"), list):
-            data["items"] = []
-
         fixed_items = []
-        for it in data["items"]:
-            name = it.get("name") if isinstance(it, dict) else None
-            price = it.get("price") if isinstance(it, dict) else None
-            fixed_items.append({"name": name, "price": price})
+        raw_items = data.get("items")
+        if isinstance(raw_items, list):
+            for it in raw_items:
+                if isinstance(it, dict):
+                    fixed_items.append({"name": it.get("name", "항목"), "price": it.get("price", 0)})
         data["items"] = fixed_items
 
         return data
@@ -360,7 +308,48 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
 
 # ------------------------------------------
-# FASTAPI APP
+# 5. AI Care Models (DTO)
+# ------------------------------------------
+
+class PetProfileDTO(BaseModel):
+    name: str
+    species: str
+    age_text: str = Field(..., alias="age_text")
+    weight_current: Optional[float] = Field(None, alias="weight_current")
+    allergies: List[str] = []
+
+class WeightLogDTO(BaseModel):
+    date: str
+    weight: float
+
+class MedicalHistoryDTO(BaseModel):
+    visit_date: str = Field(..., alias="visit_date")
+    clinic_name: str = Field(..., alias="clinic_name")
+    item_count: int = Field(..., alias="item_count")
+
+class ScheduleDTO(BaseModel):
+    title: str
+    date: str
+    is_upcoming: bool = Field(..., alias="is_upcoming")
+
+class AICareRequest(BaseModel):
+    request_date: str = Field(..., alias="request_date")
+    profile: PetProfileDTO
+    recent_weights: List[WeightLogDTO] = Field(..., alias="recent_weights")
+    medical_history: List[MedicalHistoryDTO] = Field(..., alias="medical_history")
+    schedules: List[ScheduleDTO]
+
+class AICareResponse(BaseModel):
+    summary: str
+    detail_analysis: str
+    weight_trend_status: str
+    risk_factors: List[str]
+    action_guide: List[str]
+    health_score: int
+
+
+# ------------------------------------------
+# 6. FASTAPI APP SETUP
 # ------------------------------------------
 
 app = FastAPI()
@@ -376,35 +365,31 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running"}
-
+    return {"status": "ok", "message": "PetHealth+ Server Running (v1.2)"}
 
 @app.get("/health")
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "gemini_model": settings.GEMINI_MODEL_NAME}
 
 
 # ------------------------------------------
-# 1) 진료기록 OCR (영수증 업로드)
+# 7. ENDPOINTS
 # ------------------------------------------
+
+# (1) 영수증 업로드 & 분석 (OCR + AI)
 
 @app.post("/receipt/upload")
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
-@app.post("/api/receipt/analyze")   # iOS에서 쓰는 엔드포인트
+@app.post("/api/receipt/analyze")
 @app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
 ):
-    """
-    영수증 이미지 업로드 + Vision OCR + (옵션) Gemini AI 분석
-    S3 key: receipts/{petId}/{id}.jpg
-    iOS가 file 이나 image 어떤 이름으로 보내도 처리.
-    """
     upload: Optional[UploadFile] = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail="no file or image field")
@@ -416,7 +401,7 @@ async def upload_receipt(
 
     key = f"receipts/{petId}/{rec_id}{ext}"
 
-    # 파일 데이터 읽기
+    # 파일 읽기
     data = await upload.read()
     file_like = io.BytesIO(data)
     file_like.seek(0)
@@ -428,55 +413,38 @@ async def upload_receipt(
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR 실행
+    # 2) OCR
     ocr_text = ""
-    tmp_path: Optional[str] = None
     try:
-        fd, tmp_path = tempfile.mkstemp(suffix=ext)
-        with os.fdopen(fd, "wb") as tmp:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
             tmp.write(data)
-
-        ocr_text = run_vision_ocr(tmp_path)
-
-    except Exception:
+            tmp.flush()
+            ocr_text = run_vision_ocr(tmp.name)
+    except Exception as e:
+        print(f"OCR Fail: {e}")
         ocr_text = ""
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
-    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
+    # 3) AI 파싱 -> 실패시 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
+    
     if ai_parsed:
         parsed_for_dto = ai_parsed
     else:
+        # 정규식 Fallback
         fallback = parse_receipt_kor(ocr_text) if ocr_text else {
-            "hospitalName": "",
-            "visitAt": None,
-            "items": [],
-            "totalAmount": 0,
+            "hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0
         }
-
-        visit_at = fallback.get("visitAt")
-        visit_date: Optional[str] = None
-        if visit_at:
-            # "YYYY-MM-DD HH:MM" 이면 그대로, iOS 쪽에서 길이 10/초과 여부로 처리
-            visit_date = visit_at
-
-        dto_items: List[Dict] = []
+        
+        items_dto = []
         for it in fallback.get("items", []):
-            dto_items.append(
-                {
-                    "name": it.get("name"),
-                    "price": it.get("amount"),
-                }
-            )
+            items_dto.append({"name": it.get("name"), "price": it.get("amount")})
 
         parsed_for_dto = {
             "clinicName": fallback.get("hospitalName"),
-            "visitDate": visit_date,
+            "visitDate": fallback.get("visitAt"),
             "diseaseName": None,
             "symptomsSummary": None,
-            "items": dto_items,
+            "items": items_dto,
             "totalAmount": fallback.get("totalAmount"),
         }
 
@@ -488,12 +456,7 @@ async def upload_receipt(
     }
 
 
-# ------------------------------------------
-# 2) 검사결과 PDF 업로드
-#    - iOS: POST /api/lab/upload-pdf
-#    - 응답: PdfRecord 1개 (키: s3Url)
-#    - 제목: "원본파일명 (YYYY-MM-DD)"
-# ------------------------------------------
+# (2) PDF 업로드 (검사결과 / 증명서)
 
 @app.post("/lab/upload-pdf")
 @app.post("/labs/upload-pdf")
@@ -501,42 +464,27 @@ async def upload_receipt(
 @app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
-    title: str = Form("검사결과"),   # iOS에서 파일명 보내지만, 서버 쪽에서 다시 계산
+    title: str = Form("검사결과"),
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
     lab_id = str(uuid.uuid4())
-
-    # 원본 파일명(확장자 제거)
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
-
-    # S3 key 에도 파일명을 일부 포함 (나중에 리스트에서 꺼내 쓰기 위함)
     safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
-    key = f"lab/{petId}/{safe_base}__{lab_id}.pdf"
+    key = f"lab/{petId}/{safe_base}__{lab_id}.pdf"  # 구분자 __ 사용
 
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
-
-    created_at_dt = datetime.utcnow()
-    created_at_iso = created_at_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    date_str = created_at_dt.strftime("%Y-%m-%d")
-
-    display_title = f"{original_base} ({date_str})"
+    created_at_iso = datetime.utcnow().isoformat()
 
     return {
         "id": lab_id,
         "petId": petId,
-        "title": display_title,
+        "title": original_base,
         "memo": memo,
         "s3Url": file_url,
         "createdAt": created_at_iso,
     }
 
-
-# ------------------------------------------
-# 3) 증명서 PDF 업로드
-#    - iOS: POST /api/cert/upload-pdf
-#    - 제목: "원본파일명 (YYYY-MM-DD)"
-# ------------------------------------------
 
 @app.post("/cert/upload-pdf")
 @app.post("/certs/upload-pdf")
@@ -549,35 +497,24 @@ async def upload_cert_pdf(
     file: UploadFile = File(...),
 ):
     cert_id = str(uuid.uuid4())
-
     original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
     safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
     key = f"cert/{petId}/{safe_base}__{cert_id}.pdf"
 
     file_url = upload_to_s3(file.file, key, content_type="application/pdf")
-
-    created_at_dt = datetime.utcnow()
-    created_at_iso = created_at_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    date_str = created_at_dt.strftime("%Y-%m-%d")
-
-    display_title = f"{original_base} ({date_str})"
+    created_at_iso = datetime.utcnow().isoformat()
 
     return {
         "id": cert_id,
         "petId": petId,
-        "title": display_title,
+        "title": original_base,
         "memo": memo,
         "s3Url": file_url,
         "createdAt": created_at_iso,
     }
 
 
-# ------------------------------------------
-# 4) 검사결과 리스트
-#    - iOS: GET /api/labs/list?petId=...
-#    - 응답: [ PdfRecord ] (키: s3Url)
-#    - 제목: "파일명 (YYYY-MM-DD)" (과거 파일은 "검사결과 (YYYY-MM-DD)")
-# ------------------------------------------
+# (3) 리스트 조회 (원본 로직 복원)
 
 @app.get("/lab/list")
 @app.get("/labs/list")
@@ -585,29 +522,28 @@ async def upload_cert_pdf(
 @app.get("/api/labs/list")
 def get_lab_list(petId: str = Query(...)):
     prefix = f"lab/{petId}/"
-
-    response = s3_client.list_objects_v2(
-        Bucket=settings.S3_BUCKET_NAME,
-        Prefix=prefix,
-    )
+    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
 
     items: List[Dict] = []
     if "Contents" in response:
         for obj in response["Contents"]:
-            key = obj["Key"]  # lab/{petId}/{safe_base}__{id}.pdf 또는 예전 {id}.pdf
+            key = obj["Key"]
             if not key.endswith(".pdf"):
                 continue
 
+            # 파일명 파싱 (safe_base__uuid.pdf)
             filename = key.split("/")[-1]
             name_no_ext = os.path.splitext(filename)[0]
 
             base_title = "검사결과"
             file_id = name_no_ext
 
-            # 새 패턴: safe_base__uuid
             if "__" in name_no_ext:
                 safe_base, file_id = name_no_ext.rsplit("__", 1)
                 base_title = safe_base.replace("_", " ")
+            elif "" in name_no_ext and len(name_no_ext) > 36: # 예전 포맷 대비
+                 safe_base, file_id = name_no_ext.rsplit("", 1)
+                 base_title = safe_base.replace("_", " ")
 
             created_dt = obj["LastModified"]
             created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -621,25 +557,17 @@ def get_lab_list(petId: str = Query(...)):
                 ExpiresIn=7 * 24 * 3600,
             )
 
-            items.append(
-                {
-                    "id": file_id,
-                    "petId": petId,
-                    "title": display_title,
-                    "memo": None,
-                    "s3Url": url,
-                    "createdAt": created_at_iso,
-                }
-            )
+            items.append({
+                "id": file_id,
+                "petId": petId,
+                "title": display_title,
+                "memo": None,
+                "s3Url": url,
+                "createdAt": created_at_iso,
+            })
 
     return items
 
-
-# ------------------------------------------
-# 5) 증명서 리스트
-#    - iOS: GET /api/certs/list?petId=...
-#    - 제목: "파일명 (YYYY-MM-DD)" (과거 파일은 "증명서 (YYYY-MM-DD)")
-# ------------------------------------------
 
 @app.get("/cert/list")
 @app.get("/certs/list")
@@ -647,16 +575,12 @@ def get_lab_list(petId: str = Query(...)):
 @app.get("/api/certs/list")
 def get_cert_list(petId: str = Query(...)):
     prefix = f"cert/{petId}/"
-
-    response = s3_client.list_objects_v2(
-        Bucket=settings.S3_BUCKET_NAME,
-        Prefix=prefix,
-    )
+    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
 
     items: List[Dict] = []
     if "Contents" in response:
         for obj in response["Contents"]:
-            key = obj["Key"]  # cert/{petId}/{safe_base}__{id}.pdf 또는 예전 {id}.pdf
+            key = obj["Key"]
             if not key.endswith(".pdf"):
                 continue
 
@@ -682,16 +606,95 @@ def get_cert_list(petId: str = Query(...)):
                 ExpiresIn=7 * 24 * 3600,
             )
 
-            items.append(
-                {
-                    "id": file_id,
-                    "petId": petId,
-                    "title": display_title,
-                    "memo": None,
-                    "s3Url": url,
-                    "createdAt": created_at_iso,
-                }
-            )
+            items.append({
+                "id": file_id,
+                "petId": petId,
+                "title": display_title,
+                "memo": None,
+                "s3Url": url,
+                "createdAt": created_at_iso,
+            })
 
     return items
-	
+
+
+# (4) AI Care 분석 (New)
+
+@app.post("/api/ai/analyze", response_model=AICareResponse)
+async def analyze_pet_health(req: AICareRequest):
+    # Gemini 사용 불가 시 Fallback
+    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
+        return AICareResponse(
+            summary="AI 설정이 필요해요.",
+            detail_analysis="서버 환경변수를 확인해주세요.",
+            weight_trend_status="데이터 없음",
+            risk_factors=[],
+            action_guide=["서버 점검 필요"],
+            health_score=0
+        )
+
+    try:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
+
+        prompt = f"""
+        당신은 'PetHealth+' 앱의 수의학 AI 파트너입니다.
+        반려동물 데이터를 분석해 보호자에게 따뜻하고 정확한 조언을 주세요.
+
+        [반려동물 정보]
+        - 이름/종: {req.profile.name} ({req.profile.species})
+        - 나이: {req.profile.age_text}
+        - 현재 체중: {req.profile.weight_current}kg
+        - 알러지: {", ".join(req.profile.allergies) if req.profile.allergies else "없음"}
+
+        [최근 데이터]
+        - 체중 기록(최신순): {req.recent_weights}
+        - 진료 이력: {req.medical_history}
+        - 스케줄: {req.schedules}
+
+        [분석 요청사항]
+        1. 체중: 최근 변화 추세(증가/감소/유지)를 0.1kg 단위로 민감하게 체크하세요.
+        2. 리스크: 노령견/묘 여부, 체중 급변, 빈번한 병원 방문 등을 고려해 위험 요소를 찾으세요.
+        3. 액션: 구체적이고 실천 가능한 행동을 제안하세요. (예: "간식 줄이기", "관절 영양제 고려")
+        4. 점수: 0~100점 (건강할수록 높은 점수)
+
+        [출력 포맷 (JSON Only)]
+        {{
+            "summary": "홈 화면 카드용 40자 이내 핵심 요약 (예: '체중이 0.2kg 줄었어요, 사료 양을 체크해보세요!')",
+            "detail_analysis": "전체적인 건강 상태 상세 분석 (줄바꿈 없이 3~5문장)",
+            "weight_trend_status": "체중 상태 (예: 안정적, 급격한 증가, 감소 주의)",
+            "risk_factors": ["위험 요소1", "위험 요소2"],
+            "action_guide": ["추천 행동1", "추천 행동2"],
+            "health_score": 85
+        }}
+        """
+
+        resp = model.generate_content(prompt)
+        text = resp.text.strip()
+        
+        if "  ⁠" in text:
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1:
+                text = text[start:end+1]
+
+        data = json.loads(text)
+
+        return AICareResponse(
+            summary=data.get("summary", "건강 분석을 완료했어요."),
+            detail_analysis=data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
+            weight_trend_status=data.get("weight_trend_status", "-"),
+            risk_factors=data.get("risk_factors", []),
+            action_guide=data.get("action_guide", []),
+            health_score=data.get("health_score", 50)
+        )
+
+    except Exception as e:
+        print(f"AI Analyze Error: {e}")
+        return AICareResponse(
+            summary="잠시 후 다시 시도해주세요.",
+            detail_analysis=f"오류가 발생했습니다: {str(e)}",
+            weight_trend_status="-",
+            risk_factors=[],
+            action_guide=[],
+            health_score=0
+        )
