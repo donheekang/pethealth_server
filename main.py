@@ -17,14 +17,14 @@ from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-# 🔥 작성하신 태그 파일 Import (같은 폴더에 condition_tags.py가 있어야 함)
+# 🔥 새로 만든 태그 파일 Import (없을 경우 대비하여 예외처리)
 try:
     from condition_tags import CONDITION_TAGS
 except ImportError:
     CONDITION_TAGS = {}
     print("Warning: condition_tags.py not found. AI tagging will be limited.")
 
-# Gemini Import
+# Gemini (google-generativeai) Import
 try:
     import google.generativeai as genai
 except ImportError:
@@ -32,29 +32,27 @@ except ImportError:
 
 
 # ------------------------------------------
-# 1. SETTINGS (환경 변수 연동)
+# 1. SETTINGS
 # ------------------------------------------
 
 class Settings(BaseSettings):
-    # AWS S3
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # Google Vision OCR (JSON 내용 or 파일 경로)
+    # Google Vision OCR
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
-    # Google Gemini AI
-    GEMINI_ENABLED: str = "true"
+    # Gemini 사용 여부 + API Key
+    GEMINI_ENABLED: str = "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-1.5-flash"  # 환경변수 없을 시 기본값
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash" # 기본값
 
-    # 기타
     STUB_MODE: str = "false"
 
     class Config:
-        env_file = ".env"  # .env 파일이 있다면 로드
+        env_file = ".env"
 
 settings = Settings()
 
@@ -86,7 +84,7 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
         url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-            ExpiresIn=7 * 24 * 3600,  # 7일 유효
+            ExpiresIn=7 * 24 * 3600,  # 7일
         )
         return url
 
@@ -123,6 +121,7 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
 
 def run_vision_ocr(image_path: str) -> str:
     client = get_vision_client()
+
     with open(image_path, "rb") as f:
         content = f.read()
 
@@ -140,60 +139,121 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------
-# 4. 영수증 OCR 파싱 로직 (Regex Fallback)
+# 4. 영수증 파싱 로직 (기존 코드 유지)
 # ------------------------------------------
+
+def guess_hospital_name(lines: List[str]) -> str:
+    """
+    병원명 추론: 키워드 + 위치 + 형태 기반으로 대략 고르기
+    """
+    keywords = [
+        "동물병원", "동물 병원", "동물의료", "동물메디컬", "동물 메디컬",
+        "동물클리닉", "동물 클리닉",
+        "애견병원", "애완동물병원", "펫병원", "펫 병원",
+        "종합동물병원", "동물의원", "동물병의원"
+    ]
+
+    best_line = None
+    best_score = -1
+
+    for idx, line in enumerate(lines):
+        score = 0
+        text = line.replace(" ", "")
+
+        # 1) 키워드 점수
+        if any(k in text for k in keywords):
+            score += 5
+
+        # 2) 위치 점수 (위쪽일수록 가산점)
+        if idx <= 4:
+            score += 2
+
+        # 3) 주소/전화번호처럼 보이면 감점
+        if any(x in line for x in ["TEL", "전화", "FAX", "팩스", "도로명"]):
+            score -= 2
+        
+        # 4) 숫자 많으면 감점 (사업자번호 등)
+        digit_count = sum(c.isdigit() for c in line)
+        if digit_count >= 8:
+            score -= 1
+
+        # 5) 길이 너무 짧거나 너무 길면 감점
+        if len(line) < 2 or len(line) > 25:
+            score -= 1
+
+        if score > best_score:
+            best_score = score
+            best_line = line
+
+    if best_line is None and lines:
+        return lines[0]
+    return best_line or ""
+
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트 구조화 (정규식 기반 Fallback)
+    한국 동물병원 영수증 OCR 텍스트를 구조화 (정규식 Fallback)
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    
-    # 병원명 추론 (간이)
-    hospital_name = lines[0] if lines else ""
-    for line in lines[:5]:
-        if any(x in line for x in ["병원", "메디컬", "의료", "클리닉"]):
-            hospital_name = line
-            break
 
-    # 날짜/시간
+    # 1) 병원명
+    hospital_name = guess_hospital_name(lines)
+
+    # 2) 날짜/시간
     visit_at = None
-    dt_pattern = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})")
+    dt_pattern = re.compile(
+        r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
+    )
     for line in lines:
         m = dt_pattern.search(line)
         if m:
-            y, mo, d = map(int, m.groups())
-            # 시간 정보가 없으면 기본 날짜 포맷
-            visit_at = f"{y:04d}-{mo:02d}-{d:02d}"
+            y, mo, d, h, mi = map(int, m.groups())
+            visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
+    
+    # 시간 없는 날짜 패턴 추가 (보완)
+    if not visit_at:
+        dt_pattern_short = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})")
+        for line in lines:
+            m = dt_pattern_short.search(line)
+            if m:
+                y, mo, d = map(int, m.groups())
+                visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
+                break
 
-    # 금액
-    amt_pattern = re.compile(r"(\d{1,3}(?:,\d{3})|\d+)")
+    # 3) 금액 패턴
+    amt_pattern = re.compile(
+        r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})|\d+)\s(원)?\s*$"
+    )
+
     items: List[Dict] = []
     candidate_totals: List[int] = []
 
     for line in lines:
-        # 금액이 포함된 줄 찾기
         m = amt_pattern.search(line)
         if not m:
             continue
-            
+
+        amount_str = m.group(1).replace(",", "")
         try:
-            amount = int(m.group(1).replace(",", ""))
+            amount = int(amount_str)
         except ValueError:
             continue
-        
-        # 합계/총액 키워드가 있으면 후보군에 추가
-        if any(k in line for k in ["합계", "총액", "결제", "청구"]):
+
+        name = line[:m.start()].strip()
+        lowered = name.replace(" ", "")
+
+        # 합계/총액 줄은 total 후보
+        if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액", "결제금액"]):
             candidate_totals.append(amount)
             continue
-        
-        # 일반 항목으로 간주
-        name = line[:m.start()].strip()
-        if not name: name = "항목"
+
+        if not name:
+            name = "항목"
+
         items.append({"name": name, "amount": amount})
 
-    # 총액 결정 (후보 중 최대값, 없으면 합산)
+    # 4) totalAmount 결정
     if candidate_totals:
         total_amount = max(candidate_totals)
     elif items:
@@ -204,41 +264,56 @@ def parse_receipt_kor(text: str) -> dict:
     return {
         "hospitalName": hospital_name,
         "visitAt": visit_at,
-        "items": [], # Regex로는 항목 디테일을 완벽히 뽑기 어려워 생략 (총액 위주)
+        "items": items,
         "totalAmount": total_amount,
     }
 
 
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
-    Gemini LLM을 이용한 정밀 파싱
+    Gemini를 이용한 영수증 AI 파싱
     """
-    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY or not genai:
+    if settings.GEMINI_ENABLED.lower() != "true":
+        return None
+    if not settings.GEMINI_API_KEY:
+        return None
+    if genai is None:
         return None
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
+        # 환경변수 모델명 사용
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
-        너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 AI야.
-        OCR 텍스트: \"\"\"{raw_text}\"\"\"
+        너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+        다음은 OCR로 읽은 영수증 텍스트야:
 
-        아래 JSON 형식으로만 답해줘. 추가 설명 금지.
+        \"\"\"{raw_text}\"\"\"
+
+        이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
+        키 이름은 반드시 아래와 같아야 해.
+
+        형식:
         {{
           "clinicName": string or null,
-          "visitDate": string or null,   // "YYYY-MM-DD"
+          "visitDate": string or null,   // "YYYY-MM-DD" 또는 "YYYY-MM-DD HH:MM"
           "diseaseName": string or null,
           "symptomsSummary": string or null,
-          "items": [ {{ "name": string, "price": integer }} ],
-          "totalAmount": integer
+          "items": [
+            {{
+              "name": string,
+              "price": integer or null
+            }}
+          ],
+          "totalAmount": integer or null
         }}
         """
 
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        # Markdown Strip
+        # Markdown json 태그 제거
         if "⁠  " in text:
             start = text.find("{")
             end = text.rfind("}")
@@ -246,13 +321,23 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
                 text = text[start:end + 1]
 
         data = json.loads(text)
-        
+
+        # 필수 키 검증
+        for key in ["clinicName", "visitDate", "items", "totalAmount"]:
+            if key not in data:
+                return None
+
         # items 정규화
-        safe_items = []
-        for it in data.get("items", []):
+        if not isinstance(data.get("items"), list):
+            data["items"] = []
+
+        fixed_items = []
+        for it in data["items"]:
             if isinstance(it, dict):
-                safe_items.append({"name": str(it.get("name","")), "price": int(it.get("price") or 0)})
-        data["items"] = safe_items
+                name = it.get("name", "항목")
+                price = it.get("price", 0)
+                fixed_items.append({"name": str(name), "price": int(price) if price else 0})
+        data["items"] = fixed_items
 
         return data
 
@@ -261,33 +346,25 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
 
 # ------------------------------------------
-# 5. AI HELPERS (Tagging)
+# 5. AI Care (태그 헬퍼 & DTO) - 🔥 새로 추가된 부분
 # ------------------------------------------
 
 def get_tags_definition_for_prompt() -> str:
-    """
-    Gemini에게 알려줄 태그 목록 문자열 생성
-    포맷: - 코드 : 라벨 (키워드 예시)
-    """
+    """Gemini 프롬프트용 태그 목록 생성"""
     if not CONDITION_TAGS:
         return "태그 정의 파일이 없습니다."
 
     lines = []
     lines.append("[가능한 질환/예방 태그 목록]")
-    
     for code, config in CONDITION_TAGS.items():
         # 토큰 절약을 위해 키워드는 3개까지만
         keywords_str = ", ".join(config.keywords[:3])
         line = f"- {code}: {config.label} (관련어: {keywords_str})"
         lines.append(line)
-        
     return "\n".join(lines)
 
 
-# ------------------------------------------
-# 6. DTO MODELS
-# ------------------------------------------
-
+# DTO Models for AI Analysis
 class PetProfileDTO(BaseModel):
     name: str
     species: str
@@ -324,15 +401,14 @@ class AICareResponse(BaseModel):
     risk_factors: List[str]
     action_guide: List[str]
     health_score: int
-    # 🔥 AI가 선택한 태그 리스트
     condition_tags: List[str] = []
 
 
 # ------------------------------------------
-# 7. FASTAPI SETUP
+# 6. FASTAPI APP SETUP
 # ------------------------------------------
 
-app = FastAPI(title="PetHealth+ Server", version="1.4.0")
+app = FastAPI(title="PetHealth+ Server", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -345,31 +421,270 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server is Running"}
+    return {"status": "ok", "message": "PetHealth+ Server Running"}
+
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
     return {"status": "ok", "gemini_model": settings.GEMINI_MODEL_NAME}
 
 
 # ------------------------------------------
-# 8. ENDPOINTS
+# 7. ENDPOINTS
 # ------------------------------------------
 
-# (1) AI 종합 분석 (핵심 기능)
+# (1) 영수증 업로드 & 분석 (기존 기능)
+@app.post("/receipt/upload")
+@app.post("/receipts/upload")
+@app.post("/api/receipt/upload")
+@app.post("/api/receipts/upload")
+@app.post("/api/receipt/analyze")   # iOS에서 쓰는 엔드포인트
+@app.post("/api/receipts/analyze")
+async def upload_receipt(
+    petId: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    image: Optional[UploadFile] = File(None),
+):
+    upload: Optional[UploadFile] = file or image
+    if upload is None:
+        raise HTTPException(status_code=400, detail="no file or image field")
+
+    rec_id = str(uuid.uuid4())
+    _, ext = os.path.splitext(upload.filename or "")
+    if not ext:
+        ext = ".jpg"
+
+    key = f"receipts/{petId}/{rec_id}{ext}"
+
+    # 파일 데이터 읽기
+    data = await upload.read()
+    file_like = io.BytesIO(data)
+    file_like.seek(0)
+
+    # 1) S3 업로드
+    file_url = upload_to_s3(
+        file_like,
+        key,
+        content_type=upload.content_type or "image/jpeg",
+    )
+
+    # 2) OCR 실행
+    ocr_text = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
+            tmp.write(data)
+            tmp.flush()
+            ocr_text = run_vision_ocr(tmp.name)
+    except Exception:
+        ocr_text = ""
+
+    # 3) AI 파싱 시도 → 실패하면 정규식 fallback
+    ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
+    
+    if ai_parsed:
+        parsed_for_dto = ai_parsed
+    else:
+        fallback = parse_receipt_kor(ocr_text) if ocr_text else {
+            "hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0
+        }
+
+        # 정규식 결과 DTO 변환
+        dto_items = []
+        for it in fallback.get("items", []):
+            dto_items.append({"name": it.get("name"), "price": it.get("amount")})
+
+        parsed_for_dto = {
+            "clinicName": fallback.get("hospitalName"),
+            "visitDate": fallback.get("visitAt"),
+            "diseaseName": None,
+            "symptomsSummary": None,
+            "items": dto_items,
+            "totalAmount": fallback.get("totalAmount"),
+        }
+
+    return {
+        "petId": petId,
+        "s3Url": file_url,
+        "parsed": parsed_for_dto,
+        "notes": ocr_text,
+    }
+
+
+# (2) PDF 업로드 (검사/증명서) - 기존 로직 유지 (파일명 처리)
+@app.post("/lab/upload-pdf")
+@app.post("/labs/upload-pdf")
+@app.post("/api/lab/upload-pdf")
+@app.post("/api/labs/upload-pdf")
+async def upload_lab_pdf(
+    petId: str = Form(...),
+    title: str = Form("검사결과"),
+    memo: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+):
+    original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
+    # 파일명을 key에 포함 (리스트 조회 시 복원용) -> 구분자 __ 사용
+    safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
+    key = f"lab/{petId}/{safe_base}__{uuid.uuid4()}.pdf"
+
+    url = upload_to_s3(file.file, key, "application/pdf")
+    created_at_iso = datetime.utcnow().isoformat()
+
+    return {
+        "id": key.split("/")[-1], # ID는 파일명으로 대체 가능
+        "petId": petId,
+        "title": original_base,
+        "memo": memo,
+        "s3Url": url,
+        "createdAt": created_at_iso,
+    }
+
+
+@app.post("/cert/upload-pdf")
+@app.post("/certs/upload-pdf")
+@app.post("/api/cert/upload-pdf")
+@app.post("/api/certs/upload-pdf")
+async def upload_cert_pdf(
+    petId: str = Form(...),
+    title: str = Form("증명서"),
+    memo: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+):
+    original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
+    safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
+    key = f"cert/{petId}/{safe_base}__{uuid.uuid4()}.pdf"
+
+    url = upload_to_s3(file.file, key, "application/pdf")
+    created_at_iso = datetime.utcnow().isoformat()
+
+    return {
+        "id": key.split("/")[-1],
+        "petId": petId,
+        "title": original_base,
+        "memo": memo,
+        "s3Url": url,
+        "createdAt": created_at_iso,
+    }
+
+
+# (3) 리스트 조회 - 기존 로직 복원 (파일명 파싱)
+@app.get("/lab/list")
+@app.get("/labs/list")
+@app.get("/api/lab/list")
+@app.get("/api/labs/list")
+def get_lab_list(petId: str = Query(...)):
+    prefix = f"lab/{petId}/"
+    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
+
+    items = []
+    if "Contents" in response:
+        for obj in response["Contents"]:
+            key = obj["Key"]
+            if not key.endswith(".pdf"): continue
+
+            # Key format: lab/petId/Filename__UUID.pdf
+            filename = key.split("/")[-1]
+            base_name, _ = os.path.splitext(filename)
+
+            display_title = "검사결과"
+            file_id = base_name
+
+            # 구분자(__)가 있으면 제목과 UUID 분리
+            if "__" in base_name:
+                safe_name, file_id = base_name.rsplit("__", 1)
+                display_title = safe_name.replace("_", " ")
+            elif len(base_name) > 36: # 구분자 없는 Legacy 데이터 호환
+                file_id = base_name
+                # 기존 레거시는 제목 복원이 어려우니 기본값 사용
+
+            created_dt = obj["LastModified"]
+            created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            date_str = created_dt.strftime("%Y-%m-%d")
+
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                ExpiresIn=604800,
+            )
+
+            items.append({
+                "id": file_id,
+                "petId": petId,
+                "title": f"{display_title} ({date_str})",
+                "s3Url": url,
+                "createdAt": created_at_iso,
+            })
+    
+    # 최신순 정렬
+    items.sort(key=lambda x: x["createdAt"], reverse=True)
+    return items
+
+
+@app.get("/cert/list")
+@app.get("/certs/list")
+@app.get("/api/cert/list")
+@app.get("/api/certs/list")
+def get_cert_list(petId: str = Query(...)):
+    prefix = f"cert/{petId}/"
+    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
+
+    items = []
+    if "Contents" in response:
+        for obj in response["Contents"]:
+            key = obj["Key"]
+            if not key.endswith(".pdf"): continue
+
+            filename = key.split("/")[-1]
+            base_name, _ = os.path.splitext(filename)
+
+            display_title = "증명서"
+            file_id = base_name
+
+            if "__" in base_name:
+                safe_name, file_id = base_name.rsplit("__", 1)
+                display_title = safe_name.replace("_", " ")
+
+            created_dt = obj["LastModified"]
+            created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            date_str = created_dt.strftime("%Y-%m-%d")
+
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+                ExpiresIn=604800,
+            )
+
+            items.append({
+                "id": file_id,
+                "petId": petId,
+                "title": f"{display_title} ({date_str})",
+                "s3Url": url,
+                "createdAt": created_at_iso,
+            })
+
+    items.sort(key=lambda x: x["createdAt"], reverse=True)
+    return items
+
+
+# (4) AI 종합 분석 (🔥 새로 추가된 핵심 기능)
 @app.post("/api/ai/analyze", response_model=AICareResponse)
 async def analyze_pet_health(req: AICareRequest):
+    """
+    PetHealth+ AI 케어: 종합 건강 리포트 생성
+    """
+    # 1. Gemini 비활성화 시 Fallback
     if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
         return AICareResponse(
             summary="AI 설정이 필요해요.",
             detail_analysis="서버 환경변수 GEMINI_API_KEY를 확인해주세요.",
-            weight_trend_status="-",
+            weight_trend_status="데이터 없음",
             risk_factors=[],
             action_guide=["서버 점검 필요"],
             health_score=0,
             condition_tags=[]
         )
 
+    # 2. Gemini 호출
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
@@ -377,37 +692,39 @@ async def analyze_pet_health(req: AICareRequest):
         # 태그 목록 텍스트 생성
         tags_context = get_tags_definition_for_prompt()
 
+        # 프롬프트 구성
         prompt = f"""
-        당신은 수의학 지식을 갖춘 'PetHealth+' AI 파트너입니다.
-        데이터를 분석해 보호자에게 따뜻하고 정확한 조언을 주세요.
+        당신은 'PetHealth+' 앱의 수의학 AI 파트너입니다.
+        반려동물 데이터를 분석해 보호자에게 따뜻하고 정확한 조언을 주세요.
 
         [반려동물 정보]
-        - {req.profile.name} ({req.profile.species}, {req.profile.age_text})
-        - 체중: {req.profile.weight_current}kg
-        - 알러지: {", ".join(req.profile.allergies) or "없음"}
+        - 이름/종: {req.profile.name} ({req.profile.species})
+        - 나이: {req.profile.age_text}
+        - 현재 체중: {req.profile.weight_current}kg
+        - 알러지: {", ".join(req.profile.allergies) if req.profile.allergies else "없음"}
 
-        [건강 기록]
-        - 최근 체중 변화: {req.recent_weights}
-        - 최근 병원 방문: {req.medical_history}
-        - 예정된 스케줄: {req.schedules}
+        [최근 데이터]
+        - 체중 기록(최신순): {req.recent_weights}
+        - 진료 이력: {req.medical_history}
+        - 스케줄: {req.schedules}
 
         {tags_context}
 
-        [분석 지시사항]
-        1. **체중**: 0.1kg 단위 변화도 민감하게 체크하여 추세(증가/감소/유지)를 판단하세요.
-        2. **태그 선택**: 위 태그 목록 중, 이 동물의 '현재 상태', '최근 치료', '예방 접종 이력'에 해당하는 코드(code)를 모두 고르세요.
-           - 주의: "심장사상충 음성(정상)"인 경우 '심장사상충 질환(heart_heartworm)' 태그를 선택하지 마세요. "예방약 처방"인 경우 '예방(prevent_heartworm)' 태그를 선택하세요.
-           - 광견병, 종합백신, 코로나 등 백신 종류를 정확히 구별해서 태그를 선택하세요.
-        3. **액션**: 구체적인 행동 가이드를 2~3개 제안하세요.
-        4. **점수**: 0~100점 사이 건강 점수.
+        [분석 요청사항]
+        1. 체중: 최근 변화 추세(증가/감소/유지)를 0.1kg 단위로 민감하게 체크하세요.
+        2. 리스크: 노령견/묘 여부, 체중 급변, 빈번한 병원 방문 등을 고려해 위험 요소를 찾으세요.
+        3. 액션: 구체적이고 실천 가능한 행동을 제안하세요. (예: "간식 줄이기", "관절 영양제 고려")
+        4. 태그: 위 태그 목록 중, 이 동물의 '현재 상태', '최근 치료', '예방 접종 이력'에 해당하는 코드(code)를 모두 고르세요. 
+           - "음성(Negative)"이거나 "정상"인 질환은 절대 선택하지 마세요.
+        5. 점수: 0~100점 (건강할수록 높은 점수)
 
-        [출력 JSON]
+        [출력 포맷 (JSON Only)]
         {{
-            "summary": "40자 이내 홈 화면 요약 (친절하게)",
-            "detail_analysis": "3~5문장의 상세 분석",
-            "weight_trend_status": "체중 상태 요약",
-            "risk_factors": ["위험요소1", "위험요소2"],
-            "action_guide": ["행동가이드1", "행동가이드2"],
+            "summary": "홈 화면 카드용 40자 이내 핵심 요약",
+            "detail_analysis": "전체적인 건강 상태 상세 분석 (줄바꿈 없이 3~5문장)",
+            "weight_trend_status": "체중 상태 (예: 안정적, 급격한 증가, 감소 주의)",
+            "risk_factors": ["위험 요소1", "위험 요소2"],
+            "action_guide": ["추천 행동1", "추천 행동2"],
             "health_score": 85,
             "condition_tags": ["code1", "code2"]
         }}
@@ -424,8 +741,8 @@ async def analyze_pet_health(req: AICareRequest):
         data = json.loads(text)
 
         return AICareResponse(
-            summary=data.get("summary", "분석 완료"),
-            detail_analysis=data.get("detail_analysis", ""),
+            summary=data.get("summary", "건강 분석을 완료했어요."),
+            detail_analysis=data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
             weight_trend_status=data.get("weight_trend_status", "-"),
             risk_factors=data.get("risk_factors", []),
             action_guide=data.get("action_guide", []),
@@ -436,163 +753,11 @@ async def analyze_pet_health(req: AICareRequest):
     except Exception as e:
         print(f"AI Analyze Error: {e}")
         return AICareResponse(
-            summary="분석 중 오류가 발생했어요.",
-            detail_analysis=f"Error: {str(e)}",
+            summary="잠시 후 다시 시도해주세요.",
+            detail_analysis=f"AI 분석 중 오류가 발생했습니다: {str(e)}",
             weight_trend_status="-",
             risk_factors=[],
             action_guide=[],
             health_score=0,
             condition_tags=[]
         )
-
-
-# (2) 영수증 업로드 (OCR)
-@app.post("/api/receipt/analyze")
-async def analyze_receipt_endpoint(
-    petId: str = Form(...),
-    file: Optional[UploadFile] = File(None),
-    image: Optional[UploadFile] = File(None),
-):
-    upload = file or image
-    if not upload:
-        raise HTTPException(400, "파일 누락")
-
-    rec_id = str(uuid.uuid4())
-    ext = os.path.splitext(upload.filename or "")[1] or ".jpg"
-    key = f"receipts/{petId}/{rec_id}{ext}"
-
-    data = await upload.read()
-    
-    # S3 Upload
-    s3_url = upload_to_s3(io.BytesIO(data), key, upload.content_type or "image/jpeg")
-
-    # Vision OCR
-    ocr_text = ""
-    try:
-        with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
-            tmp.write(data)
-            tmp.flush()
-            ocr_text = run_vision_ocr(tmp.name)
-    except Exception as e:
-        print(f"OCR Error: {e}")
-
-    # Parse
-    parsed = parse_receipt_ai(ocr_text)
-    if not parsed:
-        fallback = parse_receipt_kor(ocr_text)
-        items = [{"name": "항목", "price": fallback["totalAmount"]}] if fallback["totalAmount"] else []
-        parsed = {
-            "clinicName": fallback["hospitalName"],
-            "visitDate": fallback["visitAt"],
-            "diseaseName": None,
-            "symptomsSummary": None,
-            "items": items,
-            "totalAmount": fallback["totalAmount"]
-        }
-
-    return {
-        "petId": petId,
-        "s3Url": s3_url,
-        "parsed": parsed,
-        "notes": ocr_text
-    }
-
-
-# (3) PDF 업로드 (검사/증명서)
-@app.post("/api/lab/upload-pdf")
-async def upload_lab_pdf(petId: str = Form(...), title: str = Form(...), memo: str = Form(None), file: UploadFile = File(...)):
-    # 파일명 보존 로직 (제목으로 사용)
-    original = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
-    safe = original.replace(" ", "_")
-    # 파일명에 구분자(__)를 넣어 저장 -> 리스트 조회시 파싱
-    key = f"lab/{petId}/{safe}__{uuid.uuid4()}.pdf"
-    
-    url = upload_to_s3(file.file, key, "application/pdf")
-    return {"s3Url": url, "createdAt": datetime.now().isoformat(), "title": original}
-
-@app.post("/api/cert/upload-pdf")
-async def upload_cert_pdf(petId: str = Form(...), title: str = Form(...), memo: str = Form(None), file: UploadFile = File(...)):
-    original = os.path.splitext(file.filename or "")[0].strip() or "증명서"
-    safe = original.replace(" ", "_")
-    key = f"cert/{petId}/{safe}__{uuid.uuid4()}.pdf"
-    
-    url = upload_to_s3(file.file, key, "application/pdf")
-    return {"s3Url": url, "createdAt": datetime.now().isoformat(), "title": original}
-
-
-# (4) 리스트 조회 (파일명 파싱 복원)
-@app.get("/api/lab/list")
-def get_lab_list(petId: str = Query(...)):
-    prefix = f"lab/{petId}/"
-    res = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-    items = []
-    
-    if "Contents" in res:
-        for obj in res["Contents"]:
-            key = obj["Key"]
-            if not key.endswith(".pdf"): continue
-            
-            # Key: lab/petId/Filename__UUID.pdf
-            fname = key.split("/")[-1]
-            base, _ = os.path.splitext(fname)
-            
-            display_title = "검사결과"
-            file_id = base
-            
-            # 구분자(__)가 있으면 제목과 UUID 분리
-            if "__" in base:
-                safe_name, file_id = base.rsplit("__", 1)
-                display_title = safe_name.replace("_", " ")
-            elif len(base) > 36: # 구분자 없는 Legacy 데이터 호환
-                file_id = base
-                display_title = "검사결과"
-                
-            dt_str = obj["LastModified"].strftime("%Y-%m-%d")
-            url = s3_client.generate_presigned_url("get_object", Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key}, ExpiresIn=604800)
-            
-            items.append({
-                "id": file_id,
-                "petId": petId,
-                "title": f"{display_title} ({dt_str})",
-                "s3Url": url,
-                "createdAt": obj["LastModified"].isoformat()
-            })
-    
-    # 최신순 정렬
-    items.sort(key=lambda x: x["createdAt"], reverse=True)
-    return items
-
-@app.get("/api/cert/list")
-def get_cert_list(petId: str = Query(...)):
-    prefix = f"cert/{petId}/"
-    res = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-    items = []
-    
-    if "Contents" in res:
-        for obj in res["Contents"]:
-            key = obj["Key"]
-            if not key.endswith(".pdf"): continue
-            
-            fname = key.split("/")[-1]
-            base, _ = os.path.splitext(fname)
-            
-            display_title = "증명서"
-            file_id = base
-            
-            if "__" in base:
-                safe_name, file_id = base.rsplit("__", 1)
-                display_title = safe_name.replace("_", " ")
-            
-            dt_str = obj["LastModified"].strftime("%Y-%m-%d")
-            url = s3_client.generate_presigned_url("get_object", Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key}, ExpiresIn=604800)
-            
-            items.append({
-                "id": file_id,
-                "petId": petId,
-                "title": f"{display_title} ({dt_str})",
-                "s3Url": url,
-                "createdAt": obj["LastModified"].isoformat()
-            })
-            
-    items.sort(key=lambda x: x["createdAt"], reverse=True)
-    return items
