@@ -17,14 +17,15 @@ from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-# 🔥 새로 만든 태그 파일 Import (없을 경우 대비하여 예외처리)
+# ------------------------------------------
+# 0. Optional: condition_tags / Gemini
+# ------------------------------------------
 try:
     from condition_tags import CONDITION_TAGS
 except ImportError:
     CONDITION_TAGS = {}
     print("Warning: condition_tags.py not found. AI tagging will be limited.")
 
-# Gemini (google-generativeai) Import
 try:
     import google.generativeai as genai
 except ImportError:
@@ -196,9 +197,9 @@ def parse_receipt_kor(text: str) -> dict:
     한국 동물병원 영수증 OCR 텍스트를 구조화.
 
     - 병원명: 상단 쪽 텍스트에서 추론
-    - 날짜: yyyy,MM,dd,[HH:MM] 패턴 탐색
-    - 항목: "진료 내역" ~ "소 계/합계" 구간에서
-        *    로 시작하는 줄 → 항목 이름 리스트
+    - 날짜: yyyy.MM.dd [HH:MM] 패턴 탐색
+    - 항목: "[날짜:" 또는 "진료 및 미용 내역" ~ "소 계/합계/결제요청" 구간에서
+        * 로 시작하는 줄 → 항목 이름 리스트
         숫자/콤마/공백만 있는 줄 → 금액 리스트
       를 뽑아서 순서대로 매칭한다.
     """
@@ -219,7 +220,7 @@ def parse_receipt_kor(text: str) -> dict:
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
 
-    # 시간 없는 날짜
+    # 시간 없는 날짜만 있는 경우
     if not visit_at:
         dt_pattern_short = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})")
         for line in lines:
@@ -229,10 +230,9 @@ def parse_receipt_kor(text: str) -> dict:
                 visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
                 break
 
-    # 3) 금액(합계) 후보 – 영수증 전체에서 스캔
+    # 3) 전체 라인에서 합계 후보 금액
     amt_pattern_total = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(원)?\s*$")
     candidate_totals: List[int] = []
-
     for line in lines:
         m = amt_pattern_total.search(line)
         if not m:
@@ -255,6 +255,7 @@ def parse_receipt_kor(text: str) -> dict:
             break
         if ("진료" in line and "내역" in line) or ("진료 및" in line and "내역" in line):
             start_idx = i + 1
+
     if start_idx is None:
         start_idx = 0
 
@@ -274,14 +275,14 @@ def parse_receipt_kor(text: str) -> dict:
         if any(k in line for k in ["동물명", "항목", "단가", "수량", "금액"]):
             continue
 
-        # (1) * 로 시작하는 줄 → 항목 이름
+        # (1) *로 시작하는 줄 → 항목 이름
         if line.startswith("*"):
             name = line.lstrip("*").strip().strip(".")
             if name:
                 names.append(name)
             continue
 
-        # (2) 숫자/콤마/공백만 있는 줄 → 금액 (단가 / 금액 중 첫 번째만 사용)
+        # (2) 숫자/콤마/공백만 있는 줄 → 금액
         if re.fullmatch(r"[0-9,\s]+", line):
             m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)", line)
             if m:
@@ -290,7 +291,7 @@ def parse_receipt_kor(text: str) -> dict:
                     prices.append(amt)
             continue
 
-        # (3) 텍스트 + 숫자가 한 줄에 같이 있는 패턴
+        # (3) 텍스트 + 숫자가 같이 있는 줄 (다른 양식 대비)
         m = re.search(r"(.+?)\s+(\d{1,3}(?:,\d{3})+|\d+)", line)
         if m and ":" not in line and "[" not in line:
             name = m.group(1).strip()
@@ -334,7 +335,6 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        # 환경변수 모델명 사용
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
@@ -365,12 +365,12 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        # Markdown 코드블록 안에 있을 경우 정리
+        # 코드블록 안에 있을 경우 정리
         if "⁠  " in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
-                text = text[start: end + 1]
+                text = text[start:end + 1]
 
         data = json.loads(text)
 
@@ -389,10 +389,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
                 name = it.get("name", "항목")
                 price = it.get("price", 0)
                 fixed_items.append(
-                    {
-                        "name": str(name),
-                        "price": int(price) if price else 0,
-                    }
+                    {"name": str(name), "price": int(price) if price else 0}
                 )
         data["items"] = fixed_items
 
@@ -414,7 +411,6 @@ def get_tags_definition_for_prompt() -> str:
     lines = []
     lines.append("[가능한 질환/예방 태그 목록]")
     for code, config in CONDITION_TAGS.items():
-        # 토큰 절약을 위해 키워드는 3개까지만
         keywords_str = ", ".join(config.keywords[:3])
         line = f"- {code}: {config.label} (관련어: {keywords_str})"
         lines.append(line)
@@ -500,7 +496,7 @@ def health():
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
-@app.post("/api/receipt/analyze")  # iOS에서 쓰는 엔드포인트
+@app.post("/api/receipt/analyze")   # iOS에서 쓰는 엔드포인트
 @app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
@@ -547,23 +543,27 @@ async def upload_receipt(
     if ai_parsed:
         ai_items = ai_parsed.get("items") or []
         ai_total = ai_parsed.get("totalAmount") or 0
-        # 항목이 1개 이상이고 합계가 0이 아니어야 "정상"
+        # 항목이 1개 이상이고 합계가 0이 아니면 정상으로 간주
         if len(ai_items) > 0 and ai_total > 0:
             use_ai = True
 
     if use_ai:
         parsed_for_dto = ai_parsed
     else:
-        fallback = parse_receipt_kor(ocr_text) if ocr_text else {
-            "hospitalName": "",
-            "visitAt": None,
-            "items": [],
-            "totalAmount": 0,
-        }
+        fallback = (
+            parse_receipt_kor(ocr_text)
+            if ocr_text
+            else {"hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0}
+        )
 
         dto_items = []
         for it in fallback.get("items", []):
-            dto_items.append({"name": it.get("name"), "price": it.get("amount")})
+            dto_items.append(
+                {
+                    "name": it.get("name", "항목"),
+                    "price": it.get("amount") or 0,
+                }
+            )
 
         parsed_for_dto = {
             "clinicName": fallback.get("hospitalName"),
@@ -574,7 +574,7 @@ async def upload_receipt(
             "totalAmount": fallback.get("totalAmount"),
         }
 
-    # 병원명 앞의 '원 명:' 같은 접두어 제거
+    # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
@@ -642,7 +642,7 @@ async def upload_cert_pdf(
     }
 
 
-# (3) 리스트 조회 (단순화 버전)
+# (3) 리스트 조회 (단순 버전)
 @app.get("/lab/list")
 @app.get("/labs/list")
 @app.get("/api/lab/list")
@@ -754,10 +754,8 @@ async def analyze_pet_health(req: AICareRequest):
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
-        # 태그 목록 텍스트 생성
         tags_context = get_tags_definition_for_prompt()
 
-        # 프롬프트 구성
         prompt = f"""
         당신은 'PetHealth+' 앱의 수의학 AI 파트너입니다.
         반려동물 데이터를 분석해 보호자에게 따뜻하고 정확한 조언을 주세요.
@@ -778,9 +776,9 @@ async def analyze_pet_health(req: AICareRequest):
         [분석 요청사항]
         1. 체중: 최근 변화 추세(증가/감소/유지)를 0.1kg 단위로 민감하게 체크하세요.
         2. 리스크: 노령견/묘 여부, 체중 급변, 빈번한 병원 방문 등을 고려해 위험 요소를 찾으세요.
-        3. 액션: 구체적이고 실천 가능한 행동을 제안하세요. (예: "간식 줄이기", "관절 영양제 고려")
-        4. 태그: 위 태그 목록 중, 이 동물의 '현재 상태', '최근 치료', '예방 접종 이력'에 해당하는 코드(code)를 모두 고르세요. 
-           - "음성(Negative)"이거나 "정상"인 질환은 절대 선택하지 마세요.
+        3. 액션: 구체적이고 실천 가능한 행동을 제안하세요.
+        4. 태그: 위 태그 목록 중, 이 동물의 '현재 상태', '최근 치료', '예방 접종 이력'에 해당하는 코드(code)를 모두 고르세요.
+           - "음성(Negative)"이거나 "정상"인 질환은 선택하지 마세요.
         5. 점수: 0~100점 (건강할수록 높은 점수)
 
         [출력 포맷 (JSON Only)]
@@ -802,7 +800,7 @@ async def analyze_pet_health(req: AICareRequest):
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
-                text = text[start: end + 1]
+                text = text[start:end + 1]
 
         data = json.loads(text)
 
