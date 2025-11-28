@@ -417,48 +417,55 @@ def get_tags_definition_for_prompt() -> str:
     return "\n".join(lines)
 
 
-class PetProfileDTO(BaseModel):
+class CamelBase(BaseModel):
+    """camelCase JSON 을 받아주고 내보내는 공통 설정"""
+    class Config:
+        allow_population_by_field_name = True  # 필드 이름(snake)도 허용
+        orm_mode = True
+
+
+class PetProfileDTO(CamelBase):
     name: str
     species: str
-    age_text: str = Field(..., alias="age_text")
-    weight_current: Optional[float] = Field(None, alias="weight_current")
+    age_text: str = Field(..., alias="ageText")
+    weight_current: Optional[float] = Field(None, alias="weightCurrent")
     allergies: List[str] = []
 
 
-class WeightLogDTO(BaseModel):
+class WeightLogDTO(CamelBase):
     date: str
     weight: float
 
 
-class MedicalHistoryDTO(BaseModel):
-    visit_date: str = Field(..., alias="visit_date")
-    clinic_name: str = Field(..., alias="clinic_name")
-    item_count: int = Field(..., alias="item_count")
+class MedicalHistoryDTO(CamelBase):
+    visit_date: str = Field(..., alias="visitDate")
+    clinic_name: str = Field(..., alias="clinicName")
+    item_count: int = Field(..., alias="itemCount")
     diagnosis: Optional[str] = None
 
 
-class ScheduleDTO(BaseModel):
+class ScheduleDTO(CamelBase):
     title: str
     date: str
-    is_upcoming: bool = Field(..., alias="is_upcoming")
+    is_upcoming: bool = Field(..., alias="isUpcoming")
 
 
-class AICareRequest(BaseModel):
-    request_date: str = Field(..., alias="request_date")
+class AICareRequest(CamelBase):
+    request_date: str = Field(..., alias="requestDate")
     profile: PetProfileDTO
-    recent_weights: List[WeightLogDTO] = Field(..., alias="recent_weights")
-    medical_history: List[MedicalHistoryDTO] = Field(..., alias="medical_history")
+    recent_weights: List[WeightLogDTO] = Field(..., alias="recentWeights")
+    medical_history: List[MedicalHistoryDTO] = Field(..., alias="medicalHistory")
     schedules: List[ScheduleDTO]
 
 
-class AICareResponse(BaseModel):
+class AICareResponse(CamelBase):
     summary: str
-    detail_analysis: str
-    weight_trend_status: str
-    risk_factors: List[str]
-    action_guide: List[str]
-    health_score: int
-    condition_tags: List[str] = []
+    detail_analysis: str = Field(..., alias="detailAnalysis")
+    weight_trend_status: str = Field(..., alias="weightTrendStatus")
+    risk_factors: List[str] = Field(..., alias="riskFactors")
+    action_guide: List[str] = Field(..., alias="actionGuide")
+    health_score: int = Field(..., alias="healthScore")
+    condition_tags: List[str] = Field(default_factory=list, alias="conditionTags")
 
 
 # ------------------------------------------
