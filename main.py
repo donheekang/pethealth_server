@@ -6,6 +6,7 @@ import json
 import uuid
 import tempfile
 import re
+import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict
 
@@ -51,6 +52,9 @@ class Settings(BaseSettings):
     GEMINI_MODEL_NAME: str = "gemini-1.5-flash"  # 기본값
 
     STUB_MODE: str = "false"
+
+    # ✅ 쿠팡 파트너스 기본 URL (예: https://link.coupang.com/a/daesxB)
+    COUPANG_PARTNER_URL: str = ""
 
     class Config:
         env_file = ".env"
@@ -195,13 +199,6 @@ def guess_hospital_name(lines: List[str]) -> str:
 def parse_receipt_kor(text: str) -> dict:
     """
     한국 동물병원 영수증 OCR 텍스트를 구조화.
-
-    - 병원명: 상단 쪽 텍스트에서 추론
-    - 날짜: yyyy.MM.dd [HH:MM] 패턴 탐색
-    - 항목: "[날짜:" 또는 "진료 및 미용 내역" ~ "소 계/합계/결제요청" 구간에서
-        * 로 시작하는 줄 → 항목 이름 리스트
-        숫자/콤마/공백만 있는 줄 → 금액 리스트
-      를 뽑아서 순서대로 매칭한다.
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
@@ -469,7 +466,84 @@ class AICareResponse(CamelBase):
 
 
 # ------------------------------------------
-# 6. FASTAPI APP SETUP
+# 6. 쿠팡 검색/파트너스 DTO & 헬퍼
+# ------------------------------------------
+
+class CoupangSearchRequest(CamelBase):
+    """
+    iOS에서 보내는 쿠팡 검색 요청
+    """
+    species: str                     # "강아지" / "고양이"
+    health_point: str = Field(..., alias="healthPoint")   # "관절 케어" 등
+    ingredients: List[str]
+    allergies: List[str]
+
+
+class CoupangSearchResponse(CamelBase):
+    """
+    서버가 돌려주는 결과
+    """
+    keyword: str
+    search_url: str = Field(..., alias="searchUrl")
+    partner_url: Optional[str] = Field(None, alias="partnerUrl")
+
+
+def _normalize_token(text: str) -> str:
+    """
+    간단 토큰 정리:
+    - 공백 제거
+    - 소문자
+    """
+    return text.replace(" ", "").lower()
+
+
+def build_coupang_keyword(req: CoupangSearchRequest) -> str:
+    """
+    ▸ 건강 포인트 + 성분 – 알러지 성분 형태의 검색어 생성
+    예: "강아지 관절 영양제 글루코사민 콘드로이틴 -닭 -소고기"
+    """
+    # 1) 종 토큰
+    species_token = req.species.strip()
+    if not species_token:
+        species_token = "반려동물"
+
+    # 2) 기본 키워드(건강 포인트)
+    base_tokens: List[str] = [species_token, req.health_point]
+
+    # 3) 알러지 토큰 정리
+    allergy_norms = [_normalize_token(a) for a in req.allergies]
+
+    safe_ingredients: List[str] = []
+    negative_tokens: List[str] = []
+
+    for ing in req.ingredients:
+        ing = ing.strip()
+        if not ing:
+            continue
+        norm = _normalize_token(ing)
+        if any(a and a in norm for a in allergy_norms):
+            # 알러지에 걸리는 성분 → 제외 + 마이너스 키워드
+            negative_tokens.append(ing)
+        else:
+            safe_ingredients.append(ing)
+
+    positive = base_tokens + safe_ingredients
+    minus_parts = [f"-{t}" for t in negative_tokens]
+
+    # 중복 제거 (순서 유지)
+    seen = set()
+    ordered_tokens: List[str] = []
+    for tok in positive + minus_parts:
+        if tok and tok not in seen:
+            seen.add(tok)
+            ordered_tokens.append(tok)
+
+    keyword = " ".join(ordered_tokens)
+    return keyword
+
+
+# ------------------------------------------
+# 7. FASTAPI APP SETUP
 # ------------------------------------------
 
 app = FastAPI(title="PetHealth+ Server", version="1.0.0")
@@ -495,7 +569,7 @@ def health():
 
 
 # ------------------------------------------
-# 7. ENDPOINTS
+# 8. ENDPOINTS
 # ------------------------------------------
 
 # (1) 영수증 업로드 & 분석
@@ -832,3 +906,33 @@ async def analyze_pet_health(req: AICareRequest):
             health_score=0,
             condition_tags=[],
         )
+
+
+# (5) 쿠팡 검색 링크 생성
+@app.post("/api/coupang/search-link", response_model=CoupangSearchResponse)
+async def create_coupang_search_link(req: CoupangSearchRequest):
+    """
+    ▸ 검색어 자동 생성
+    ▸ 알러지 성분 제외/마이너스 처리
+    ▸ 쿠팡 검색 URL + 파트너스 URL 생성
+    """
+    # 1) 검색어 생성
+    keyword = build_coupang_keyword(req)
+
+    # 2) 쿠팡 검색 URL
+    encoded_q = urllib.parse.quote_plus(keyword)
+    search_url = f"https://www.coupang.com/np/search?component=&q={encoded_q}&channel=user"
+
+    # 3) 파트너스 URL (환경변수에 base url 이 있을 때만)
+    partner_url: Optional[str] = None
+    base = settings.COUPANG_PARTNER_URL.strip()
+    if base:
+        # ⚠️ 실제 파라미터 이름은 쿠팡 문서에서 확인 필요
+        connector = "&" if "?" in base else "?"
+        partner_url = f"{base}{connector}searchUrl={urllib.parse.quote_plus(search_url)}"
+
+    return CoupangSearchResponse(
+        keyword=keyword,
+        search_url=search_url,
+        partner_url=partner_url,
+    )
