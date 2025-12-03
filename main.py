@@ -30,6 +30,7 @@ try:
     import google.generativeai as genai
 except ImportError:
     genai = None
+    print("Warning: google.generativeai not installed. GEMINI 기능 비활성화.")
 
 
 # ------------------------------------------
@@ -48,8 +49,10 @@ class Settings(BaseSettings):
     # Gemini 사용 여부 + API Key
     GEMINI_ENABLED: str = "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-1.5-flash"
+    # ✅ 최신 모델 이름로 기본값 변경
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest"
 
+    # AI 대신 더미 데이터만 돌리는 모드
     STUB_MODE: str = "false"
 
     class Config:
@@ -328,6 +331,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
+        # ✅ 최신 모델명 사용
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
@@ -353,10 +357,17 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
           ],
           "totalAmount": integer or null
         }}
+        JSON만 출력하고, 설명 문장은 쓰지 마.
         """
 
         resp = model.generate_content(prompt)
-        text = resp.text.strip()
+
+        # google.generativeai 응답에서 텍스트 추출
+        text = getattr(resp, "text", None)
+        if not text and resp.candidates:
+            parts = resp.candidates[0].content.parts
+            text = "".join(p.text for p in parts if hasattr(p, "text"))
+        text = (text or "").strip()
 
         # 코드블록 안에 있을 경우 정리
         if "⁠  " in text:
@@ -416,40 +427,41 @@ class CamelBase(BaseModel):
     class Config:
         allow_population_by_field_name = True
         orm_mode = True
+        extra = "ignore"   # iOS에서 추가 필드가 와도 무시
 
 
 class PetProfileDTO(CamelBase):
     name: str
-    species: str
-    age_text: str = Field(..., alias="ageText")
+    species: str = "dog"
+    age_text: Optional[str] = Field(None, alias="ageText")
     weight_current: Optional[float] = Field(None, alias="weightCurrent")
-    allergies: List[str] = []
+    allergies: List[str] = Field(default_factory=list)
 
 
 class WeightLogDTO(CamelBase):
     date: str
-    weight: float
+    weight: Optional[float] = None
 
 
 class MedicalHistoryDTO(CamelBase):
-    visit_date: str = Field(..., alias="visitDate")
-    clinic_name: str = Field(..., alias="clinicName")
-    item_count: int = Field(..., alias="itemCount")
+    visit_date: Optional[str] = Field(None, alias="visitDate")
+    clinic_name: Optional[str] = Field(None, alias="clinicName")
+    item_count: Optional[int] = Field(0, alias="itemCount")
     diagnosis: Optional[str] = None
 
 
 class ScheduleDTO(CamelBase):
     title: str
-    date: str
-    is_upcoming: bool = Field(..., alias="isUpcoming")
+    date: Optional[str] = None
+    is_upcoming: Optional[bool] = Field(None, alias="isUpcoming")
 
 
 class AICareRequest(CamelBase):
-    request_date: str = Field(..., alias="requestDate")
+    request_date: Optional[str] = Field(None, alias="requestDate")
     profile: PetProfileDTO
-    recent_weights: List[WeightLogDTO] = Field(..., alias="recentWeights")
-    medical_history: List[MedicalHistoryDTO] = Field(..., alias="medicalHistory")
-    schedules: List[ScheduleDTO]
+    recent_weights: List[WeightLogDTO] = Field(default_factory=list, alias="recentWeights")
+    medical_history: List[MedicalHistoryDTO] = Field(default_factory=list, alias="medicalHistory")
+    schedules: List[ScheduleDTO] = Field(default_factory=list)
 
 
 class AICareResponse(CamelBase):
@@ -485,7 +497,12 @@ def root():
 @app.get("/health")
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "gemini_model": settings.GEMINI_MODEL_NAME}
+    return {
+        "status": "ok",
+        "gemini_model": settings.GEMINI_MODEL_NAME,
+        "gemini_enabled": settings.GEMINI_ENABLED,
+        "stub_mode": settings.STUB_MODE,
+    }
 
 
 # ------------------------------------------
@@ -738,11 +755,31 @@ async def analyze_pet_health(req: AICareRequest):
     """
     PetHealth+ AI 케어: 종합 건강 리포트 생성
     """
+
+    # 0. STUB_MODE 이면 항상 더미 리포트 반환 (Gemini 없이도 UI 확인용)
+    if settings.STUB_MODE.lower() == "true":
+        name = req.profile.name
+        return AICareResponse(
+            summary=f"{name}의 기본 상태를 정리했어요.",
+            detail_analysis=(
+                f"{name}의 최근 체중·스케줄·진료 기록을 바탕으로 전체적인 건강 상태를 가볍게 점검한 "
+                "샘플 리포트입니다. 실제 AI 분석이 활성화되면 보다 정교한 맞춤 케어 가이드를 제공할 예정이에요."
+            ),
+            weight_trend_status="데이터 수집 중",
+            risk_factors=["AI 분석 기능 준비 중"],
+            action_guide=[
+                "체중을 주기적으로 기록해 주세요.",
+                "예방 접종 및 검진 일정을 스케줄에 등록해 주세요.",
+            ],
+            health_score=75,
+            condition_tags=[],
+        )
+
     # 1. Gemini 비활성화 시 Fallback
-    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
+    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY or genai is None:
         return AICareResponse(
             summary="AI 설정이 필요해요.",
-            detail_analysis="서버 환경변수 GEMINI_API_KEY를 확인해주세요.",
+            detail_analysis="서버 환경변수 GEMINI_API_KEY와 GEMINI_ENABLED를 확인해주세요.",
             weight_trend_status="데이터 없음",
             risk_factors=[],
             action_guide=["서버 점검 필요"],
@@ -767,10 +804,14 @@ async def analyze_pet_health(req: AICareRequest):
         - 현재 체중: {req.profile.weight_current}kg
         - 알러지: {", ".join(req.profile.allergies) if req.profile.allergies else "없음"}
 
-        [최근 데이터]
-        - 체중 기록(최신순): {req.recent_weights}
-        - 진료 이력: {req.medical_history}
-        - 스케줄: {req.schedules}
+        [최근 체중 기록]
+        {req.recent_weights}
+
+        [진료 이력]
+        {req.medical_history}
+
+        [스케줄]
+        {req.schedules}
 
         {tags_context}
 
@@ -792,10 +833,16 @@ async def analyze_pet_health(req: AICareRequest):
             "health_score": 85,
             "condition_tags": ["code1", "code2"]
         }}
+        JSON만 출력하고, 다른 문장은 쓰지 마.
         """
 
         resp = model.generate_content(prompt)
-        text = resp.text.strip()
+
+        text = getattr(resp, "text", None)
+        if not text and resp.candidates:
+            parts = resp.candidates[0].content.parts
+            text = "".join(p.text for p in parts if hasattr(p, "text"))
+        text = (text or "").strip()
 
         if "  ⁠" in text:
             start = text.find("{")
@@ -807,12 +854,12 @@ async def analyze_pet_health(req: AICareRequest):
 
         return AICareResponse(
             summary=data.get("summary", "건강 분석을 완료했어요."),
-            detail_analysis=data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
-            weight_trend_status=data.get("weight_trend_status", "-"),
-            risk_factors=data.get("risk_factors", []),
-            action_guide=data.get("action_guide", []),
-            health_score=data.get("health_score", 50),
-            condition_tags=data.get("condition_tags", []),
+            detail_analysis=data.get("detail_analysis", data.get("detailAnalysis", "상세 분석 데이터가 없습니다.")),
+            weight_trend_status=data.get("weight_trend_status", data.get("weightTrendStatus", "-")),
+            risk_factors=data.get("risk_factors", data.get("riskFactors", [])),
+            action_guide=data.get("action_guide", data.get("actionGuide", [])),
+            health_score=data.get("health_score", data.get("healthScore", 50)),
+            condition_tags=data.get("condition_tags", data.get("conditionTags", [])),
         )
 
     except Exception as e:
