@@ -6,7 +6,6 @@ import json
 import uuid
 import tempfile
 import re
-import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict
 
@@ -49,12 +48,9 @@ class Settings(BaseSettings):
     # Gemini 사용 여부 + API Key
     GEMINI_ENABLED: str = "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-1.5-flash"  # 기본값
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash"
 
     STUB_MODE: str = "false"
-
-    # ✅ 쿠팡 파트너스 기본 URL (예: https://link.coupang.com/a/daesxB)
-    COUPANG_PARTNER_URL: str = ""
 
     class Config:
         env_file = ".env"
@@ -288,7 +284,7 @@ def parse_receipt_kor(text: str) -> dict:
                     prices.append(amt)
             continue
 
-        # (3) 텍스트 + 숫자가 같이 있는 줄 (다른 양식 대비)
+        # (3) 텍스트 + 숫자가 같이 있는 줄
         m = re.search(r"(.+?)\s+(\d{1,3}(?:,\d{3})+|\d+)", line)
         if m and ":" not in line and "[" not in line:
             name = m.group(1).strip()
@@ -363,7 +359,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         text = resp.text.strip()
 
         # 코드블록 안에 있을 경우 정리
-        if "⁠  " in text:
+        if "⁠  " in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
@@ -392,7 +388,8 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
         return data
 
-    except Exception:
+    except Exception as e:
+        print("parse_receipt_ai error:", e)
         return None
 
 
@@ -417,7 +414,7 @@ def get_tags_definition_for_prompt() -> str:
 class CamelBase(BaseModel):
     """camelCase JSON 을 받아주고 내보내는 공통 설정"""
     class Config:
-        allow_population_by_field_name = True  # 필드 이름(snake)도 허용
+        allow_population_by_field_name = True
         orm_mode = True
 
 
@@ -466,84 +463,7 @@ class AICareResponse(CamelBase):
 
 
 # ------------------------------------------
-# 6. 쿠팡 검색/파트너스 DTO & 헬퍼
-# ------------------------------------------
-
-class CoupangSearchRequest(CamelBase):
-    """
-    iOS에서 보내는 쿠팡 검색 요청
-    """
-    species: str                     # "강아지" / "고양이"
-    health_point: str = Field(..., alias="healthPoint")   # "관절 케어" 등
-    ingredients: List[str]
-    allergies: List[str]
-
-
-class CoupangSearchResponse(CamelBase):
-    """
-    서버가 돌려주는 결과
-    """
-    keyword: str
-    search_url: str = Field(..., alias="searchUrl")
-    partner_url: Optional[str] = Field(None, alias="partnerUrl")
-
-
-def _normalize_token(text: str) -> str:
-    """
-    간단 토큰 정리:
-    - 공백 제거
-    - 소문자
-    """
-    return text.replace(" ", "").lower()
-
-
-def build_coupang_keyword(req: CoupangSearchRequest) -> str:
-    """
-    ▸ 건강 포인트 + 성분 – 알러지 성분 형태의 검색어 생성
-    예: "강아지 관절 영양제 글루코사민 콘드로이틴 -닭 -소고기"
-    """
-    # 1) 종 토큰
-    species_token = req.species.strip()
-    if not species_token:
-        species_token = "반려동물"
-
-    # 2) 기본 키워드(건강 포인트)
-    base_tokens: List[str] = [species_token, req.health_point]
-
-    # 3) 알러지 토큰 정리
-    allergy_norms = [_normalize_token(a) for a in req.allergies]
-
-    safe_ingredients: List[str] = []
-    negative_tokens: List[str] = []
-
-    for ing in req.ingredients:
-        ing = ing.strip()
-        if not ing:
-            continue
-        norm = _normalize_token(ing)
-        if any(a and a in norm for a in allergy_norms):
-            # 알러지에 걸리는 성분 → 제외 + 마이너스 키워드
-            negative_tokens.append(ing)
-        else:
-            safe_ingredients.append(ing)
-
-    positive = base_tokens + safe_ingredients
-    minus_parts = [f"-{t}" for t in negative_tokens]
-
-    # 중복 제거 (순서 유지)
-    seen = set()
-    ordered_tokens: List[str] = []
-    for tok in positive + minus_parts:
-        if tok and tok not in seen:
-            seen.add(tok)
-            ordered_tokens.append(tok)
-
-    keyword = " ".join(ordered_tokens)
-    return keyword
-
-
-# ------------------------------------------
-# 7. FASTAPI APP SETUP
+# 6. FASTAPI APP SETUP
 # ------------------------------------------
 
 app = FastAPI(title="PetHealth+ Server", version="1.0.0")
@@ -569,7 +489,7 @@ def health():
 
 
 # ------------------------------------------
-# 8. ENDPOINTS
+# 7. ENDPOINTS
 # ------------------------------------------
 
 # (1) 영수증 업로드 & 분석
@@ -577,7 +497,7 @@ def health():
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
-@app.post("/api/receipt/analyze")   # iOS에서 쓰는 엔드포인트
+@app.post("/api/receipt/analyze")
 @app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
@@ -614,7 +534,8 @@ async def upload_receipt(
             tmp.write(data)
             tmp.flush()
             ocr_text = run_vision_ocr(tmp.name)
-    except Exception:
+    except Exception as e:
+        print("OCR error:", e)
         ocr_text = ""
 
     # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
@@ -624,7 +545,6 @@ async def upload_receipt(
     if ai_parsed:
         ai_items = ai_parsed.get("items") or []
         ai_total = ai_parsed.get("totalAmount") or 0
-        # 항목이 1개 이상이고 합계가 0이 아니면 정상으로 간주
         if len(ai_items) > 0 and ai_total > 0:
             use_ai = True
 
@@ -856,7 +776,7 @@ async def analyze_pet_health(req: AICareRequest):
 
         [분석 요청사항]
         1. 체중: 최근 변화 추세(증가/감소/유지)를 0.1kg 단위로 민감하게 체크하세요.
-        2. 리스크: 노령견/묘 여부, 체중 급변, 빈번한 병원 방문 등을 고려해 위험 요소를 찾으세요.
+        2. 리스크: 노령 여부, 체중 급변, 빈번한 병원 방문 등을 고려해 위험 요소를 찾으세요.
         3. 액션: 구체적이고 실천 가능한 행동을 제안하세요.
         4. 태그: 위 태그 목록 중, 이 동물의 '현재 상태', '최근 치료', '예방 접종 이력'에 해당하는 코드(code)를 모두 고르세요.
            - "음성(Negative)"이거나 "정상"인 질환은 선택하지 마세요.
@@ -877,7 +797,7 @@ async def analyze_pet_health(req: AICareRequest):
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        if "  ⁠" in text:
+        if "  ⁠" in text:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1:
@@ -906,33 +826,3 @@ async def analyze_pet_health(req: AICareRequest):
             health_score=0,
             condition_tags=[],
         )
-
-
-# (5) 쿠팡 검색 링크 생성
-@app.post("/api/coupang/search-link", response_model=CoupangSearchResponse)
-async def create_coupang_search_link(req: CoupangSearchRequest):
-    """
-    ▸ 검색어 자동 생성
-    ▸ 알러지 성분 제외/마이너스 처리
-    ▸ 쿠팡 검색 URL + 파트너스 URL 생성
-    """
-    # 1) 검색어 생성
-    keyword = build_coupang_keyword(req)
-
-    # 2) 쿠팡 검색 URL
-    encoded_q = urllib.parse.quote_plus(keyword)
-    search_url = f"https://www.coupang.com/np/search?component=&q={encoded_q}&channel=user"
-
-    # 3) 파트너스 URL (환경변수에 base url 이 있을 때만)
-    partner_url: Optional[str] = None
-    base = settings.COUPANG_PARTNER_URL.strip()
-    if base:
-        # ⚠️ 실제 파라미터 이름은 쿠팡 문서에서 확인 필요
-        connector = "&" if "?" in base else "?"
-        partner_url = f"{base}{connector}searchUrl={urllib.parse.quote_plus(search_url)}"
-
-    return CoupangSearchResponse(
-        keyword=keyword,
-        search_url=search_url,
-        partner_url=partner_url,
-    )
