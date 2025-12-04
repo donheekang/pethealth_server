@@ -49,10 +49,9 @@ class Settings(BaseSettings):
     # Gemini 사용 여부 + API Key
     GEMINI_ENABLED: str = "false"
     GEMINI_API_KEY: str = ""
-    # ✅ 최신 모델 이름로 기본값 변경
     GEMINI_MODEL_NAME: str = "gemini-1.5-flash"
 
-    # AI 대신 더미 데이터만 돌리는 모드
+    # AI 대신 더미 데이터만 돌리는 모드 (필요하면 사용)
     STUB_MODE: str = "false"
 
     class Config:
@@ -320,7 +319,8 @@ def parse_receipt_kor(text: str) -> dict:
 
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
-    Gemini를 이용한 영수증 AI 파싱
+    Gemini를 이용한 영수증 AI 파싱.
+    실패하면 None 리턴해서 정규식 파서로 Fallback.
     """
     if settings.GEMINI_ENABLED.lower() != "true":
         return None
@@ -331,7 +331,6 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        # ✅ 최신 모델명 사용
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
@@ -361,20 +360,14 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         """
 
         resp = model.generate_content(prompt)
-
-        # google.generativeai 응답에서 텍스트 추출
-        text = getattr(resp, "text", None)
-        if not text and resp.candidates:
-            parts = resp.candidates[0].content.parts
-            text = "".join(p.text for p in parts if hasattr(p, "text"))
-        text = (text or "").strip()
+        text = getattr(resp, "text", "") or ""
+        text = text.strip()
 
         # 코드블록 안에 있을 경우 정리
-        if "⁠  " in text:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1:
-                text = text[start:end + 1]
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
 
         data = json.loads(text)
 
@@ -472,7 +465,6 @@ class AICareResponse(CamelBase):
     action_guide: List[str] = Field(..., alias="actionGuide")
     health_score: int = Field(..., alias="healthScore")
     condition_tags: List[str] = Field(default_factory=list, alias="conditionTags")
-
 
 # ------------------------------------------
 # 6. FASTAPI APP SETUP
