@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # Gemini 사용 여부 + API Key
     GEMINI_ENABLED: str = "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-1.5-flash"
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
 
     # AI 대신 더미 데이터만 돌리는 모드 (필요하면 사용)
     STUB_MODE: str = "false"
