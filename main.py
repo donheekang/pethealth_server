@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     GEMINI_ENABLED: str = "false"
     GEMINI_API_KEY: str = ""
     # ✅ 최신 모델 이름로 기본값 변경
-    GEMINI_MODEL_NAME: str = "gemini-1.0-pro"
+    GEMINI_MODEL_NAME: str = "gemini-1.5-flash-latest"
 
     # AI 대신 더미 데이터만 돌리는 모드
     STUB_MODE: str = "false"
