@@ -510,7 +510,7 @@ def health():
 # ------------------------------------------
 
 # (1) 영수증 업로드 & 분석
-@app.post("/receipt/upload")
+@("/receipt/upload")
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -769,26 +769,25 @@ def make_stub_response(summary: str, detail: str) -> dict:
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
     """
-    PetHealth+ AI 케어: 종합 건강 리포트 생성
-    - Gemini가 실패해도 항상 200 + 기본 JSON을 내려주도록 설계
+    PetHealth+ AI 케어: 종합 건강 리포트 생성.
+    - 어떤 일이 있어도 200 + JSON을 반환하도록 구성.
     """
-    # 1. Gemini 비활성화 / 키 없음 → 바로 기본 응답
+    # 1) Gemini 비활성화거나 키 없으면 바로 스텁 응답
     if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
         return make_stub_response(
             "AI 설정이 필요해요.",
             "서버 환경변수 GEMINI_API_KEY와 GEMINI_ENABLED를 확인해주세요."
         )
 
-    # 2. Gemini 호출 시도
-    try:
-        if genai is None:
-            # 라이브러리가 아예 없는 경우
-            return make_stub_response(
-                "AI 모듈이 설치돼 있지 않아요.",
-                "requirements.txt에 google-generativeai 패키지가 설치되어 있는지 확인해주세요."
-            )
+    # 2) Gemini 라이브러리 없으면 스텁
+    if genai is None:
+        return make_stub_response(
+            "AI 모듈이 설치돼 있지 않아요.",
+            "requirements.txt에 google-generativeai 패키지가 설치되어 있는지 확인해주세요."
+        )
 
-        # 최신 google-generativeai 사용 + 모델 이름 환경변수에서 읽기
+    # 3) 실제 Gemini 호출 시도
+    try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
@@ -833,7 +832,7 @@ async def analyze_pet_health(req: AICareRequest):
         resp = model.generate_content(prompt)
         text = resp.text.strip()
 
-        # 코드블록 안에 들어가 있으면 {} 부분만 잘라내기
+        # 코드블록으로 감싸져 있으면 {} 부분만 추출
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1:
@@ -841,21 +840,19 @@ async def analyze_pet_health(req: AICareRequest):
 
         data = json.loads(text)
 
-        ai_resp = AICareResponse(
-            summary=data.get("summary", "건강 분석을 완료했어요."),
-            detail_analysis=data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
-            weight_trend_status=data.get("weight_trend_status", "-"),
-            risk_factors=data.get("risk_factors", []),
-            action_guide=data.get("action_guide", []),
-            health_score=data.get("health_score", 50),
-            condition_tags=data.get("condition_tags", []),
-        )
-
-        # 역시 camelCase 키로 내려보내기
-        return ai_resp.dict(by_alias=True)
+        # 여기서도 camelCase로 맞춰서 dict 생성
+        return {
+            "summary": data.get("summary", "건강 분석을 완료했어요."),
+            "detailAnalysis": data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
+            "weightTrendStatus": data.get("weight_trend_status", "-"),
+            "riskFactors": data.get("risk_factors", []),
+            "actionGuide": data.get("action_guide", []),
+            "healthScore": data.get("health_score", 50),
+            "conditionTags": data.get("condition_tags", []),
+        }
 
     except Exception as e:
-        # 여기서 404 (모델 없음) 포함 모든 에러를 잡아요.
+        # 여기서 404 포함 모든 오류를 잡는다.
         print(f"AI Analyze Error: {e}")
         return make_stub_response(
             "잠시 후 다시 시도해주세요.",
