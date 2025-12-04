@@ -748,47 +748,47 @@ def get_cert_list(petId: str = Query(...)):
     items.sort(key=lambda x: x["createdAt"], reverse=True)
     return items
 
+def make_stub_response(summary: str, detail: str) -> dict:
+    """
+    Gemini 호출 실패 / 비활성화 시에도 항상 정상 JSON을 돌려주기 위한 기본 응답.
+    iOS 쪽 AICareResponseDTO와 필드명이 정확히 맞도록 camelCase로 반환합니다.
+    """
+    fallback = AICareResponse(
+        summary=summary,
+        detail_analysis=detail,
+        weight_trend_status="데이터 없음",
+        risk_factors=[],
+        action_guide=["서버 점검이 필요해요."],
+        health_score=0,
+        condition_tags=[],
+    )
+    # ⚠️ by_alias=True로 해서 detailAnalysis, weightTrendStatus 같은 camelCase 키로 내려보냄
+    return fallback.dict(by_alias=True)
 
 # (4) AI 종합 분석
-@app.post("/api/ai/analyze", response_model=AICareResponse)
+@app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
     """
     PetHealth+ AI 케어: 종합 건강 리포트 생성
+    - Gemini가 실패해도 항상 200 + 기본 JSON을 내려주도록 설계
     """
-
-    # 0. STUB_MODE 이면 항상 더미 리포트 반환 (Gemini 없이도 UI 확인용)
-    if settings.STUB_MODE.lower() == "true":
-        name = req.profile.name
-        return AICareResponse(
-            summary=f"{name}의 기본 상태를 정리했어요.",
-            detail_analysis=(
-                f"{name}의 최근 체중·스케줄·진료 기록을 바탕으로 전체적인 건강 상태를 가볍게 점검한 "
-                "샘플 리포트입니다. 실제 AI 분석이 활성화되면 보다 정교한 맞춤 케어 가이드를 제공할 예정이에요."
-            ),
-            weight_trend_status="데이터 수집 중",
-            risk_factors=["AI 분석 기능 준비 중"],
-            action_guide=[
-                "체중을 주기적으로 기록해 주세요.",
-                "예방 접종 및 검진 일정을 스케줄에 등록해 주세요.",
-            ],
-            health_score=75,
-            condition_tags=[],
+    # 1. Gemini 비활성화 / 키 없음 → 바로 기본 응답
+    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
+        return make_stub_response(
+            "AI 설정이 필요해요.",
+            "서버 환경변수 GEMINI_API_KEY와 GEMINI_ENABLED를 확인해주세요."
         )
 
-    # 1. Gemini 비활성화 시 Fallback
-    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY or genai is None:
-        return AICareResponse(
-            summary="AI 설정이 필요해요.",
-            detail_analysis="서버 환경변수 GEMINI_API_KEY와 GEMINI_ENABLED를 확인해주세요.",
-            weight_trend_status="데이터 없음",
-            risk_factors=[],
-            action_guide=["서버 점검 필요"],
-            health_score=0,
-            condition_tags=[],
-        )
-
-    # 2. Gemini 호출
+    # 2. Gemini 호출 시도
     try:
+        if genai is None:
+            # 라이브러리가 아예 없는 경우
+            return make_stub_response(
+                "AI 모듈이 설치돼 있지 않아요.",
+                "requirements.txt에 google-generativeai 패키지가 설치되어 있는지 확인해주세요."
+            )
+
+        # 최신 google-generativeai 사용 + 모델 이름 환경변수에서 읽기
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
@@ -804,72 +804,60 @@ async def analyze_pet_health(req: AICareRequest):
         - 현재 체중: {req.profile.weight_current}kg
         - 알러지: {", ".join(req.profile.allergies) if req.profile.allergies else "없음"}
 
-        [최근 체중 기록]
-        {req.recent_weights}
-
-        [진료 이력]
-        {req.medical_history}
-
-        [스케줄]
-        {req.schedules}
+        [최근 데이터]
+        - 체중 기록(최신순): {req.recent_weights}
+        - 진료 이력: {req.medical_history}
+        - 스케줄: {req.schedules}
 
         {tags_context}
 
         [분석 요청사항]
-        1. 체중: 최근 변화 추세(증가/감소/유지)를 0.1kg 단위로 민감하게 체크하세요.
-        2. 리스크: 노령 여부, 체중 급변, 빈번한 병원 방문 등을 고려해 위험 요소를 찾으세요.
-        3. 액션: 구체적이고 실천 가능한 행동을 제안하세요.
-        4. 태그: 위 태그 목록 중, 이 동물의 '현재 상태', '최근 치료', '예방 접종 이력'에 해당하는 코드(code)를 모두 고르세요.
-           - "음성(Negative)"이거나 "정상"인 질환은 선택하지 마세요.
-        5. 점수: 0~100점 (건강할수록 높은 점수)
+        1. 체중 변화(증가/감소/유지)를 0.1kg 단위까지 민감하게 분석.
+        2. 노령, 체중 급변, 잦은 병원 방문 등 리스크 요소 정리.
+        3. 보호자가 바로 실천할 수 있는 행동 가이드 제안.
+        4. condition_tags 목록 중 현재 상태에 해당하는 코드만 선택 (정상/음성은 선택 X).
+        5. 건강 점수는 0~100점.
 
-        [출력 포맷 (JSON Only)]
+        [출력 포맷 (JSON ONLY)]
         {{
-            "summary": "홈 화면 카드용 40자 이내 핵심 요약",
-            "detail_analysis": "전체적인 건강 상태 상세 분석 (줄바꿈 없이 3~5문장)",
-            "weight_trend_status": "체중 상태 (예: 안정적, 급격한 증가, 감소 주의)",
-            "risk_factors": ["위험 요소1", "위험 요소2"],
-            "action_guide": ["추천 행동1", "추천 행동2"],
-            "health_score": 85,
-            "condition_tags": ["code1", "code2"]
+          "summary": "홈 카드용 40자 이내 요약",
+          "detail_analysis": "3~5문장 상세 분석",
+          "weight_trend_status": "체중 상태 요약",
+          "risk_factors": ["위험1", "위험2"],
+          "action_guide": ["행동1", "행동2"],
+          "health_score": 80,
+          "condition_tags": ["code1", "code2"]
         }}
-        JSON만 출력하고, 다른 문장은 쓰지 마.
         """
 
         resp = model.generate_content(prompt)
+        text = resp.text.strip()
 
-        text = getattr(resp, "text", None)
-        if not text and resp.candidates:
-            parts = resp.candidates[0].content.parts
-            text = "".join(p.text for p in parts if hasattr(p, "text"))
-        text = (text or "").strip()
-
-        if "  ⁠" in text:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1:
-                text = text[start:end + 1]
+        # 코드블록 안에 들어가 있으면 {} 부분만 잘라내기
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
 
         data = json.loads(text)
 
-        return AICareResponse(
+        ai_resp = AICareResponse(
             summary=data.get("summary", "건강 분석을 완료했어요."),
-            detail_analysis=data.get("detail_analysis", data.get("detailAnalysis", "상세 분석 데이터가 없습니다.")),
-            weight_trend_status=data.get("weight_trend_status", data.get("weightTrendStatus", "-")),
-            risk_factors=data.get("risk_factors", data.get("riskFactors", [])),
-            action_guide=data.get("action_guide", data.get("actionGuide", [])),
-            health_score=data.get("health_score", data.get("healthScore", 50)),
-            condition_tags=data.get("condition_tags", data.get("conditionTags", [])),
+            detail_analysis=data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
+            weight_trend_status=data.get("weight_trend_status", "-"),
+            risk_factors=data.get("risk_factors", []),
+            action_guide=data.get("action_guide", []),
+            health_score=data.get("health_score", 50),
+            condition_tags=data.get("condition_tags", []),
         )
 
+        # 역시 camelCase 키로 내려보내기
+        return ai_resp.dict(by_alias=True)
+
     except Exception as e:
+        # 여기서 404 (모델 없음) 포함 모든 에러를 잡아요.
         print(f"AI Analyze Error: {e}")
-        return AICareResponse(
-            summary="잠시 후 다시 시도해주세요.",
-            detail_analysis=f"AI 분석 중 오류가 발생했습니다: {str(e)}",
-            weight_trend_status="-",
-            risk_factors=[],
-            action_guide=[],
-            health_score=0,
-            condition_tags=[],
+        return make_stub_response(
+            "잠시 후 다시 시도해주세요.",
+            f"AI 분석 중 오류가 발생했습니다: {e}"
         )
