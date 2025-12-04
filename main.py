@@ -750,18 +750,18 @@ def get_cert_list(petId: str = Query(...)):
 
 def make_stub_response(summary: str, detail: str) -> dict:
     """
-    Gemini 호출 실패 / 비활성화 시에도 항상 정상 JSON을 돌려주기 위한 기본 응답.
-    iOS 쪽 AICareResponseDTO와 필드명이 정확히 맞도록 camelCase로 반환합니다.
+    Gemini가 실패해도 항상 내려줄 기본 응답.
+    iOS AICareResponseDTO랑 필드명 1:1로 맞춰서 dict를 만든다.
     """
-    fallback = AICareResponse(
-        summary=summary,
-        detail_analysis=detail,
-        weight_trend_status="데이터 없음",
-        risk_factors=[],
-        action_guide=["서버 점검이 필요해요."],
-        health_score=0,
-        condition_tags=[],
-    )
+    return {
+        "summary": summary,
+        "detailAnalysis": detail,
+        "weightTrendStatus": "데이터 없음",
+        "riskFactors": [],
+        "actionGuide": ["서버 점검이 필요해요."],
+        "healthScore": 0,
+        "conditionTags": [],
+    }
     # ⚠️ by_alias=True로 해서 detailAnalysis, weightTrendStatus 같은 camelCase 키로 내려보냄
     return fallback.dict(by_alias=True)
 
