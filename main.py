@@ -502,7 +502,7 @@ def health():
 # ------------------------------------------
 
 # (1) 영수증 업로드 & 분석
-@("/receipt/upload")
+@app.post("/receipt/upload")
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -740,6 +740,11 @@ def get_cert_list(petId: str = Query(...)):
     items.sort(key=lambda x: x["createdAt"], reverse=True)
     return items
 
+
+# ------------------------------------------
+# 8. AI 케어 분석 (Gemini) - 항상 200 + JSON 반환
+# ------------------------------------------
+
 def make_stub_response(summary: str, detail: str) -> dict:
     """
     Gemini가 실패해도 항상 내려줄 기본 응답.
@@ -754,16 +759,21 @@ def make_stub_response(summary: str, detail: str) -> dict:
         "healthScore": 0,
         "conditionTags": [],
     }
-    # ⚠️ by_alias=True로 해서 detailAnalysis, weightTrendStatus 같은 camelCase 키로 내려보냄
-    return fallback.dict(by_alias=True)
 
-# (4) AI 종합 분석
+
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
     """
     PetHealth+ AI 케어: 종합 건강 리포트 생성.
     - 어떤 일이 있어도 200 + JSON을 반환하도록 구성.
     """
+    # 0) 강제 스텁 모드
+    if settings.STUB_MODE.lower() == "true":
+        return make_stub_response(
+            "테스트 모드 응답이에요.",
+            "현재 서버가 STUB_MODE로 동작 중이라 실제 AI 분석 대신 기본 예시 결과를 보여드리고 있어요."
+        )
+
     # 1) Gemini 비활성화거나 키 없으면 바로 스텁 응답
     if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
         return make_stub_response(
@@ -822,7 +832,8 @@ async def analyze_pet_health(req: AICareRequest):
         """
 
         resp = model.generate_content(prompt)
-        text = resp.text.strip()
+        text = getattr(resp, "text", "") or ""
+        text = text.strip()
 
         # 코드블록으로 감싸져 있으면 {} 부분만 추출
         start = text.find("{")
