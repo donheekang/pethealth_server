@@ -700,171 +700,54 @@ def get_cert_list(petId: str = Query(...)):
 
 # ------------------------------------------------
 # 8. AI 케어 – 태그 통계 & 케어 가이드
-#   (iOS의 새로운 AICareResponseDTO 구조와 맞춤)
+#   (iOS의 AICareResponseDTO 구조와 맞춤)
 # ------------------------------------------------
 
-def _parse_date(date_str: Optional[str]) -> Optional[datetime]:
-    if not date_str:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y.%m.%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    return None
+from datetime import date as _date
 
 
-def _extract_condition_codes_from_history(
-    history: List[MedicalHistoryDTO],
-) -> Dict[str, List[datetime]]:
+def _parse_visit_date(s: Optional[str]) -> Optional[_date]:
     """
-    condition_tags.CONDITION_TAGS에 등록된 키워드 기반으로
-    진료 기록에서 태그 코드를 뽑아낸다.
+    '2025-12-03' 또는 '2025-12-03 10:30' 같이 들어오는 날짜 문자열 파싱.
     """
-    result: Dict[str, List[datetime]] = {}
-
-    if not CONDITION_TAGS:
-        return result
-
-    for record in history:
-        text_parts = []
-        if record.diagnosis:
-            text_parts.append(record.diagnosis)
-        if record.clinic_name:
-            text_parts.append(record.clinic_name)
-        text = " ".join(text_parts)
-
-        visit_dt = _parse_date(record.visit_date)
-        if not visit_dt:
-            continue
-
-        for code, cfg in CONDITION_TAGS.items():
-            label = getattr(cfg, "label", None) or getattr(cfg, "name", None)
-            keywords = getattr(cfg, "keywords", None)
-            if keywords is None and isinstance(cfg, dict):
-                label = label or cfg.get("label") or cfg.get("name")
-                keywords = cfg.get("keywords", [])
-
-            if not keywords:
-                continue
-
-            lowered = text.lower()
-            if any(str(kw).lower() in lowered for kw in keywords):
-                result.setdefault(code, []).append(visit_dt)
-
-    return result
-
-
-def _build_period_stats(tag_dates: Dict[str, List[datetime]]) -> Dict[str, Dict[str, int]]:
-    now = datetime.utcnow()
-    windows = {
-        "1m": now - timedelta(days=30),
-        "3m": now - timedelta(days=90),
-        "1y": now - timedelta(days=365),
-    }
-
-    stats: Dict[str, Dict[str, int]] = {k: {} for k in windows.keys()}
-
-    for code, dates in tag_dates.items():
-        for label, start_dt in windows.items():
-            count = sum(1 for d in dates if d >= start_dt)
-            stats[label][code] = count
-
-    return stats
-
-
-def _build_tag_list(tag_dates: Dict[str, List[datetime]]) -> List[Dict[str, Any]]:
-    tags: List[Dict[str, Any]] = []
-
-    for code, dates in tag_dates.items():
-        cfg = CONDITION_TAGS.get(code, {})
-        label = getattr(cfg, "label", None) or getattr(cfg, "name", None)
-        if not label and isinstance(cfg, dict):
-            label = cfg.get("label") or cfg.get("name") or code
-
-        recent_dates = sorted(dates, reverse=True)[:5]
-        recent_str = [d.strftime("%Y-%m-%d") for d in recent_dates]
-
-        tags.append(
-            {
-                "tag": code,
-                "label": label or code,
-                "count": len(dates),
-                "recentDates": recent_str,
-            }
-        )
-
-    tags.sort(key=lambda x: x["count"], reverse=True)
-    return tags
-
-
-def _make_stub_ai_response(req: AICareRequest) -> Dict[str, Any]:
-    """
-    Gemini가 꺼져 있거나 에러일 때도
-    iOS AICareResponseDTO 구조 그대로 내려주는 기본 응답.
-    """
-    tag_dates = _extract_condition_codes_from_history(req.medical_history)
-    tags = _build_tag_list(tag_dates)
-    period_stats = _build_period_stats(tag_dates)
-
-    care_guide: Dict[str, List[str]] = {}
-    for t in tags:
-        code = t["tag"]
-        cfg = CONDITION_TAGS.get(code, {})
-        guide: List[str] = []
-
-        if isinstance(cfg, dict):
-            guide = cfg.get("guide", []) or cfg.get("tips", [])
-        else:
-            guide = getattr(cfg, "guide", None) or getattr(cfg, "tips", None) or []
-
-        care_guide[code] = list(guide)
-
-    if tags:
-        summary = "태그별 진료 기록을 정리했어요."
-    else:
-        summary = "아직 AI가 사용할 진료 태그가 부족해요. 진료기록이 더 쌓이면 통계를 보여드릴게요."
-
-    return {
-        "summary": summary,
-        "tags": tags,
-        "periodStats": period_stats,
-        "careGuide": care_guide,
-    }
-# ------------------------------------------
-#  AI 케어 헬퍼: 날짜 파싱 / 태그 집계
-# ------------------------------------------
-
-def _parse_visit_date(s: str) -> date | None:
-    """'2025-12-03' 또는 '2025-12-03 10:30' 같이 들어오는 날짜 문자열 파싱."""
     if not s:
         return None
     s = s.strip()
+
+    # 1) ISO 포맷 (2025-12-03, 2025-12-03T10:30:00 등)
     try:
-        # ISO 포맷(YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM:SS 등)
         return datetime.fromisoformat(s).date()
     except Exception:
-        try:
-            # 공백 기준 앞부분만 날짜로 쓰기
-            part = s.split()[0]
-            return datetime.strptime(part, "%Y-%m-%d").date()
-        except Exception:
-            return None
+        pass
+
+    # 2) "2025-12-03 10:30" → 앞부분만
+    try:
+        part = s.split()[0]
+        return datetime.strptime(part, "%Y-%m-%d").date()
+    except Exception:
+        return None
 
 
-def _build_tag_stats(medical_history: list) -> tuple[list[dict], dict[str, dict[str, int]]]:
+def _build_tag_stats(
+    medical_history: list,
+) -> tuple[list[dict], dict[str, dict[str, int]]]:
     """
     진료 이력 리스트에서 CONDITION_TAGS를 기준으로
     - tags: [{tag, label, count, recentDates}]
     - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
     를 만들어서 반환.
-    """
-    today = date.today()
 
-    # tag_code -> 집계
+    ⚠️ medical_history 안의 각 원소는
+    - Pydantic 모델(MedicalHistoryDTO) 이거나
+    - dict (JSON 그대로) 일 수 있으므로
+      둘 다 안전하게 처리하도록 작성.
+    """
+    today = _date.today()
+
+    # tag_code -> 집계 정보
     agg: dict[str, dict] = {}
 
-    # 기간별 통계 초기값
+    # 기간별 통계 (기본값)
     period_stats: dict[str, dict[str, int]] = {
         "1m": {},
         "3m": {},
@@ -872,41 +755,91 @@ def _build_tag_stats(medical_history: list) -> tuple[list[dict], dict[str, dict[
     }
 
     for mh in medical_history:
-        # pydantic 모델 기준: mh.visit_date / mh.clinic_name / mh.diagnosis
-        visit_str = getattr(mh, "visit_date", "") or ""
-        diag = getattr(mh, "diagnosis", "") or ""
-        clinic = getattr(mh, "clinic_name", "") or ""
-
-        base_text = f"{diag} {clinic}".strip()
-        if not base_text:
+        # 1) Pydantic 객체 / dict 모두 지원
+        if hasattr(mh, "dict"):  # MedicalHistoryDTO 같은 모델
+            raw = mh.dict(by_alias=True)
+        elif isinstance(mh, dict):
+            raw = mh
+        else:
+            # 예상치 못한 타입은 스킵
             continue
 
+        visit_str = raw.get("visitDate") or raw.get("visit_date") or ""
+        diag = raw.get("diagnosis") or ""
+        clinic = raw.get("clinicName") or raw.get("clinic_name") or ""
+
+        # iOS 쪽에서 보내줄 수 있는 태그 코드 배열
+        tag_codes_from_ios = raw.get("tagCodes") or raw.get("tag_codes") or []
+
+        base_text = f"{diag} {clinic}".strip()
         visit_dt = _parse_visit_date(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
+
+        # 2) 이 진료에 대해 어떤 태그들이 걸리는지 계산
+        matched_codes: set[str] = set()
+
+        # (1) tagCodes 필드가 있으면 가장 우선
+        if isinstance(tag_codes_from_ios, list):
+            for c in tag_codes_from_ios:
+                code_str = str(c).strip()
+                if code_str and code_str in CONDITION_TAGS:
+                    matched_codes.add(code_str)
+
+        # (2) diagnosis / clinic 텍스트에서도 코드 / 키워드 매칭
         text_lower = base_text.lower()
+        if base_text:
+            for cfg in CONDITION_TAGS.values():
+                # dataclass 또는 dict 두 경우 모두 처리
+                try:
+                    code = cfg.code
+                    label = cfg.label
+                    keywords = cfg.keywords
+                except AttributeError:
+                    # dict 타입일 가능성
+                    code = cfg.get("code")
+                    label = cfg.get("label", code)
+                    keywords = cfg.get("keywords", [])
 
-        # 모든 ConditionTag 에 대해 keyword 매칭
-        for cfg in CONDITION_TAGS.values():
-            # code 자체도 키워드로 인정 + keywords 리스트
-            keyword_hit = False
-            code_lower = cfg.code.lower()
-            if code_lower in text_lower:
-                keyword_hit = True
+                if not code:
+                    continue
+
+                code_lower = str(code).lower()
+                hit = False
+
+                # 코드 문자열이 그대로 들어있는 경우
+                if code_lower in text_lower:
+                    hit = True
+                else:
+                    for kw in keywords:
+                        if str(kw).lower() in text_lower:
+                            hit = True
+                            break
+
+                if hit:
+                    matched_codes.add(code)
+
+        # 이 진료에서 매칭된 태그가 없다면 건너뛰기
+        if not matched_codes:
+            continue
+
+        # 3) 매칭된 태그들에 대해 집계/기간 통계 반영
+        for code in matched_codes:
+            cfg = CONDITION_TAGS.get(code)
+
+            # label / keywords 꺼내기 (dataclass 또는 dict)
+            if cfg is None:
+                label = code
             else:
-                for kw in cfg.keywords:
-                    if kw.lower() in text_lower:
-                        keyword_hit = True
-                        break
+                try:
+                    label = cfg.label
+                except AttributeError:
+                    label = cfg.get("label", code)
 
-            if not keyword_hit:
-                continue
-
-            # 태그 집계
             stat = agg.setdefault(
-                cfg.code,
+                code,
                 {
-                    "tag": cfg.code,
-                    "label": cfg.label,
+                    "tag": code,
+                    "label": label,
                     "count": 0,
                     "recentDates": [],
                 },
@@ -915,17 +848,16 @@ def _build_tag_stats(medical_history: list) -> tuple[list[dict], dict[str, dict[
             if visit_date_str:
                 stat["recentDates"].append(visit_date_str)
 
-            # 기간별 통계 (날짜 있을 때만)
             if visit_dt:
                 days = (today - visit_dt).days
                 if days <= 365:
-                    period_stats["1y"][cfg.code] = period_stats["1y"].get(cfg.code, 0) + 1
+                    period_stats["1y"][code] = period_stats["1y"].get(code, 0) + 1
                 if days <= 90:
-                    period_stats["3m"][cfg.code] = period_stats["3m"].get(cfg.code, 0) + 1
+                    period_stats["3m"][code] = period_stats["3m"].get(code, 0) + 1
                 if days <= 30:
-                    period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
+                    period_stats["1m"][code] = period_stats["1m"].get(code, 0) + 1
 
-    # recentDates 최신순 정리 + count 기준 정렬
+    # 4) 날짜 최신순 정렬 + count 기준으로 태그 정렬
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
@@ -954,30 +886,28 @@ DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
     # 필요하면 계속 추가 가능
 }
 
-# (4) AI 종합 분석 (태그 통계 전용 버전)
+
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
     """
     PetHealth+ AI 케어: 진료 태그 기반 요약/통계 리포트.
-    Gemini가 있으면 나중에 자연어 요약에 사용할 수 있고,
-    없더라도 이 함수만으로 통계 리포트는 항상 내려가도록 구성.
+    Gemini 여부와 상관 없이 항상 통계를 내려주는 버전.
     """
-
     # 1) 진료 이력에서 태그 집계
     tags, period_stats = _build_tag_stats(req.medical_history or [])
 
-    # 2) 요약 문구 생성
+    # 2) 요약 문구
     if not req.medical_history:
         summary = (
             f"{req.profile.name}의 진료 기록이 없어서 현재 상태에 대한 "
-            "구체적인 조언을 드리기 어렵습니다. 진료 기록이 쌓이면 "
-            "더욱 정확한 컨설팅을 해드릴 수 있습니다."
+            "구체적인 조언을 드리기 어렵습니다. 진단명이 포함된 영수증을 "
+            "조금 더 기록해 주시면 통계를 만들어 드릴 수 있어요."
         )
     elif not tags:
         summary = (
             f"{req.profile.name}의 진료 기록은 있지만, 아직 슬개골·피부·관절 같은 "
-            "특정 컨디션 태그로 분류하기엔 정보가 부족해요. 영수증에 진단명이 보이도록 "
-            "조금 더 기록해 주시면 통계를 정리해 드릴게요."
+            "특정 컨디션 태그로 분류하기엔 정보가 부족해요. 영수증에 진단명이나 "
+            "질환명이 보이도록 찍어 올려 주시면 더 정확한 통계를 제공할 수 있습니다."
         )
     else:
         top = tags[0]
@@ -986,14 +916,14 @@ async def analyze_pet_health(req: AICareRequest):
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸습니다."
         )
 
-    # 3) 케어 가이드 구성 (태그 코드별 기본 문구 매핑)
+    # 3) 케어 가이드 구성
     care_guide: dict[str, list[str]] = {}
     for t in tags:
         code = t["tag"]
         if code in DEFAULT_CARE_GUIDE:
             care_guide[code] = DEFAULT_CARE_GUIDE[code]
 
-    # 4) 최종 응답 JSON
+    # 4) 최종 응답 JSON (iOS AICareResponseDTO와 동일 구조)
     return {
         "summary": summary,
         "tags": tags,
