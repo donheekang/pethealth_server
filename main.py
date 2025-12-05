@@ -699,21 +699,28 @@ def get_cert_list(petId: str = Query(...)):
 
 
 # ------------------------------------------------
-# 8. AI 케어 – 태그 통계 & 케어 가이드 (새 구조 전용)
-#   iOS AICareResponseDTO:
-#   { summary, tags[], periodStats{}, careGuide{} }
+# 8. AI 케어 – 태그 통계 & 케어 가이드 (최종 버전)
 # ------------------------------------------------
 
-from datetime import date
+from datetime import date  # 이미 위에서 import 했다면 중복 import는 삭제해도 OK
 
-def _parse_visit_date(s: str | None) -> date | None:
+
+def _parse_visit_date_str(s: str | None) -> date | None:
+    """
+    '2025-12-03' 또는 '2025-12-03 10:30' 같은 문자열을 date로 변환.
+    실패하면 None.
+    """
     if not s:
         return None
     s = s.strip()
+
+    # 1) ISO 형식 전체 시도
     try:
         return datetime.fromisoformat(s).date()
     except Exception:
         pass
+
+    # 2) 앞부분(YYYY-MM-DD)만 잘라서 시도
     try:
         part = s.split()[0]
         return datetime.strptime(part, "%Y-%m-%d").date()
@@ -724,9 +731,18 @@ def _parse_visit_date(s: str | None) -> date | None:
 def _build_tag_stats(
     medical_history: list[MedicalHistoryDTO],
 ) -> tuple[list[dict], dict[str, dict[str, int]]]:
+    """
+    진료 이력 리스트에서 CONDITION_TAGS를 기준으로
+    - tags: [{tag, label, count, recentDates}]
+    - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
+    를 만들어서 반환.
+    """
     today = date.today()
 
+    # tag_code -> 집계
     agg: dict[str, dict] = {}
+
+    # 기간별 통계 초기값
     period_stats: dict[str, dict[str, int]] = {
         "1m": {},
         "3m": {},
@@ -734,6 +750,7 @@ def _build_tag_stats(
     }
 
     for mh in medical_history:
+        # pydantic 모델 필드
         visit_str = mh.visit_date or ""
         diag = mh.diagnosis or ""
         clinic = mh.clinic_name or ""
@@ -742,11 +759,13 @@ def _build_tag_stats(
         if not base_text:
             continue
 
-        visit_dt = _parse_visit_date(visit_str)
+        visit_dt = _parse_visit_date_str(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
         text_lower = base_text.lower()
 
+        # 모든 ConditionTag 에 대해 keyword 매칭
         for cfg in CONDITION_TAGS.values():
+            # dataclass ConditionTagConfig 기준
             code_lower = cfg.code.lower()
 
             keyword_hit = False
@@ -774,6 +793,7 @@ def _build_tag_stats(
             if visit_date_str:
                 stat["recentDates"].append(visit_date_str)
 
+            # 기간별 카운트
             if visit_dt:
                 days = (today - visit_dt).days
                 if days <= 365:
@@ -783,6 +803,7 @@ def _build_tag_stats(
                 if days <= 30:
                     period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
 
+    # recentDates 최신순 정렬
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
@@ -790,6 +811,7 @@ def _build_tag_stats(
     return tags, period_stats
 
 
+# 태그 코드별 기본 케어 가이드
 DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
     "ortho_patella": [
         "미끄럽지 않은 매트를 깔아주세요.",
@@ -806,13 +828,24 @@ DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
     "prevent_vaccine_corona": [
         "접종 후 1~2일 동안은 기력, 식욕 변화를 잘 관찰해 주세요.",
     ],
+    # 필요하면 계속 추가
 }
 
 
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
+    """
+    iOS AICareResponseDTO와 1:1로 맞춘 최종 응답:
+    {
+      "summary": String,
+      "tags": [ { "tag": String, "label": String, "count": Int, "recentDates": [String] } ],
+      "periodStats": { "1m": {tag:count...}, "3m": {...}, "1y": {...} },
+      "careGuide": { tag: [String] }
+    }
+    """
     tags, period_stats = _build_tag_stats(req.medical_history or [])
 
+    # 1) 요약 문구
     if not req.medical_history:
         summary = (
             f"{req.profile.name}의 진료 기록이 없어서 현재 상태에 대한 "
@@ -832,12 +865,14 @@ async def analyze_pet_health(req: AICareRequest):
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸습니다."
         )
 
+    # 2) 케어 가이드
     care_guide: dict[str, list[str]] = {}
     for t in tags:
         code = t["tag"]
         if code in DEFAULT_CARE_GUIDE:
             care_guide[code] = DEFAULT_CARE_GUIDE[code]
 
+    # 3) 최종 응답 (딱 이 네 개 키만)
     return {
         "summary": summary,
         "tags": tags,
