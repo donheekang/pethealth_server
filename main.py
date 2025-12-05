@@ -16,6 +16,8 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+from datetime import datetime, date
+from condition_tags import CONDITION_TAGS  # 우리가 방금 정리한 태그 정의
 
 # ------------------------------------------------
 # 1. 설정
@@ -829,113 +831,172 @@ def _make_stub_ai_response(req: AICareRequest) -> Dict[str, Any]:
         "periodStats": period_stats,
         "careGuide": care_guide,
     }
+# ------------------------------------------
+#  AI 케어 헬퍼: 날짜 파싱 / 태그 집계
+# ------------------------------------------
+
+def _parse_visit_date(s: str) -> date | None:
+    """'2025-12-03' 또는 '2025-12-03 10:30' 같이 들어오는 날짜 문자열 파싱."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        # ISO 포맷(YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM:SS 등)
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        try:
+            # 공백 기준 앞부분만 날짜로 쓰기
+            part = s.split()[0]
+            return datetime.strptime(part, "%Y-%m-%d").date()
+        except Exception:
+            return None
 
 
-# (4) AI 종합 분석 – 태그 통계 + Gemini 요약
+def _build_tag_stats(medical_history: list) -> tuple[list[dict], dict[str, dict[str, int]]]:
+    """
+    진료 이력 리스트에서 CONDITION_TAGS를 기준으로
+    - tags: [{tag, label, count, recentDates}]
+    - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
+    를 만들어서 반환.
+    """
+    today = date.today()
+
+    # tag_code -> 집계
+    agg: dict[str, dict] = {}
+
+    # 기간별 통계 초기값
+    period_stats: dict[str, dict[str, int]] = {
+        "1m": {},
+        "3m": {},
+        "1y": {},
+    }
+
+    for mh in medical_history:
+        # pydantic 모델 기준: mh.visit_date / mh.clinic_name / mh.diagnosis
+        visit_str = getattr(mh, "visit_date", "") or ""
+        diag = getattr(mh, "diagnosis", "") or ""
+        clinic = getattr(mh, "clinic_name", "") or ""
+
+        base_text = f"{diag} {clinic}".strip()
+        if not base_text:
+            continue
+
+        visit_dt = _parse_visit_date(visit_str)
+        visit_date_str = visit_dt.isoformat() if visit_dt else None
+        text_lower = base_text.lower()
+
+        # 모든 ConditionTag 에 대해 keyword 매칭
+        for cfg in CONDITION_TAGS.values():
+            # code 자체도 키워드로 인정 + keywords 리스트
+            keyword_hit = False
+            code_lower = cfg.code.lower()
+            if code_lower in text_lower:
+                keyword_hit = True
+            else:
+                for kw in cfg.keywords:
+                    if kw.lower() in text_lower:
+                        keyword_hit = True
+                        break
+
+            if not keyword_hit:
+                continue
+
+            # 태그 집계
+            stat = agg.setdefault(
+                cfg.code,
+                {
+                    "tag": cfg.code,
+                    "label": cfg.label,
+                    "count": 0,
+                    "recentDates": [],
+                },
+            )
+            stat["count"] += 1
+            if visit_date_str:
+                stat["recentDates"].append(visit_date_str)
+
+            # 기간별 통계 (날짜 있을 때만)
+            if visit_dt:
+                days = (today - visit_dt).days
+                if days <= 365:
+                    period_stats["1y"][cfg.code] = period_stats["1y"].get(cfg.code, 0) + 1
+                if days <= 90:
+                    period_stats["3m"][cfg.code] = period_stats["3m"].get(cfg.code, 0) + 1
+                if days <= 30:
+                    period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
+
+    # recentDates 최신순 정리 + count 기준 정렬
+    for stat in agg.values():
+        stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
+
+    tags = sorted(agg.values(), key=lambda x: x["count"], reverse=True)
+
+    return tags, period_stats
+
+
+# 태그 코드별 기본 케어 가이드 (필요한 것만 우선 몇 개 작성)
+DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
+    "ortho_patella": [
+        "미끄럽지 않은 매트를 깔아주세요.",
+        "계단이나 높은 점프는 최대한 피하는 것이 좋아요.",
+        "관절 영양제를 꾸준히 급여하는 것을 보호자와 상의해 보세요.",
+    ],
+    "skin_atopy": [
+        "정기적인 목욕과 빗질로 피부를 깨끗하게 유지해 주세요.",
+        "간식이나 사료를 바꾼 후 증상이 심해졌는지 함께 체크해 주세요.",
+    ],
+    "prevent_vaccine_comprehensive": [
+        "정기적인 종합백신 접종 스케줄을 캘린더에 기록해 두면 좋아요.",
+    ],
+    "prevent_vaccine_corona": [
+        "접종 후 1~2일 동안은 기력, 식욕 변화를 잘 관찰해 주세요.",
+    ],
+    # 필요하면 계속 추가 가능
+}
+
+# (4) AI 종합 분석 (태그 통계 전용 버전)
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
-    print("=== AI ANALYZE START ===")
-    for mh in req.medical_history:
-        print("  - visit:", mh.visit_date, "clinic:", mh.clinic_name, "diagnosis:", mh.diagnosis)
     """
-    iOS에서 보내주는 AICareRequestDTO를 받아서
-    아래 JSON 형태로 돌려준다.
+    PetHealth+ AI 케어: 진료 태그 기반 요약/통계 리포트.
+    Gemini가 있으면 나중에 자연어 요약에 사용할 수 있고,
+    없더라도 이 함수만으로 통계 리포트는 항상 내려가도록 구성.
+    """
 
-    {
-      "summary": "...",
-      "tags": [ { "tag": "..", "label": "..", "count": 2, "recentDates": [] }, ... ],
-      "periodStats": { "1m": { "patella": 1 }, "3m": {...}, "1y": {...} },
-      "careGuide": { "patella": ["문장1","문장2"], "skin": [...] }
+    # 1) 진료 이력에서 태그 집계
+    tags, period_stats = _build_tag_stats(req.medical_history or [])
+
+    # 2) 요약 문구 생성
+    if not req.medical_history:
+        summary = (
+            f"{req.profile.name}의 진료 기록이 없어서 현재 상태에 대한 "
+            "구체적인 조언을 드리기 어렵습니다. 진료 기록이 쌓이면 "
+            "더욱 정확한 컨설팅을 해드릴 수 있습니다."
+        )
+    elif not tags:
+        summary = (
+            f"{req.profile.name}의 진료 기록은 있지만, 아직 슬개골·피부·관절 같은 "
+            "특정 컨디션 태그로 분류하기엔 정보가 부족해요. 영수증에 진단명이 보이도록 "
+            "조금 더 기록해 주시면 통계를 정리해 드릴게요."
+        )
+    else:
+        top = tags[0]
+        summary = (
+            f"최근 진료에서 '{top['label']}' 관련 기록이 {top['count']}회 확인됐어요. "
+            "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸습니다."
+        )
+
+    # 3) 케어 가이드 구성 (태그 코드별 기본 문구 매핑)
+    care_guide: dict[str, list[str]] = {}
+    for t in tags:
+        code = t["tag"]
+        if code in DEFAULT_CARE_GUIDE:
+            care_guide[code] = DEFAULT_CARE_GUIDE[code]
+
+    # 4) 최종 응답 JSON
+    return {
+        "summary": summary,
+        "tags": tags,
+        "periodStats": period_stats,
+        "careGuide": care_guide,
     }
-    """
-    # 1) 서버에서 진료 태그/통계 먼저 계산
-    tag_dates = _extract_condition_codes_from_history(req.medical_history)
-    tags = _build_tag_list(tag_dates)
-    period_stats = _build_period_stats(tag_dates)
-
-    # 2) Gemini 사용 여부
-    use_gemini = (
-        settings.GEMINI_ENABLED.lower() == "true"
-        and bool(settings.GEMINI_API_KEY)
-        and genai is not None
-        and settings.STUB_MODE.lower() != "true"
-    )
-
-    if not use_gemini:
-        return _make_stub_ai_response(req)
-
-    # 3) Gemini에게 요약 + 케어 가이드만 부탁
-    try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
-
-        pet_name = req.profile.name
-        species = req.profile.species
-        age_text = req.profile.age_text or ""
-        weights = [f"{w.date}: {w.weight}kg" for w in req.recent_weights if w.weight]
-
-        tags_json = json.dumps(tags, ensure_ascii=False)
-        period_json = json.dumps(period_stats, ensure_ascii=False)
-
-        prompt = f"""
-        당신은 반려동물 건강 컨설턴트입니다.
-
-        아래는 {pet_name}({species}, {age_text})의 진료 태그 통계입니다.
-
-        [체중 기록]
-        {weights}
-
-        [태그 요약]
-        {tags_json}
-
-        [기간별 통계]
-        {period_json}
-
-        보호자에게 보여줄 간단한 리포트를 만들어 주세요.
-
-        출력 형식 (JSON ONLY):
-
-        {{
-          "summary": "한 줄 요약 (예: '슬개골과 피부 관련 내원이 있었어요. 앞으로 관리가 필요합니다.')",
-          "careGuide": {{
-            "<tagCode>": ["문장1", "문장2"],
-            "...": [...]
-          }}
-        }}
-
-        JSON만 출력하세요. 설명 문장은 쓰지 마세요.
-        """
-
-        resp = model.generate_content(prompt)
-
-        text = getattr(resp, "text", None)
-        if not text and getattr(resp, "candidates", None):
-            parts = resp.candidates[0].content.parts
-            text = "".join(getattr(p, "text", "") for p in parts)
-
-        text = (text or "").strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1:
-            text = text[start:end + 1]
-
-        ai_data = json.loads(text)
-
-        summary = ai_data.get("summary") or "태그별 진료 기록을 정리했어요."
-        care_guide = ai_data.get("careGuide") or {}
-
-        for code in list(care_guide.keys()):
-            if not isinstance(care_guide[code], list):
-                care_guide[code] = [str(care_guide[code])]
-
-        return {
-            "summary": summary,
-            "tags": tags,
-            "periodStats": period_stats,
-            "careGuide": care_guide,
-        }
-
-    except Exception as e:
-        print(f"AI Analyze Error: {e}")
-        # 어떤 오류가 나도 iOS 입장에선 같은 구조로 응답 받도록
-        return _make_stub_ai_response(req)
