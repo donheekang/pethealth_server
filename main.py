@@ -707,17 +707,13 @@ def get_cert_list(petId: str = Query(...)):
 from datetime import date
 
 def _parse_visit_date(s: str | None) -> date | None:
-    """'2025-12-03' 또는 '2025-12-03 10:30' 형식 날짜 파싱."""
     if not s:
         return None
     s = s.strip()
-    # 1) ISO 포맷
     try:
         return datetime.fromisoformat(s).date()
     except Exception:
         pass
-
-    # 2) 앞부분만 날짜로 사용
     try:
         part = s.split()[0]
         return datetime.strptime(part, "%Y-%m-%d").date()
@@ -728,18 +724,9 @@ def _parse_visit_date(s: str | None) -> date | None:
 def _build_tag_stats(
     medical_history: list[MedicalHistoryDTO],
 ) -> tuple[list[dict], dict[str, dict[str, int]]]:
-    """
-    진료 이력에서 CONDITION_TAGS를 기준으로
-    - tags: [{tag, label, count, recentDates}]
-    - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
-    를 만들어 반환.
-    """
     today = date.today()
 
-    # tag_code -> 집계
     agg: dict[str, dict] = {}
-
-    # 기간별 통계 초기값
     period_stats: dict[str, dict[str, int]] = {
         "1m": {},
         "3m": {},
@@ -759,7 +746,6 @@ def _build_tag_stats(
         visit_date_str = visit_dt.isoformat() if visit_dt else None
         text_lower = base_text.lower()
 
-        # 모든 ConditionTag 에 대해 keyword 매칭
         for cfg in CONDITION_TAGS.values():
             code_lower = cfg.code.lower()
 
@@ -797,7 +783,6 @@ def _build_tag_stats(
                 if days <= 30:
                     period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
 
-    # recentDates 최신순 정리 + count 기준 정렬
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
@@ -805,7 +790,6 @@ def _build_tag_stats(
     return tags, period_stats
 
 
-# 태그 코드별 기본 케어 가이드
 DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
     "ortho_patella": [
         "미끄럽지 않은 매트를 깔아주세요.",
@@ -827,15 +811,8 @@ DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
 
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
-    """
-    PetHealth+ AI 케어: 진료 태그 기반 요약/통계 리포트.
-    iOS 의 AICareResponseDTO (summary/tags/periodStats/careGuide)에 맞춰 응답.
-    """
-
-    # 1) 진료 이력에서 태그 집계
     tags, period_stats = _build_tag_stats(req.medical_history or [])
 
-    # 2) 요약 문구
     if not req.medical_history:
         summary = (
             f"{req.profile.name}의 진료 기록이 없어서 현재 상태에 대한 "
@@ -855,14 +832,12 @@ async def analyze_pet_health(req: AICareRequest):
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸습니다."
         )
 
-    # 3) 케어 가이드
     care_guide: dict[str, list[str]] = {}
     for t in tags:
         code = t["tag"]
         if code in DEFAULT_CARE_GUIDE:
             care_guide[code] = DEFAULT_CARE_GUIDE[code]
 
-    # 4) 최종 응답
     return {
         "summary": summary,
         "tags": tags,
