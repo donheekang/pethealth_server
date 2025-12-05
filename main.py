@@ -516,15 +516,28 @@ DEFAULT_CARE_GUIDE: Dict[str, List[str]] = {
 }
 
 
+# ------------------------------------------
+# (4) AI 종합 분석 (태그 통계 전용 버전)
+# ------------------------------------------
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
+    """
+    PetHealth+ AI 케어: 진료 태그 기반 요약/통계 리포트.
+    iOS의 AICareResponseDTO와 정확히 동일한 형태로만 응답한다.
+      - summary: String
+      - tags: [{ tag, label, count, recentDates }]
+      - periodStats: { "1m": {tagCode: Int}, "3m": {...}, "1y": {...} }
+      - careGuide: { tagCode: [String] }
+    """
+
     print(f"[AI] analyze_pet_health called for {req.profile.name}")
     print(f"[AI] medical history count = {len(req.medical_history or [])}")
 
+    # 1) 진료 이력 → 태그 통계
     tags, period_stats = _build_tag_stats(req.medical_history or [])
-
     has_history = len(req.medical_history or []) > 0
 
+    # 2) 요약 문구
     if not has_history:
         summary = (
             f"{req.profile.name}의 진료 기록이 없어서 현재 상태에 대한 "
@@ -544,12 +557,14 @@ async def analyze_pet_health(req: AICareRequest):
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸어요."
         )
 
+    # 3) 케어 가이드 매핑
     care_guide: Dict[str, List[str]] = {}
     for t in tags:
         code = t["tag"]
         if code in DEFAULT_CARE_GUIDE:
             care_guide[code] = DEFAULT_CARE_GUIDE[code]
 
+    # 4) iOS가 기대하는 형태 그대로 응답
     response = {
         "summary": summary,
         "tags": tags,
@@ -557,5 +572,5 @@ async def analyze_pet_health(req: AICareRequest):
         "careGuide": care_guide,
     }
 
-    print(f"[AI] response tags={len(tags)}")
+    print(f"[AI] response = {response}")
     return response
