@@ -834,6 +834,9 @@ def _make_stub_ai_response(req: AICareRequest) -> Dict[str, Any]:
 # (4) AI 종합 분석 – 태그 통계 + Gemini 요약
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
+    print("=== AI ANALYZE START ===")
+    for mh in req.medical_history:
+        print("  - visit:", mh.visit_date, "clinic:", mh.clinic_name, "diagnosis:", mh.diagnosis)
     """
     iOS에서 보내주는 AICareRequestDTO를 받아서
     아래 JSON 형태로 돌려준다.
