@@ -6,7 +6,7 @@ import json
 import uuid
 import tempfile
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
@@ -16,8 +16,6 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from datetime import datetime, date
-from condition_tags import CONDITION_TAGS  # 우리가 방금 정리한 태그 정의
 
 # ------------------------------------------------
 # 1. 설정
@@ -25,9 +23,9 @@ from condition_tags import CONDITION_TAGS  # 우리가 방금 정리한 태그 �
 
 try:
     from condition_tags import CONDITION_TAGS
-except ImportError:
-    CONDITION_TAGS = {}
-    print("Warning: condition_tags.py not found. AI tagging will be limited.")
+except ImportError:  # 서버에 condition_tags.py 없을 때
+    CONDITION_TAGS: Dict[str, Any] = {}
+    print("Warning: condition_tags.py not found. AI condition-tagging will be limited.")
 
 try:
     import google.generativeai as genai
@@ -37,6 +35,7 @@ except ImportError:
 
 
 class Settings(BaseSettings):
+    # S3
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
     AWS_REGION: str
@@ -45,10 +44,10 @@ class Settings(BaseSettings):
     # Google Vision
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
-    # Gemini
+    # Gemini (영수증 파싱에만 사용, 선택)
     GEMINI_ENABLED: str = "false"        # "true" / "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"   # 콘솔에서 쓰는 모델명
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
 
     # 디버그용 스텁 모드
     STUB_MODE: str = "false"
@@ -73,7 +72,7 @@ s3_client = boto3.client(
 
 def upload_to_s3(file_obj, key: str, content_type: str) -> str:
     """
-    파일을 S3에 올리고, 7일짜리 presigned URL을 돌려준다.
+    파일을 S3에 업로드하고 7일짜리 presigned URL을 돌려준다.
     """
     try:
         s3_client.upload_fileobj(
@@ -85,7 +84,7 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
         url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-            ExpiresIn=7 * 24 * 3600,
+            ExpiresIn=7 * 24 * 3600,  # 7일
         )
         return url
     except NoCredentialsError:
@@ -139,7 +138,7 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------------
-# 4. 영수증 파서 (기존 Kor 파서 + AI 파서)
+# 4. 영수증 파서 (기존 Kor 파서 + Gemini 파서)
 # ------------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
@@ -184,7 +183,7 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    OCR 텍스트를 한국 동물병원 영수증 형태라고 가정하고
+    OCR 텍스트를 한국 동물병원 영수증이라고 가정하고
     병원명 / 날짜 / 항목 / 합계를 최대한 맞춰보는 파서.
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -380,7 +379,6 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
 # ------------------------------------------------
 # 5. AI 케어 Request 모델 (Pydantic)
-#   - Response는 단순 dict로 바로 리턴
 # ------------------------------------------------
 
 class CamelBase(BaseModel):
@@ -504,7 +502,7 @@ async def upload_receipt(
         print("OCR error:", e)
         ocr_text = ""
 
-    # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
+    # 3) AI 파싱 시도 → 실패 시 정규식 파서로 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
 
     use_ai = False
@@ -702,9 +700,6 @@ def get_cert_list(petId: str = Query(...)):
 # 8. AI 케어 – 태그 통계 & 케어 가이드 (최종 버전)
 # ------------------------------------------------
 
-from datetime import date  # 이미 위에서 import 했다면 중복 import는 삭제해도 OK
-
-
 def _parse_visit_date_str(s: str | None) -> date | None:
     """
     '2025-12-03' 또는 '2025-12-03 10:30' 같은 문자열을 date로 변환.
@@ -750,7 +745,6 @@ def _build_tag_stats(
     }
 
     for mh in medical_history:
-        # pydantic 모델 필드
         visit_str = mh.visit_date or ""
         diag = mh.diagnosis or ""
         clinic = mh.clinic_name or ""
@@ -763,9 +757,8 @@ def _build_tag_stats(
         visit_date_str = visit_dt.isoformat() if visit_dt else None
         text_lower = base_text.lower()
 
-        # 모든 ConditionTag 에 대해 keyword 매칭
+        # ConditionTagConfig(code, label, species, group, keywords)
         for cfg in CONDITION_TAGS.values():
-            # dataclass ConditionTagConfig 기준
             code_lower = cfg.code.lower()
 
             keyword_hit = False
@@ -828,7 +821,7 @@ DEFAULT_CARE_GUIDE: dict[str, list[str]] = {
     "prevent_vaccine_corona": [
         "접종 후 1~2일 동안은 기력, 식욕 변화를 잘 관찰해 주세요.",
     ],
-    # 필요하면 계속 추가
+    # 필요하면 계속 추가 가능
 }
 
 
@@ -865,14 +858,14 @@ async def analyze_pet_health(req: AICareRequest):
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸습니다."
         )
 
-    # 2) 케어 가이드
+    # 2) 케어 가이드 매핑
     care_guide: dict[str, list[str]] = {}
     for t in tags:
         code = t["tag"]
         if code in DEFAULT_CARE_GUIDE:
             care_guide[code] = DEFAULT_CARE_GUIDE[code]
 
-    # 3) 최종 응답 (딱 이 네 개 키만)
+    # 3) 최종 응답 (이 4개 키만!)
     return {
         "summary": summary,
         "tags": tags,
