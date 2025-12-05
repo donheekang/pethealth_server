@@ -6,8 +6,8 @@ import json
 import uuid
 import tempfile
 import re
-from datetime import datetime
-from typing import Optional, List, Dict
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,9 +17,10 @@ from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-# ------------------------------------------
-# 0. Optional: condition_tags / Gemini
-# ------------------------------------------
+# ------------------------------------------------
+# 1. 설정
+# ------------------------------------------------
+
 try:
     from condition_tags import CONDITION_TAGS
 except ImportError:
@@ -30,12 +31,8 @@ try:
     import google.generativeai as genai
 except ImportError:
     genai = None
-    print("Warning: google.generativeai not installed. GEMINI 기능 비활성화.")
+    print("Warning: google.generativeai not installed. Gemini features disabled.")
 
-
-# ------------------------------------------
-# 1. SETTINGS
-# ------------------------------------------
 
 class Settings(BaseSettings):
     AWS_ACCESS_KEY_ID: str
@@ -43,15 +40,15 @@ class Settings(BaseSettings):
     AWS_REGION: str
     S3_BUCKET_NAME: str
 
-    # Google Vision OCR
+    # Google Vision
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
-    # Gemini 사용 여부 + API Key
-    GEMINI_ENABLED: str = "false"
+    # Gemini
+    GEMINI_ENABLED: str = "false"        # "true" / "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"   # 콘솔에서 쓰는 모델명
 
-    # AI 대신 더미 데이터만 돌리는 모드 (필요하면 사용)
+    # 디버그용 스텁 모드
     STUB_MODE: str = "false"
 
     class Config:
@@ -60,10 +57,9 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-
-# ------------------------------------------
-# 2. AWS S3 CLIENT
-# ------------------------------------------
+# ------------------------------------------------
+# 2. S3 클라이언트
+# ------------------------------------------------
 
 s3_client = boto3.client(
     "s3",
@@ -75,7 +71,7 @@ s3_client = boto3.client(
 
 def upload_to_s3(file_obj, key: str, content_type: str) -> str:
     """
-    file-like 객체를 S3에 업로드하고 presigned URL 반환
+    파일을 S3에 올리고, 7일짜리 presigned URL을 돌려준다.
     """
     try:
         s3_client.upload_fileobj(
@@ -84,35 +80,33 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
             key,
             ExtraArgs={"ContentType": content_type},
         )
-
         url = s3_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-            ExpiresIn=7 * 24 * 3600,  # 7일
+            ExpiresIn=7 * 24 * 3600,
         )
         return url
-
     except NoCredentialsError:
         raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
 
 
-# ------------------------------------------
-# 3. GOOGLE VISION OCR
-# ------------------------------------------
+# ------------------------------------------------
+# 3. Google Vision OCR
+# ------------------------------------------------
 
 def get_vision_client() -> vision.ImageAnnotatorClient:
     cred_value = settings.GOOGLE_APPLICATION_CREDENTIALS
     if not cred_value:
         raise Exception("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 비어있습니다.")
 
-    # 1) JSON 내용 시도
     try:
+        # JSON 문자열로 넘어온 경우
         info = json.loads(cred_value)
         return vision.ImageAnnotatorClient.from_service_account_info(info)
     except json.JSONDecodeError:
-        # 2) JSON이 아니면 경로로 간주
+        # 파일 경로로 넘어온 경우
         if not os.path.exists(cred_value):
             raise Exception(
                 "GOOGLE_APPLICATION_CREDENTIALS가 JSON도 아니고, "
@@ -142,14 +136,11 @@ def run_vision_ocr(image_path: str) -> str:
     return texts[0].description
 
 
-# ------------------------------------------
-# 4. 영수증 파싱 로직 (정규식 Fallback)
-# ------------------------------------------
+# ------------------------------------------------
+# 4. 영수증 파서 (기존 Kor 파서 + AI 파서)
+# ------------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
-    """
-    병원명 추론: 키워드 + 위치 + 형태 기반으로 대략 고르기
-    """
     keywords = [
         "동물병원", "동물 병원", "동물의료", "동물메디컬", "동물 메디컬",
         "동물클리닉", "동물 클리닉",
@@ -164,24 +155,19 @@ def guess_hospital_name(lines: List[str]) -> str:
         score = 0
         text = line.replace(" ", "")
 
-        # 1) 키워드 점수
         if any(k in text for k in keywords):
             score += 5
 
-        # 2) 위치 점수 (위쪽일수록 가산점)
         if idx <= 4:
             score += 2
 
-        # 3) 주소/전화번호처럼 보이면 감점
         if any(x in line for x in ["TEL", "전화", "FAX", "팩스", "도로명"]):
             score -= 2
 
-        # 4) 숫자 많으면 감점 (사업자번호 등)
         digit_count = sum(c.isdigit() for c in line)
         if digit_count >= 8:
             score -= 1
 
-        # 5) 길이 너무 짧거나 너무 길면 감점
         if len(line) < 2 or len(line) > 25:
             score -= 1
 
@@ -196,14 +182,15 @@ def guess_hospital_name(lines: List[str]) -> str:
 
 def parse_receipt_kor(text: str) -> dict:
     """
-    한국 동물병원 영수증 OCR 텍스트를 구조화.
+    OCR 텍스트를 한국 동물병원 영수증 형태라고 가정하고
+    병원명 / 날짜 / 항목 / 합계를 최대한 맞춰보는 파서.
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # 1) 병원명
+    # 1) 병원명 추정
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 방문일시
+    # 2) 날짜 추정
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
@@ -215,7 +202,6 @@ def parse_receipt_kor(text: str) -> dict:
             visit_at = datetime(y, mo, d, h, mi).strftime("%Y-%m-%d %H:%M")
             break
 
-    # 시간 없는 날짜만 있는 경우
     if not visit_at:
         dt_pattern_short = re.compile(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})")
         for line in lines:
@@ -225,7 +211,7 @@ def parse_receipt_kor(text: str) -> dict:
                 visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
                 break
 
-    # 3) 전체 라인에서 합계 후보 금액
+    # 3) 금액 추정
     amt_pattern_total = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(원)?\s*$")
     candidate_totals: List[int] = []
     for line in lines:
@@ -242,7 +228,7 @@ def parse_receipt_kor(text: str) -> dict:
         if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액", "결제요청"]):
             candidate_totals.append(amount)
 
-    # 4) 진료 항목 영역 추출
+    # 4) 항목 블록 추출
     start_idx = None
     for i, line in enumerate(lines):
         if "[날짜" in line:
@@ -266,18 +252,15 @@ def parse_receipt_kor(text: str) -> dict:
     prices: List[int] = []
 
     for line in item_block:
-        # 헤더/설명 줄 스킵
         if any(k in line for k in ["동물명", "항목", "단가", "수량", "금액"]):
             continue
 
-        # (1) *로 시작하는 줄 → 항목 이름
         if line.startswith("*"):
             name = line.lstrip("*").strip().strip(".")
             if name:
                 names.append(name)
             continue
 
-        # (2) 숫자/콤마/공백만 있는 줄 → 금액
         if re.fullmatch(r"[0-9,\s]+", line):
             m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)", line)
             if m:
@@ -286,7 +269,6 @@ def parse_receipt_kor(text: str) -> dict:
                     prices.append(amt)
             continue
 
-        # (3) 텍스트 + 숫자가 같이 있는 줄
         m = re.search(r"(.+?)\s+(\d{1,3}(?:,\d{3})+|\d+)", line)
         if m and ":" not in line and "[" not in line:
             name = m.group(1).strip()
@@ -295,13 +277,11 @@ def parse_receipt_kor(text: str) -> dict:
                 names.append(name)
                 prices.append(amt)
 
-    # 5) 이름-금액 매칭
-    items: List[Dict] = []
+    items: List[Dict[str, Any]] = []
     pair_count = min(len(names), len(prices))
     for i in range(pair_count):
         items.append({"name": names[i], "amount": prices[i]})
 
-    # 6) totalAmount 결정
     if candidate_totals:
         total_amount = max(candidate_totals)
     elif prices:
@@ -319,8 +299,8 @@ def parse_receipt_kor(text: str) -> dict:
 
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
-    Gemini를 이용한 영수증 AI 파싱.
-    실패하면 None 리턴해서 정규식 파서로 Fallback.
+    Gemini를 써서 영수증을 파싱하는 버전.
+    실패하면 None을 돌려준다.
     """
     if settings.GEMINI_ENABLED.lower() != "true":
         return None
@@ -340,12 +320,10 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         \"\"\"{raw_text}\"\"\"
 
         이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
-        키 이름은 반드시 아래와 같아야 해.
 
-        형식:
         {{
           "clinicName": string or null,
-          "visitDate": string or null,   // "YYYY-MM-DD" 또는 "YYYY-MM-DD HH:MM"
+          "visitDate": string or null,
           "diseaseName": string or null,
           "symptomsSummary": string or null,
           "items": [
@@ -356,14 +334,17 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
           ],
           "totalAmount": integer or null
         }}
-        JSON만 출력하고, 설명 문장은 쓰지 마.
         """
 
         resp = model.generate_content(prompt)
-        text = getattr(resp, "text", "") or ""
-        text = text.strip()
 
-        # 코드블록 안에 있을 경우 정리
+        text = getattr(resp, "text", None)
+        if not text and getattr(resp, "candidates", None):
+            parts = resp.candidates[0].content.parts
+            text = "".join(getattr(p, "text", "") for p in parts)
+
+        text = (text or "").strip()
+
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1:
@@ -371,12 +352,10 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
         data = json.loads(text)
 
-        # 필수 키 검증
         for key in ["clinicName", "visitDate", "items", "totalAmount"]:
             if key not in data:
                 return None
 
-        # items 정규화
         if not isinstance(data.get("items"), list):
             data["items"] = []
 
@@ -384,9 +363,9 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         for it in data["items"]:
             if isinstance(it, dict):
                 name = it.get("name", "항목")
-                price = it.get("price", 0)
+                price = it.get("price") or 0
                 fixed_items.append(
-                    {"name": str(name), "price": int(price) if price else 0}
+                    {"name": str(name), "price": int(price)}
                 )
         data["items"] = fixed_items
 
@@ -397,30 +376,16 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         return None
 
 
-# ------------------------------------------
-# 5. AI Care (태그 헬퍼 & DTO)
-# ------------------------------------------
-
-def get_tags_definition_for_prompt() -> str:
-    """Gemini 프롬프트용 태그 목록 생성"""
-    if not CONDITION_TAGS:
-        return "태그 정의 파일이 없습니다."
-
-    lines = []
-    lines.append("[가능한 질환/예방 태그 목록]")
-    for code, config in CONDITION_TAGS.items():
-        keywords_str = ", ".join(config.keywords[:3])
-        line = f"- {code}: {config.label} (관련어: {keywords_str})"
-        lines.append(line)
-    return "\n".join(lines)
-
+# ------------------------------------------------
+# 5. AI 케어 Request 모델 (Pydantic)
+#   - Response는 단순 dict로 바로 리턴
+# ------------------------------------------------
 
 class CamelBase(BaseModel):
-    """camelCase JSON 을 받아주고 내보내는 공통 설정"""
     class Config:
         allow_population_by_field_name = True
         orm_mode = True
-        extra = "ignore"   # iOS에서 추가 필드가 와도 무시
+        extra = "ignore"
 
 
 class PetProfileDTO(CamelBase):
@@ -457,20 +422,11 @@ class AICareRequest(CamelBase):
     schedules: List[ScheduleDTO] = Field(default_factory=list)
 
 
-class AICareResponse(CamelBase):
-    summary: str
-    detail_analysis: str = Field(..., alias="detailAnalysis")
-    weight_trend_status: str = Field(..., alias="weightTrendStatus")
-    risk_factors: List[str] = Field(..., alias="riskFactors")
-    action_guide: List[str] = Field(..., alias="actionGuide")
-    health_score: int = Field(..., alias="healthScore")
-    condition_tags: List[str] = Field(default_factory=list, alias="conditionTags")
-
-# ------------------------------------------
+# ------------------------------------------------
 # 6. FASTAPI APP SETUP
-# ------------------------------------------
+# ------------------------------------------------
 
-app = FastAPI(title="PetHealth+ Server", version="1.0.0")
+app = FastAPI(title="PetHealth+ Server", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -497,12 +453,11 @@ def health():
     }
 
 
-# ------------------------------------------
-# 7. ENDPOINTS
-# ------------------------------------------
+# ------------------------------------------------
+# 7. ENDPOINTS – 영수증 / PDF
+# ------------------------------------------------
 
 # (1) 영수증 업로드 & 분석
-@app.post("/receipt/upload")
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -584,7 +539,7 @@ async def upload_receipt(
             "totalAmount": fallback.get("totalAmount"),
         }
 
-    # 🔧 병원명 앞의 '원 명:' 같은 접두어 제거
+    # 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
@@ -652,7 +607,7 @@ async def upload_cert_pdf(
     }
 
 
-# (3) 리스트 조회 (단순 버전)
+# (3) 리스트 조회
 @app.get("/lab/list")
 @app.get("/labs/list")
 @app.get("/api/lab/list")
@@ -741,123 +696,243 @@ def get_cert_list(petId: str = Query(...)):
     return items
 
 
-# ------------------------------------------
-# 8. AI 케어 분석 (Gemini) - 항상 200 + JSON 반환
-# ------------------------------------------
+# ------------------------------------------------
+# 8. AI 케어 – 태그 통계 & 케어 가이드
+#   (iOS의 새로운 AICareResponseDTO 구조와 맞춤)
+# ------------------------------------------------
 
-def make_stub_response(summary: str, detail: str) -> dict:
+def _parse_date(date_str: Optional[str]) -> Optional[datetime]:
+    if not date_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y.%m.%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_condition_codes_from_history(
+    history: List[MedicalHistoryDTO],
+) -> Dict[str, List[datetime]]:
     """
-    Gemini가 실패해도 항상 내려줄 기본 응답.
-    iOS AICareResponseDTO랑 필드명 1:1로 맞춰서 dict를 만든다.
+    condition_tags.CONDITION_TAGS에 등록된 키워드 기반으로
+    진료 기록에서 태그 코드를 뽑아낸다.
     """
+    result: Dict[str, List[datetime]] = {}
+
+    if not CONDITION_TAGS:
+        return result
+
+    for record in history:
+        text_parts = []
+        if record.diagnosis:
+            text_parts.append(record.diagnosis)
+        if record.clinic_name:
+            text_parts.append(record.clinic_name)
+        text = " ".join(text_parts)
+
+        visit_dt = _parse_date(record.visit_date)
+        if not visit_dt:
+            continue
+
+        for code, cfg in CONDITION_TAGS.items():
+            label = getattr(cfg, "label", None) or getattr(cfg, "name", None)
+            keywords = getattr(cfg, "keywords", None)
+            if keywords is None and isinstance(cfg, dict):
+                label = label or cfg.get("label") or cfg.get("name")
+                keywords = cfg.get("keywords", [])
+
+            if not keywords:
+                continue
+
+            lowered = text.lower()
+            if any(str(kw).lower() in lowered for kw in keywords):
+                result.setdefault(code, []).append(visit_dt)
+
+    return result
+
+
+def _build_period_stats(tag_dates: Dict[str, List[datetime]]) -> Dict[str, Dict[str, int]]:
+    now = datetime.utcnow()
+    windows = {
+        "1m": now - timedelta(days=30),
+        "3m": now - timedelta(days=90),
+        "1y": now - timedelta(days=365),
+    }
+
+    stats: Dict[str, Dict[str, int]] = {k: {} for k in windows.keys()}
+
+    for code, dates in tag_dates.items():
+        for label, start_dt in windows.items():
+            count = sum(1 for d in dates if d >= start_dt)
+            stats[label][code] = count
+
+    return stats
+
+
+def _build_tag_list(tag_dates: Dict[str, List[datetime]]) -> List[Dict[str, Any]]:
+    tags: List[Dict[str, Any]] = []
+
+    for code, dates in tag_dates.items():
+        cfg = CONDITION_TAGS.get(code, {})
+        label = getattr(cfg, "label", None) or getattr(cfg, "name", None)
+        if not label and isinstance(cfg, dict):
+            label = cfg.get("label") or cfg.get("name") or code
+
+        recent_dates = sorted(dates, reverse=True)[:5]
+        recent_str = [d.strftime("%Y-%m-%d") for d in recent_dates]
+
+        tags.append(
+            {
+                "tag": code,
+                "label": label or code,
+                "count": len(dates),
+                "recentDates": recent_str,
+            }
+        )
+
+    tags.sort(key=lambda x: x["count"], reverse=True)
+    return tags
+
+
+def _make_stub_ai_response(req: AICareRequest) -> Dict[str, Any]:
+    """
+    Gemini가 꺼져 있거나 에러일 때도
+    iOS AICareResponseDTO 구조 그대로 내려주는 기본 응답.
+    """
+    tag_dates = _extract_condition_codes_from_history(req.medical_history)
+    tags = _build_tag_list(tag_dates)
+    period_stats = _build_period_stats(tag_dates)
+
+    care_guide: Dict[str, List[str]] = {}
+    for t in tags:
+        code = t["tag"]
+        cfg = CONDITION_TAGS.get(code, {})
+        guide: List[str] = []
+
+        if isinstance(cfg, dict):
+            guide = cfg.get("guide", []) or cfg.get("tips", [])
+        else:
+            guide = getattr(cfg, "guide", None) or getattr(cfg, "tips", None) or []
+
+        care_guide[code] = list(guide)
+
+    if tags:
+        summary = "태그별 진료 기록을 정리했어요."
+    else:
+        summary = "아직 AI가 사용할 진료 태그가 부족해요. 진료기록이 더 쌓이면 통계를 보여드릴게요."
+
     return {
         "summary": summary,
-        "detailAnalysis": detail,
-        "weightTrendStatus": "데이터 없음",
-        "riskFactors": [],
-        "actionGuide": ["서버 점검이 필요해요."],
-        "healthScore": 0,
-        "conditionTags": [],
+        "tags": tags,
+        "periodStats": period_stats,
+        "careGuide": care_guide,
     }
 
 
+# (4) AI 종합 분석 – 태그 통계 + Gemini 요약
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(req: AICareRequest):
     """
-    PetHealth+ AI 케어: 종합 건강 리포트 생성.
-    - 어떤 일이 있어도 200 + JSON을 반환하도록 구성.
+    iOS에서 보내주는 AICareRequestDTO를 받아서
+    아래 JSON 형태로 돌려준다.
+
+    {
+      "summary": "...",
+      "tags": [ { "tag": "..", "label": "..", "count": 2, "recentDates": [] }, ... ],
+      "periodStats": { "1m": { "patella": 1 }, "3m": {...}, "1y": {...} },
+      "careGuide": { "patella": ["문장1","문장2"], "skin": [...] }
+    }
     """
-    # 0) 강제 스텁 모드
-    if settings.STUB_MODE.lower() == "true":
-        return make_stub_response(
-            "테스트 모드 응답이에요.",
-            "현재 서버가 STUB_MODE로 동작 중이라 실제 AI 분석 대신 기본 예시 결과를 보여드리고 있어요."
-        )
+    # 1) 서버에서 진료 태그/통계 먼저 계산
+    tag_dates = _extract_condition_codes_from_history(req.medical_history)
+    tags = _build_tag_list(tag_dates)
+    period_stats = _build_period_stats(tag_dates)
 
-    # 1) Gemini 비활성화거나 키 없으면 바로 스텁 응답
-    if settings.GEMINI_ENABLED.lower() != "true" or not settings.GEMINI_API_KEY:
-        return make_stub_response(
-            "AI 설정이 필요해요.",
-            "서버 환경변수 GEMINI_API_KEY와 GEMINI_ENABLED를 확인해주세요."
-        )
+    # 2) Gemini 사용 여부
+    use_gemini = (
+        settings.GEMINI_ENABLED.lower() == "true"
+        and bool(settings.GEMINI_API_KEY)
+        and genai is not None
+        and settings.STUB_MODE.lower() != "true"
+    )
 
-    # 2) Gemini 라이브러리 없으면 스텁
-    if genai is None:
-        return make_stub_response(
-            "AI 모듈이 설치돼 있지 않아요.",
-            "requirements.txt에 google-generativeai 패키지가 설치되어 있는지 확인해주세요."
-        )
+    if not use_gemini:
+        return _make_stub_ai_response(req)
 
-    # 3) 실제 Gemini 호출 시도
+    # 3) Gemini에게 요약 + 케어 가이드만 부탁
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
-        tags_context = get_tags_definition_for_prompt()
+        pet_name = req.profile.name
+        species = req.profile.species
+        age_text = req.profile.age_text or ""
+        weights = [f"{w.date}: {w.weight}kg" for w in req.recent_weights if w.weight]
+
+        tags_json = json.dumps(tags, ensure_ascii=False)
+        period_json = json.dumps(period_stats, ensure_ascii=False)
 
         prompt = f"""
-        당신은 'PetHealth+' 앱의 수의학 AI 파트너입니다.
-        반려동물 데이터를 분석해 보호자에게 따뜻하고 정확한 조언을 주세요.
+        당신은 반려동물 건강 컨설턴트입니다.
 
-        [반려동물 정보]
-        - 이름/종: {req.profile.name} ({req.profile.species})
-        - 나이: {req.profile.age_text}
-        - 현재 체중: {req.profile.weight_current}kg
-        - 알러지: {", ".join(req.profile.allergies) if req.profile.allergies else "없음"}
+        아래는 {pet_name}({species}, {age_text})의 진료 태그 통계입니다.
 
-        [최근 데이터]
-        - 체중 기록(최신순): {req.recent_weights}
-        - 진료 이력: {req.medical_history}
-        - 스케줄: {req.schedules}
+        [체중 기록]
+        {weights}
 
-        {tags_context}
+        [태그 요약]
+        {tags_json}
 
-        [분석 요청사항]
-        1. 체중 변화(증가/감소/유지)를 0.1kg 단위까지 민감하게 분석.
-        2. 노령, 체중 급변, 잦은 병원 방문 등 리스크 요소 정리.
-        3. 보호자가 바로 실천할 수 있는 행동 가이드 제안.
-        4. condition_tags 목록 중 현재 상태에 해당하는 코드만 선택 (정상/음성은 선택 X).
-        5. 건강 점수는 0~100점.
+        [기간별 통계]
+        {period_json}
 
-        [출력 포맷 (JSON ONLY)]
+        보호자에게 보여줄 간단한 리포트를 만들어 주세요.
+
+        출력 형식 (JSON ONLY):
+
         {{
-          "summary": "홈 카드용 40자 이내 요약",
-          "detail_analysis": "3~5문장 상세 분석",
-          "weight_trend_status": "체중 상태 요약",
-          "risk_factors": ["위험1", "위험2"],
-          "action_guide": ["행동1", "행동2"],
-          "health_score": 80,
-          "condition_tags": ["code1", "code2"]
+          "summary": "한 줄 요약 (예: '슬개골과 피부 관련 내원이 있었어요. 앞으로 관리가 필요합니다.')",
+          "careGuide": {{
+            "<tagCode>": ["문장1", "문장2"],
+            "...": [...]
+          }}
         }}
+
+        JSON만 출력하세요. 설명 문장은 쓰지 마세요.
         """
 
         resp = model.generate_content(prompt)
-        text = getattr(resp, "text", "") or ""
-        text = text.strip()
 
-        # 코드블록으로 감싸져 있으면 {} 부분만 추출
+        text = getattr(resp, "text", None)
+        if not text and getattr(resp, "candidates", None):
+            parts = resp.candidates[0].content.parts
+            text = "".join(getattr(p, "text", "") for p in parts)
+
+        text = (text or "").strip()
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1:
             text = text[start:end + 1]
 
-        data = json.loads(text)
+        ai_data = json.loads(text)
 
-        # 여기서도 camelCase로 맞춰서 dict 생성
+        summary = ai_data.get("summary") or "태그별 진료 기록을 정리했어요."
+        care_guide = ai_data.get("careGuide") or {}
+
+        for code in list(care_guide.keys()):
+            if not isinstance(care_guide[code], list):
+                care_guide[code] = [str(care_guide[code])]
+
         return {
-            "summary": data.get("summary", "건강 분석을 완료했어요."),
-            "detailAnalysis": data.get("detail_analysis", "상세 분석 데이터가 없습니다."),
-            "weightTrendStatus": data.get("weight_trend_status", "-"),
-            "riskFactors": data.get("risk_factors", []),
-            "actionGuide": data.get("action_guide", []),
-            "healthScore": data.get("health_score", 50),
-            "conditionTags": data.get("condition_tags", []),
+            "summary": summary,
+            "tags": tags,
+            "periodStats": period_stats,
+            "careGuide": care_guide,
         }
 
     except Exception as e:
-        # 여기서 404 포함 모든 오류를 잡는다.
         print(f"AI Analyze Error: {e}")
-        return make_stub_response(
-            "잠시 후 다시 시도해주세요.",
-            f"AI 분석 중 오류가 발생했습니다: {e}"
-        )
+        # 어떤 오류가 나도 iOS 입장에선 같은 구조로 응답 받도록
+        return _make_stub_ai_response(req)
