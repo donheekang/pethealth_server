@@ -1,5 +1,6 @@
 """
 반려동물 질환/케어 태그 정의 파일.
+AI 케어 분석(Gemini)에서 태그 매칭 및 케어 가이드 제공에 사용됨.
 """
 
 from dataclasses import dataclass
@@ -14,165 +15,199 @@ class ConditionTagConfig:
     label: str           # 표시 이름
     species: SpeciesType # 종 구분
     group: str           # 상위 그룹
-    keywords: List[str]  # 매칭 키워드
+    keywords: List[str]  # 태그 매칭 키워드
+    guide: List[str]     # 케어 가이드 문구 리스트
 
 
-# 딕셔너리 시작
+# ---------------------------------------------------
+# TAG DEFINITIONS
+# ---------------------------------------------------
+
 CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
-    
+
+    # ---------------------------------------------------
     # 1) 피부 · 알레르기
+    # ---------------------------------------------------
     "skin_atopy": ConditionTagConfig(
-        code="skin_atopy", label="피부 · 아토피/알레르기", species="both", group="dermatology",
-        keywords=["아토피", "알레르기", "atopy", "allergic dermatitis"]
+        code="skin_atopy",
+        label="피부 · 아토피/알레르기",
+        species="both",
+        group="dermatology",
+        keywords=[
+            "skin_atopy", "아토피", "피부 알레르기", "알레르기", "atopy", "allergic dermatitis"
+        ],
+        guide=[
+            "저자극 샴푸를 사용해주세요.",
+            "알러지 유발 음식은 피해주세요.",
+            "빗질을 규칙적으로 해주세요."
+        ]
     ),
+
     "skin_food_allergy": ConditionTagConfig(
-        code="skin_food_allergy", label="피부 · 식이 알레르기", species="both", group="dermatology",
-        keywords=["식이 알레르기", "음식 알레르기", "Food allergy"]
+        code="skin_food_allergy",
+        label="피부 · 식이 알레르기",
+        species="both",
+        group="dermatology",
+        keywords=[
+            "skin_food_allergy", "식이 알레르기", "음식 알레르기", "food allergy"
+        ],
+        guide=[
+            "문제가 되는 식재료를 기록하고 제거해주세요.",
+            "수의사와 식이 테스트를 상의해보세요."
+        ]
     ),
+
     "skin_pyoderma": ConditionTagConfig(
-        code="skin_pyoderma", label="피부 · 세균성 피부염(농피증)", species="both", group="dermatology",
-        keywords=["농피증", "세균성 피부염", "pyoderma"]
+        code="skin_pyoderma",
+        label="피부 · 세균성 피부염(농피증)",
+        species="both",
+        group="dermatology",
+        keywords=[
+            "skin_pyoderma", "농피증", "세균성 피부염", "pyoderma"
+        ],
+        guide=[
+            "약욕 처방을 꾸준히 따라주세요.",
+            "피부가 젖지 않도록 관리해주세요."
+        ]
     ),
+
     "skin_malassezia": ConditionTagConfig(
-        code="skin_malassezia", label="피부 · 곰팡이성 피부염", species="both", group="dermatology",
-        keywords=["말라세지아", "곰팡이", "yeast", "진균성"]
+        code="skin_malassezia",
+        label="피부 · 곰팡이성 피부염",
+        species="both",
+        group="dermatology",
+        keywords=[
+            "skin_malassezia", "말라세지아", "곰팡이", "yeast", "진균성"
+        ],
+        guide=[
+            "항진균 샴푸와 처방을 따라주세요.",
+            "피부 상태를 꾸준히 관찰해주세요."
+        ]
     ),
+
     "ear_otitis": ConditionTagConfig(
-        code="ear_otitis", label="귀 · 외이염/귓병", species="both", group="dermatology",
-        keywords=["외이염", "귓병", "otitis", "ear infection"]
+        code="ear_otitis",
+        label="귀 · 외이염/귓병",
+        species="both",
+        group="dermatology",
+        keywords=[
+            "ear_otitis", "외이염", "귓병", "otitis", "ear infection"
+        ],
+        guide=[
+            "귀 세정제를 규칙적으로 사용해주세요.",
+            "귀 털이 많은 경우 관리가 필요할 수 있어요."
+        ]
     ),
 
+    # ---------------------------------------------------
     # 2) 심장
+    # ---------------------------------------------------
     "heart_murmur": ConditionTagConfig(
-        code="heart_murmur", label="심장 · 심잡음", species="both", group="cardiology",
-        keywords=["심잡음", "heart murmur", "murmur"]
+        code="heart_murmur",
+        label="심장 · 심잡음",
+        species="both",
+        group="cardiology",
+        keywords=[
+            "heart_murmur", "심잡음", "heart murmur", "murmur"
+        ],
+        guide=[
+            "정기적인 심장초음파 검사가 필요해요.",
+            "운동 강도는 무리가 가지 않게 조절해주세요."
+        ]
     ),
+
     "heart_mitral_valve": ConditionTagConfig(
-        code="heart_mitral_valve", label="심장 · 승모판 질환(MVD)", species="dog", group="cardiology",
-        keywords=["승모판", "이첨판", "mitral valve", "MVD", "MR"]
-    ),
-    "heart_hcm": ConditionTagConfig(
-        code="heart_hcm", label="심장 · 비대성 심근증(HCM)", species="cat", group="cardiology",
-        keywords=["비대성 심근증", "HCM", "심근비대"]
-    ),
-    "heart_heartworm": ConditionTagConfig(
-        code="heart_heartworm", label="심장 · 심장사상충 감염(치료중)", species="both", group="cardiology",
-        keywords=["심장사상충 양성", "heartworm positive", "사상충 감염"]
-    ),
-
-    # 3) 신장/비뇨기
-    "kidney_ckd": ConditionTagConfig(
-        code="kidney_ckd", label="신장 · 만성 신부전(CKD)", species="both", group="nephrology",
-        keywords=["만성 신부전", "CKD", "renal failure", "BUN 상승", "CREA 상승", "SDMA"]
-    ),
-    "urinary_stone": ConditionTagConfig(
-        code="urinary_stone", label="요로 · 결석(방광/요도)", species="both", group="urology",
-        keywords=["결석", "방광결석", "요석", "stone", "calculi", "struvite", "calcium oxalate"]
-    ),
-    "urinary_cystitis": ConditionTagConfig(
-        code="urinary_cystitis", label="요로 · 방광염", species="both", group="urology",
-        keywords=["방광염", "cystitis", "혈뇨", "오줌 소태"]
-    ),
-    "urinary_flutd": ConditionTagConfig(
-        code="urinary_flutd", label="요로 · 하부요로질환(FLUTD/FIC)", species="cat", group="urology",
-        keywords=["특발성 방광염", "FLUTD", "FIC", "배뇨곤란"]
+        code="heart_mitral_valve",
+        label="심장 · 승모판 질환(MVD)",
+        species="dog",
+        group="cardiology",
+        keywords=[
+            "heart_mitral_valve", "승모판", "mitral valve", "MVD", "MR"
+        ],
+        guide=[
+            "정기적으로 심장 초음파 추적 검사를 진행하세요.",
+            "기침, 호흡 변화가 생기면 즉시 병원 방문이 필요합니다."
+        ]
     ),
 
-    # 4) 관절/정형
+    # ---------------------------------------------------
+    # 3) 관절/정형
+    # ---------------------------------------------------
     "ortho_patella": ConditionTagConfig(
-        code="ortho_patella", label="관절 · 슬개골 탈구", species="dog", group="orthopedics",
-        keywords=["슬개골", "patella", "무릎 탈구", "파행"]
+        code="ortho_patella",
+        label="관절 · 슬개골 탈구",
+        species="dog",
+        group="orthopedics",
+        keywords=[
+            "ortho_patella", "슬개골", "patella", "무릎 탈구", "파행"
+        ],
+        guide=[
+            "미끄럽지 않은 매트를 깔아주세요.",
+            "계단이나 점프는 제한해주세요.",
+            "관절 영양제를 고려해보세요."
+        ]
     ),
+
     "ortho_arthritis": ConditionTagConfig(
-        code="ortho_arthritis", label="관절 · 관절염", species="both", group="orthopedics",
-        keywords=["관절염", "arthritis", "DJD", "퇴행성 관절"]
-    ),
-    "ortho_disk": ConditionTagConfig(
-        code="ortho_disk", label="신경/관절 · 디스크(IVDD)", species="both", group="orthopedics",
-        keywords=["디스크", "IVDD", "허리 통증", "마비"]
-    ),
-
-    # 5) 치과
-    "dental_tartar": ConditionTagConfig(
-        code="dental_tartar", label="치과 · 치석/치은염", species="both", group="dentistry",
-        keywords=["치석", "스케일링", "치은염", "잇몸 염증", "scaling"]
-    ),
-    "dental_extraction": ConditionTagConfig(
-        code="dental_extraction", label="치과 · 발치 치료", species="both", group="dentistry",
-        keywords=["발치", "extraction", "이빨 뽑음"]
-    ),
-    "dental_resorption": ConditionTagConfig(
-        code="dental_resorption", label="치과 · 치아흡수성병변(FORL)", species="cat", group="dentistry",
-        keywords=["흡수병변", "FORL", "치아 흡수"]
+        code="ortho_arthritis",
+        label="관절 · 관절염",
+        species="both",
+        group="orthopedics",
+        keywords=[
+            "ortho_arthritis", "관절염", "arthritis", "DJD", "퇴행성"
+        ],
+        guide=[
+            "체중 조절이 가장 중요합니다.",
+            "산책은 무리가 가지 않는 선에서 규칙적으로 진행해주세요."
+        ]
     ),
 
-    # 6) 소화기
-    "gi_pancreatitis": ConditionTagConfig(
-        code="gi_pancreatitis", label="소화기 · 췌장염", species="both", group="gastroenterology",
-        keywords=["췌장염", "pancreatitis", "cPL", "fPL"]
-    ),
-    "gi_enteritis": ConditionTagConfig(
-        code="gi_enteritis", label="소화기 · 장염/설사", species="both", group="gastroenterology",
-        keywords=["장염", "설사", "enteritis", "diarrhea", "구토"]
-    ),
-
-    # 7) 예방접종 및 웰니스 (Preventive) - 상세 분리
+    # ---------------------------------------------------
+    # 4) 예방접종
+    # ---------------------------------------------------
     "prevent_vaccine_comprehensive": ConditionTagConfig(
         code="prevent_vaccine_comprehensive",
-        label="예방접종 · 종합백신(DHPPL/FVRCP)",
+        label="예방접종 · 종합백신",
         species="both",
         group="preventive",
-        keywords=["종합백신", "혼합백신", "DHPPL", "DA2PP", "DHPP", "FVRCP", "4종백신", "5종백신"]
+        keywords=[
+            "prevent_vaccine_comprehensive", "종합백신", "DHPPL", "4종백신", "혼합백신"
+        ],
+        guide=[
+            "정기적인 백신 스케줄을 확인해주세요.",
+            "접종 후 24시간은 몸 상태를 관찰해주세요."
+        ]
     ),
+
     "prevent_vaccine_corona": ConditionTagConfig(
         code="prevent_vaccine_corona",
         label="예방접종 · 코로나 장염",
         species="dog",
         group="preventive",
-        keywords=["코로나 백신", "Corona", "Canine Coronavirus", "장염 예방"]
+        keywords=[
+            "prevent_vaccine_corona", "코로나 백신", "Corona", "장염 예방"
+        ],
+        guide=[
+            "접종 날짜를 놓치지 않도록 기록해두세요."
+        ]
     ),
-    "prevent_vaccine_kennel": ConditionTagConfig(
-        code="prevent_vaccine_kennel",
-        label="예방접종 · 켄넬코프",
-        species="dog",
-        group="preventive",
-        keywords=["켄넬코프", "Kennel Cough", "기관지염 백신"]
-    ),
-    "prevent_vaccine_rabies": ConditionTagConfig(
-        code="prevent_vaccine_rabies",
-        label="예방접종 · 광견병",
-        species="both",
-        group="preventive",
-        keywords=["광견병", "Rabies"]
-    ),
-    "prevent_heartworm": ConditionTagConfig(
-        code="prevent_heartworm",
-        label="예방 · 심장사상충 예방약",
-        species="both",
-        group="preventive",
-        keywords=["심장사상충 예방", "하트가드", "넥스가드", "애드보킷", "레볼루션", "Heartworm Prev"]
-    ),
-    "prevent_external": ConditionTagConfig(
-        code="prevent_external",
-        label="예방 · 외부기생충(진드기)",
-        species="both",
-        group="preventive",
-        keywords=["외부기생충", "진드기", "벼룩", "브라벡토", "프론트라인"]
-    ),
+
+    # ---------------------------------------------------
+    # 5) 기타 웰니스
+    # ---------------------------------------------------
     "wellness_checkup": ConditionTagConfig(
         code="wellness_checkup",
         label="웰니스 · 건강검진",
         species="both",
-        group="preventive",
-        keywords=["건강검진", "종합검진", "Checkup", "Health check"]
-    ),
-    "wellness_neuter": ConditionTagConfig(
-        code="wellness_neuter",
-        label="웰니스 · 중성화 수술",
-        species="both",
-        group="preventive",
-        keywords=["중성화", "Castration", "Spay", "Neuter"]
+        group="wellness",
+        keywords=[
+            "wellness_checkup", "건강검진", "종합검진", "health check"
+        ],
+        guide=[
+            "성견/성묘는 1년에 한 번 건강검진을 권장해요.",
+        ]
     )
 }
 
-_all_ = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
+# export
+all = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
