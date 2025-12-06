@@ -34,13 +34,14 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         species="both",
         group="dermatology",
         keywords=[
-            "skin_atopy", "아토피", "피부 알레르기", "알레르기", "atopy", "allergic dermatitis"
+            "skin_atopy", "아토피", "피부 알레르기", "알레르기", "atopy",
+            "allergic dermatitis"
         ],
         guide=[
             "저자극 샴푸를 사용해주세요.",
-            "알러지 유발 음식은 피해주세요.",
-            "빗질을 규칙적으로 해주세요.",
-        ],
+            "알러지를 유발할 수 있는 음식은 피해주세요.",
+            "빗질을 규칙적으로 해주세요."
+        ]
     ),
 
     "skin_food_allergy": ConditionTagConfig(
@@ -53,8 +54,8 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         ],
         guide=[
             "문제가 되는 식재료를 기록하고 제거해주세요.",
-            "수의사와 식이 테스트를 상의해보세요.",
-        ],
+            "수의사와 식이 테스트를 상의해보세요."
+        ]
     ),
 
     "skin_pyoderma": ConditionTagConfig(
@@ -67,22 +68,22 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         ],
         guide=[
             "약욕 처방을 꾸준히 따라주세요.",
-            "피부가 젖지 않도록 관리해주세요.",
-        ],
+            "피부가 젖지 않도록 관리해주세요."
+        ]
     ),
 
     "skin_malassezia": ConditionTagConfig(
         code="skin_malassezia",
-        label="피부 · 곰팡이성 피부염",
+        label="피부 · 말라세지아/진균성 피부염",
         species="both",
         group="dermatology",
         keywords=[
             "skin_malassezia", "말라세지아", "곰팡이", "yeast", "진균성"
         ],
         guide=[
-            "항진균 샴푸와 처방을 따라주세요.",
-            "피부 상태를 꾸준히 관찰해주세요.",
-        ],
+            "항진균 샴푸를 정기적으로 사용해주세요.",
+            "피부 상태를 꾸준히 확인해주세요."
+        ]
     ),
 
     "ear_otitis": ConditionTagConfig(
@@ -95,8 +96,8 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         ],
         guide=[
             "귀 세정제를 규칙적으로 사용해주세요.",
-            "귀 털이 많은 경우 관리가 필요할 수 있어요.",
-        ],
+            "귀 털이 많은 경우 전문적인 관리가 필요할 수 있어요."
+        ]
     ),
 
     # ---------------------------------------------------
@@ -108,12 +109,12 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         species="both",
         group="cardiology",
         keywords=[
-            "heart_murmur", "심잡음", "heart murmur", "murmur"
+            "heart_murmur", "심잡음", "murmur", "heart murmur"
         ],
         guide=[
             "정기적인 심장초음파 검사가 필요해요.",
-            "운동 강도는 무리가 가지 않게 조절해주세요.",
-        ],
+            "운동은 무리하지 않도록 조절해주세요."
+        ]
     ),
 
     "heart_mitral_valve": ConditionTagConfig(
@@ -125,13 +126,13 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
             "heart_mitral_valve", "승모판", "mitral valve", "MVD", "MR"
         ],
         guide=[
-            "정기적으로 심장 초음파 추적 검사를 진행하세요.",
-            "기침, 호흡 변화가 생기면 즉시 병원 방문이 필요합니다.",
-        ],
+            "정기적 초음파 추적 검사를 권장해요.",
+            "기침이나 호흡 변화가 보이면 병원 방문이 필요합니다."
+        ]
     ),
 
     # ---------------------------------------------------
-    # 3) 관절/정형
+    # 3) 관절
     # ---------------------------------------------------
     "ortho_patella": ConditionTagConfig(
         code="ortho_patella",
@@ -142,10 +143,10 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
             "ortho_patella", "슬개골", "patella", "무릎 탈구", "파행"
         ],
         guide=[
-            "미끄럽지 않은 매트를 깔아주세요.",
-            "계단이나 점프는 제한해주세요.",
-            "관절 영양제를 고려해보세요.",
-        ],
+            "미끄럼 방지 매트를 깔아주세요.",
+            "계단/점프는 제한해주세요.",
+            "관절 영양제를 고려해보세요."
+        ]
     ),
 
     "ortho_arthritis": ConditionTagConfig(
@@ -154,12 +155,12 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         species="both",
         group="orthopedics",
         keywords=[
-            "ortho_arthritis", "관절염", "arthritis", "DJD", "퇴행성"
+            "ortho_arthritis", "관절염", "arthritis", "퇴행성", "DJD"
         ],
         guide=[
-            "체중 조절이 가장 중요합니다.",
-            "산책은 무리가 가지 않는 선에서 규칙적으로 진행해주세요.",
-        ],
+            "체중 조절이 중요합니다.",
+            "무리하지 않는 산책을 규칙적으로 해주세요."
+        ]
     ),
 
     # ---------------------------------------------------
@@ -167,16 +168,21 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
     # ---------------------------------------------------
     "prevent_vaccine_comprehensive": ConditionTagConfig(
         code="prevent_vaccine_comprehensive",
-        label="예방접종 · 종합백신",
+        label="예방접종 · 종합백신(DHPPL/FVRCP)",
         species="both",
         group="preventive",
         keywords=[
-            "prevent_vaccine_comprehensive", "종합백신", "DHPPL", "4종백신", "혼합백신"
+            # 👉 iOS 진단 문자열과 매칭되는 alias 추가
+            "prevent_vaccine_comprehensive",
+            "vaccine_comprehensive",
+            "종합백신", "혼합백신",
+            "DHPPL", "DHPP", "DA2PP", "FVRCP",
+            "4종백신", "5종백신",
         ],
         guide=[
-            "정기적인 백신 스케줄을 확인해주세요.",
-            "접종 후 24시간은 몸 상태를 관찰해주세요.",
-        ],
+            "정기적인 백신 스케줄을 기록해두면 좋아요.",
+            "접종 후 1~2일 동안 컨디션 변화를 관찰해주세요."
+        ]
     ),
 
     "prevent_vaccine_corona": ConditionTagConfig(
@@ -185,30 +191,15 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
         species="dog",
         group="preventive",
         keywords=[
-            "prevent_vaccine_corona", "코로나 백신", "Corona", "장염 예방"
+            "prevent_vaccine_corona", "코로나 백신", "corona"
         ],
         guide=[
-            "접종 날짜를 놓치지 않도록 기록해두세요.",
-        ],
-    ),
-
-    # 진료 코드용 alias (diagnosis: "vaccine_comprehensive")
-    "vaccine_comprehensive": ConditionTagConfig(
-        code="vaccine_comprehensive",
-        label="예방접종 · 종합백신(DHPPL/FVRCP)",
-        species="both",
-        group="preventive",
-        keywords=[
-            "vaccine_comprehensive", "종합백신", "혼합백신", "DHPPL", "FVRCP"
-        ],
-        guide=[
-            "정기적인 백신 스케줄을 캘린더에 기록해두세요.",
-            "접종 후 1~2일 동안은 기력과 식욕을 잘 살펴봐 주세요.",
-        ],
+            "접종 날짜를 놓치지 않도록 캘린더에 기록해주세요."
+        ]
     ),
 
     # ---------------------------------------------------
-    # 5) 기타 웰니스
+    # 5) 웰니스
     # ---------------------------------------------------
     "wellness_checkup": ConditionTagConfig(
         code="wellness_checkup",
@@ -219,9 +210,10 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
             "wellness_checkup", "건강검진", "종합검진", "health check"
         ],
         guide=[
-            "성견/성묘는 1년에 한 번 건강검진을 권장해요.",
-        ],
+            "성견/성묘는 1년에 한 번 건강검진을 권장해요."
+        ]
     ),
 }
 
-_all_ = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
+# export
+all = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
