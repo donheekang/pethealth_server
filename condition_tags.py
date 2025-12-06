@@ -191,6 +191,22 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
             "접종 날짜를 놓치지 않도록 기록해두세요."
         ]
     ),
+    # 7) 예방접종 및 웰니스 (Preventive) - 상세 분리
+CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
+    # ... (기존 항목들)
+
+    # 기존 prevent_vaccine_comprehensive 그대로 두고,
+    # 진료 코드용 alias 를 하나 더 추가
+    "vaccine_comprehensive": ConditionTagConfig(
+        code="vaccine_comprehensive",
+        label="예방접종 · 종합백신(DHPPL/FVRCP)",
+        species="both",
+        group="preventive",
+        keywords=["vaccine_comprehensive", "종합백신", "혼합백신", "DHPPL", "FVRCP"]
+    ),
+
+    # 나머지 기존 항목들 계속...
+}
 
     # ---------------------------------------------------
     # 5) 기타 웰니스
