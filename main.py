@@ -985,7 +985,11 @@ async def analyze_pet_health(body: Dict[str, Any]):
     profile = body.get("profile") or {}
     pet_name = profile.get("name") or "반려동물"
 
-    medical_history = body.get("medicalHistory") or []
+       medical_history = (
+        body.get("medicalHistory")      # camelCase (나중에 쓸 수도 있으니까 유지)
+        or body.get("medical_history")  # 지금 iOS에서 보내는 snake_case
+        or []
+    )
     has_history = len(medical_history) > 0
 
     # 1) 태그 집계
