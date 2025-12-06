@@ -17,11 +17,8 @@ from botocore.exceptions import NoCredentialsError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-from condition_tags import CONDITION_TAGS  # 질환/컨디션 태그 정의
-
-
 # ------------------------------------------------
-# 1. 설정
+# 1. 설정 / 외부 모듈
 # ------------------------------------------------
 
 try:
@@ -49,7 +46,7 @@ class Settings(BaseSettings):
     # Gemini
     GEMINI_ENABLED: str = "false"        # "true" / "false"
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"   # 콘솔에서 쓰는 모델명
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
 
     # 디버그용 스텁 모드
     STUB_MODE: str = "false"
@@ -59,7 +56,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
 
 # ------------------------------------------------
 # 2. S3 클라이언트
@@ -141,7 +137,7 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------------
-# 4. 영수증 파서 (기존 Kor 파서 + AI 파서)
+# 4. 영수증 파서 (Kor 파서 + AI 파서)
 # ------------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
@@ -381,7 +377,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
 
 
 # ------------------------------------------------
-# 5. (참고용) AI 케어 Request DTO – 현재 엔드포인트에서는 직접 사용 안 함
+# 5. DTO 정의 (현재는 참고용)
 # ------------------------------------------------
 
 class CamelBase(BaseModel):
@@ -409,7 +405,8 @@ class MedicalHistoryDTO(CamelBase):
     clinic_name: Optional[str] = Field(None, alias="clinicName")
     item_count: Optional[int] = Field(0, alias="itemCount")
     diagnosis: Optional[str] = None
-    tags: List[str] = Field(default_factory=list)  # ✅ 새로 추가
+    tags: List[str] = Field(default_factory=list)
+
 
 class ScheduleDTO(CamelBase):
     title: str
@@ -505,7 +502,7 @@ async def upload_receipt(
         print("OCR error:", e)
         ocr_text = ""
 
-    # 3) AI 파싱 시도 → 결과가 비정상이면 정규식 파서로 Fallback
+    # 3) AI 파싱 시도 → 실패 시 정규식 파서로 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
 
     use_ai = False
@@ -703,11 +700,7 @@ def get_cert_list(petId: str = Query(...)):
 # 8. AI 케어 – 태그 통계 & 케어 가이드
 # ------------------------------------------------
 
-from datetime import date, datetime
-from typing import Any, Dict, List, Tuple
-
-
-def _parse_visit_date(s: str | None) -> date | None:
+def _parse_visit_date(s: Optional[str]) -> Optional[date]:
     """'2025-12-03' 또는 '2025-12-03 10:30' 형식 날짜 문자열 파싱."""
     if not s:
         return None
@@ -726,19 +719,20 @@ def _build_tag_stats(
     medical_history: List[Dict[str, Any]]
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
     """
-    iOS 에서 넘어온 medicalHistory(dict 리스트)를 받아서
+    진료 이력 리스트에서 CONDITION_TAGS 를 기준으로
 
     - tags: [{tag, label, count, recentDates}]
     - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
 
-    를 계산해서 돌려준다.
+    를 만들어서 반환.
 
-    1순위: record["tags"] 사용
-    2순위: tags 가 비어 있으면 diagnosis/clinicName 텍스트에서 키워드 매칭
+    1순위: iOS 에서 넘어온 record["tags"] 사용
+    2순위: tags 가 비어 있을 때만 diagnosis/clinic_name 에서 키워드 검색
     """
     today = date.today()
 
     agg: Dict[str, Dict[str, Any]] = {}
+
     period_stats: Dict[str, Dict[str, int]] = {
         "1m": {},
         "3m": {},
@@ -746,10 +740,7 @@ def _build_tag_stats(
     }
 
     for mh in medical_history:
-        if not isinstance(mh, dict):
-            continue
-
-        # visitDate / visit_date 둘 다 대응
+        # dict 기준으로 안전하게 꺼내기
         visit_str = (
             mh.get("visitDate")
             or mh.get("visit_date")
@@ -758,13 +749,11 @@ def _build_tag_stats(
         visit_dt = _parse_visit_date(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
 
-        # ✅ 1) iOS 에서 보내준 tags 그대로 사용
         record_tags: List[str] = mh.get("tags") or []
-        if not isinstance(record_tags, list):
-            record_tags = []
 
         used_codes: set[str] = set()
 
+        # 1) tags 우선 사용
         if record_tags:
             for code in record_tags:
                 cfg = CONDITION_TAGS.get(code)
@@ -794,10 +783,14 @@ def _build_tag_stats(
                     if days <= 30:
                         period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
 
-        # ✅ 2) tags 가 비어 있는 경우에만 diagnosis/clinicName 으로 Fallback
+        # 2) tags 없을 때만 diagnosis/clinic_name 키워드 매칭
         if not record_tags:
             diag = mh.get("diagnosis") or ""
-            clinic = mh.get("clinicName") or mh.get("clinic_name") or ""
+            clinic = (
+                mh.get("clinicName")
+                or mh.get("clinic_name")
+                or ""
+            )
             base_text = f"{diag} {clinic}".strip()
             if not base_text:
                 continue
@@ -845,14 +838,14 @@ def _build_tag_stats(
                     if days <= 30:
                         period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
 
-    # 날짜 최신순 정렬
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
     tags = sorted(agg.values(), key=lambda x: x["count"], reverse=True)
     return tags, period_stats
 
-# 태그 코드별 기본 케어 가이드
+
+# 기본 케어 가이드 (코드별)
 DEFAULT_CARE_GUIDE: Dict[str, List[str]] = {
     "ortho_patella": [
         "미끄럽지 않은 매트를 깔아주세요.",
@@ -869,9 +862,112 @@ DEFAULT_CARE_GUIDE: Dict[str, List[str]] = {
     "prevent_vaccine_corona": [
         "접종 후 1~2일 동안은 기력, 식욕 변화를 잘 관찰해 주세요.",
     ],
-    # 필요하면 계속 추가 가능
 }
 
+
+# ------------------------------------------------
+# 9. Gemini 기반 AI 요약 생성
+# ------------------------------------------------
+
+def _build_gemini_prompt(
+    pet_name: str,
+    tags: List[Dict[str, Any]],
+    period_stats: Dict[str, Dict[str, int]],
+    body: Dict[str, Any],
+) -> str:
+    """Gemini에 줄 프롬프트 생성 (토큰 절약 버전)."""
+    profile = body.get("profile") or {}
+    species = profile.get("species", "dog")
+    age_text = profile.get("ageText") or profile.get("age_text") or ""
+    weight = profile.get("weightCurrent") or profile.get("weight_current")
+
+    # 최근 진료 이력 최대 5개만 요약
+    mh_list = body.get("medicalHistory") or []
+    mh_summary_lines = []
+    for mh in mh_list[:5]:
+        clinic = mh.get("clinicName") or mh.get("clinic_name") or ""
+        diag = mh.get("diagnosis") or ""
+        visit = mh.get("visitDate") or mh.get("visit_date") or ""
+        mh_summary_lines.append(f"- {visit} / {clinic} / {diag}")
+
+    tag_lines = []
+    for t in tags:
+        recent_dates = ", ".join(t.get("recentDates", [])[:3])
+        tag_lines.append(
+            f"- {t['label']} : {t['count']}회 (최근 기록일: {recent_dates or '정보 없음'})"
+        )
+
+    prompt = f"""
+당신은 반려동물 건강관리 전문가입니다.
+아래 정보를 바탕으로 보호자에게 한국어로 3~5문장 정도의 간단한 설명을 해주세요.
+
+[반려동물 기본 정보]
+•⁠  ⁠이름: {pet_name}
+•⁠  ⁠종: {species}
+•⁠  ⁠나이 정보: {age_text or '정보 없음'}
+•⁠  ⁠현재 체중: {weight if weight is not None else '정보 없음'} kg
+
+[최근 진료 태그 통계]
+{os.linesep.join(tag_lines) if tag_lines else '태그 통계 없음'}
+
+[최근 진료 이력 요약(최대 5개)]
+{os.linesep.join(mh_summary_lines) if mh_summary_lines else '진료 내역 없음'}
+
+설명은 다음 가이드를 꼭 지켜주세요.
+1) 보호자에게 말하듯이 존댓말로 이야기합니다.
+2) 태그를 하나씩 짚어 주면서 어떤 의미인지, 앞으로 어떤 관리를 하면 좋은지 알려주세요.
+3) 너무 무섭게 말하지 말고, 안심시키면서 현실적인 행동 조언을 주세요.
+4) 출력은 마크다운 없이 '문장만' 출력합니다. 불릿, 번호, 따옴표, ``` 코드블록은 쓰지 마세요.
+"""
+    return prompt.strip()
+
+
+def _generate_gemini_summary(
+    pet_name: str,
+    tags: List[Dict[str, Any]],
+    period_stats: Dict[str, Dict[str, int]],
+    body: Dict[str, Any],
+) -> Optional[str]:
+    """Gemini를 실제로 호출해 요약을 생성. 실패하면 None."""
+    # 태그 없으면 굳이 AI 호출 안 함
+    if not tags:
+        return None
+
+    if settings.GEMINI_ENABLED.lower() != "true":
+        return None
+    if not settings.GEMINI_API_KEY:
+        return None
+    if genai is None:
+        return None
+
+    try:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
+
+        prompt = _build_gemini_prompt(pet_name, tags, period_stats, body)
+        resp = model.generate_content(prompt)
+
+        text = getattr(resp, "text", None)
+        if not text and getattr(resp, "candidates", None):
+            parts = resp.candidates[0].content.parts
+            text = "".join(getattr(p, "text", "") for p in parts)
+
+        summary = (text or "").strip()
+        if not summary:
+            return None
+
+        # 코드블록/따옴표 제거
+        summary = summary.strip("`").strip()
+        return summary
+
+    except Exception as e:
+        print("[AI] Gemini summary error:", e)
+        return None
+
+
+# ------------------------------------------------
+# 10. AI 케어 분석 엔드포인트
+# ------------------------------------------------
 
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(body: Dict[str, Any]):
@@ -886,27 +982,16 @@ async def analyze_pet_health(body: Dict[str, Any]):
     except Exception:
         print("[AI] raw body (repr) =", repr(body))
 
-    # profile 은 그대로
     profile = body.get("profile") or {}
     pet_name = profile.get("name") or "반려동물"
 
-    # ✅ camelCase / snake_case 둘 다 지원
-    medical_history = (
-        body.get("medicalHistory")
-        or body.get("medical_history")
-        or []
-    )
-    if not isinstance(medical_history, list):
-        medical_history = []
-
+    medical_history = body.get("medicalHistory") or []
     has_history = len(medical_history) > 0
-    print(f"[AI] parsed medical_history len={len(medical_history)}")
 
-    # 1) 태그 집계 (dict 리스트를 받도록 이미 수정해 둔 버전 사용)
+    # 1) 태그 집계
     tags, period_stats = _build_tag_stats(medical_history)
-    print(f"[AI] _build_tag_stats result: tags={tags}, period_stats={period_stats}")
 
-    # 2) 요약 문구
+    # 2) 기본 요약 (룰 기반 – Gemini 실패 시 fallback)
     if not has_history:
         summary = (
             f"{pet_name}의 진료 기록이 없어서 현재 상태에 대한 "
@@ -925,6 +1010,11 @@ async def analyze_pet_health(body: Dict[str, Any]):
             f"최근 진료에서 '{top['label']}' 관련 기록이 {top['count']}회 확인됐어요. "
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸어요."
         )
+
+        # 🔥 Gemini 호출 시도 (성공하면 summary 덮어쓰기)
+        ai_summary = _generate_gemini_summary(pet_name, tags, period_stats, body)
+        if ai_summary:
+            summary = ai_summary
 
     # 3) 케어 가이드
     care_guide: Dict[str, List[str]] = {}
