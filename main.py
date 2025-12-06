@@ -742,7 +742,10 @@ def _get_field(obj: Any, *candidates: str) -> str:
             return str(value)
     return ""
 
-
+def _build_tag_stats(medical_history: list) -> tuple[list[dict], dict[str, dict[str, int]]]:
+    # 디버그: 현재 로딩된 태그 코드 확인
+    print("[AI] CONDITION_TAGS keys =", list(CONDITION_TAGS.keys()))
+    
 def _build_tag_stats(
     medical_history: List[Any],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
