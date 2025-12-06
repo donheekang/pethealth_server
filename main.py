@@ -886,14 +886,25 @@ async def analyze_pet_health(body: Dict[str, Any]):
     except Exception:
         print("[AI] raw body (repr) =", repr(body))
 
+    # profile 은 그대로
     profile = body.get("profile") or {}
     pet_name = profile.get("name") or "반려동물"
 
-    medical_history = body.get("medicalHistory") or []
-    has_history = len(medical_history) > 0
+    # ✅ camelCase / snake_case 둘 다 지원
+    medical_history = (
+        body.get("medicalHistory")
+        or body.get("medical_history")
+        or []
+    )
+    if not isinstance(medical_history, list):
+        medical_history = []
 
-    # 1) 태그 집계
+    has_history = len(medical_history) > 0
+    print(f"[AI] parsed medical_history len={len(medical_history)}")
+
+    # 1) 태그 집계 (dict 리스트를 받도록 이미 수정해 둔 버전 사용)
     tags, period_stats = _build_tag_stats(medical_history)
+    print(f"[AI] _build_tag_stats result: tags={tags}, period_stats={period_stats}")
 
     # 2) 요약 문구
     if not has_history:
