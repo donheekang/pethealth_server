@@ -235,4 +235,4 @@ CONDITION_TAGS: Dict[str, ConditionTagConfig] = {
     ),
 }
 
-_all_ = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
+__all__ = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
