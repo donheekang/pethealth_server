@@ -703,133 +703,147 @@ def get_cert_list(petId: str = Query(...)):
 # 8. AI 케어 – 태그 통계 & 케어 가이드
 # ------------------------------------------------
 
-from datetime import datetime, date
-from typing import Any, Dict, List, Tuple
+from datetime import date, datetime
+from typing import Any
 
 def _parse_visit_date(s: str | None) -> date | None:
-    """'2025-12-03' 또는 '2025-12-03 10:30' 같이 들어오는 날짜 문자열 파싱."""
+    """'2025-12-03' 또는 '2025-12-03 10:30' 형식 날짜 문자열 파싱."""
     if not s:
         return None
     s = s.strip()
-    # 1) ISO 포맷 우선
     try:
+        # ISO 포맷 전체
         return datetime.fromisoformat(s).date()
     except Exception:
-        pass
-    # 2) 앞부분만 YYYY-MM-DD 로 시도
-    try:
-        part = s.split()[0]
-        return datetime.strptime(part, "%Y-%m-%d").date()
-    except Exception:
-        return None
+        try:
+            # 앞부분만 날짜로 쓰기
+            part = s.split()[0]
+            return datetime.strptime(part, "%Y-%m-%d").date()
+        except Exception:
+            return None
 
 
-def _get_field(obj: Any, *candidates: str) -> str:
+def _build_tag_stats(medical_history: list[MedicalHistoryDTO]) -> tuple[list[dict], dict[str, dict[str, int]]]:
     """
-    medical_history 아이템이 dict 로 오든 Pydantic 모델로 오든
-    안전하게 값을 꺼내는 헬퍼.
-    """
-    # dict
-    if isinstance(obj, dict):
-        for key in candidates:
-            if key in obj and obj[key]:
-                return str(obj[key])
-        return ""
-    # pydantic 모델 / 일반 객체
-    for key in candidates:
-        value = getattr(obj, key, None)
-        if value:
-            return str(value)
-    return ""
+    진료 이력 리스트에서 CONDITION_TAGS 를 기준으로
 
-def _build_tag_stats(medical_history: list) -> tuple[list[dict], dict[str, dict[str, int]]]:
-    # 디버그: 현재 로딩된 태그 코드 확인
-    print("[AI] CONDITION_TAGS keys =", list(CONDITION_TAGS.keys()))
-    
-def _build_tag_stats(
-    medical_history: List[Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
-    """
-    진료 이력 리스트에서 CONDITION_TAGS를 기준으로
     - tags: [{tag, label, count, recentDates}]
     - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
+
     를 만들어서 반환.
-    dict / Pydantic 둘 다 처리 가능하게 구현.
+
+    1순위: iOS 에서 넘어온 record.tags 사용
+    2순위: record.tags 가 비어 있을 때만 diagnosis/clinic_name 에서 키워드 검색
     """
     today = date.today()
 
     # tag_code -> 집계
-    agg: Dict[str, Dict[str, Any]] = {}
+    agg: dict[str, dict[str, Any]] = {}
 
-    # 기간별 통계
-    period_stats: Dict[str, Dict[str, int]] = {
+    # 기간별 통계 초기값
+    period_stats: dict[str, dict[str, int]] = {
         "1m": {},
         "3m": {},
         "1y": {},
     }
 
-    for mh in medical_history or []:
-        # 필드 꺼내기 (snake / camel 모두 지원)
-        visit_str = _get_field(mh, "visit_date", "visitDate")
-        diag = _get_field(mh, "diagnosis")
-        clinic = _get_field(mh, "clinic_name", "clinicName")
-
-        base_text = f"{diag} {clinic}".strip()
-        if not base_text:
-            continue
-
+    for mh in medical_history:
+        visit_str = getattr(mh, "visit_date", "") or ""
         visit_dt = _parse_visit_date(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
-        text_lower = base_text.lower()
 
-        # CONDITION_TAGS 키워드 매칭
-        for cfg in CONDITION_TAGS.values():
-            keyword_hit = False
+        # ✅ 1) 우선 iOS가 준 tags 그대로 사용
+        record_tags: list[str] = getattr(mh, "tags", []) or []
 
-            # 1) 코드 자체
-            if cfg.code.lower() in text_lower:
-                keyword_hit = True
-            else:
-                # 2) 키워드 목록
-                for kw in cfg.keywords:
-                    if kw.lower() in text_lower:
-                        keyword_hit = True
-                        break
+        used_codes: set[str] = set()
 
-            if not keyword_hit:
+        if record_tags:
+            for code in record_tags:
+                cfg = CONDITION_TAGS.get(code)
+                if not cfg:
+                    continue
+                used_codes.add(code)
+
+                stat = agg.setdefault(
+                    cfg.code,
+                    {
+                        "tag": cfg.code,
+                        "label": cfg.label,
+                        "count": 0,
+                        "recentDates": [],
+                    },
+                )
+                stat["count"] += 1
+                if visit_date_str:
+                    stat["recentDates"].append(visit_date_str)
+
+                if visit_dt:
+                    days = (today - visit_dt).days
+                    if days <= 365:
+                        period_stats["1y"][cfg.code] = period_stats["1y"].get(cfg.code, 0) + 1
+                    if days <= 90:
+                        period_stats["3m"][cfg.code] = period_stats["3m"].get(cfg.code, 0) + 1
+                    if days <= 30:
+                        period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
+
+        # ✅ 2) tags 가 비어있는 기록만, 기존처럼 키워드 매칭 fallback
+        if not record_tags:
+            diag = getattr(mh, "diagnosis", "") or ""
+            clinic = getattr(mh, "clinic_name", "") or ""
+            base_text = f"{diag} {clinic}".strip()
+            if not base_text:
                 continue
 
-            stat = agg.setdefault(
-                cfg.code,
-                {
-                    "tag": cfg.code,
-                    "label": cfg.label,
-                    "count": 0,
-                    "recentDates": [],
-                },
-            )
-            stat["count"] += 1
-            if visit_date_str:
-                stat["recentDates"].append(visit_date_str)
+            text_lower = base_text.lower()
 
-            # 기간별 통계 집계
-            if visit_dt:
-                days = (today - visit_dt).days
-                if days <= 365:
-                    period_stats["1y"][cfg.code] = period_stats["1y"].get(cfg.code, 0) + 1
-                if days <= 90:
-                    period_stats["3m"][cfg.code] = period_stats["3m"].get(cfg.code, 0) + 1
-                if days <= 30:
-                    period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
+            for cfg in CONDITION_TAGS.values():
+                code_lower = cfg.code.lower()
+                keyword_hit = False
 
-    # 날짜 정렬 + count 기준 정렬
+                if code_lower in text_lower:
+                    keyword_hit = True
+                else:
+                    for kw in cfg.keywords:
+                        if kw.lower() in text_lower:
+                            keyword_hit = True
+                            break
+
+                if not keyword_hit:
+                    continue
+
+                # 중복 방지
+                if cfg.code in used_codes:
+                    continue
+                used_codes.add(cfg.code)
+
+                stat = agg.setdefault(
+                    cfg.code,
+                    {
+                        "tag": cfg.code,
+                        "label": cfg.label,
+                        "count": 0,
+                        "recentDates": [],
+                    },
+                )
+                stat["count"] += 1
+                if visit_date_str:
+                    stat["recentDates"].append(visit_date_str)
+
+                if visit_dt:
+                    days = (today - visit_dt).days
+                    if days <= 365:
+                        period_stats["1y"][cfg.code] = period_stats["1y"].get(cfg.code, 0) + 1
+                    if days <= 90:
+                        period_stats["3m"][cfg.code] = period_stats["3m"].get(cfg.code, 0) + 1
+                    if days <= 30:
+                        period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
+
+    # recentDates 최신순 정렬
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
+    # count 기준 내림차순 정렬
     tags = sorted(agg.values(), key=lambda x: x["count"], reverse=True)
-
-    # 디버그용 로그
-    print(f"[AI] _build_tag_stats result: tags={tags}, period_stats={period_stats}")
 
     return tags, period_stats
 
