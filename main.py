@@ -409,7 +409,7 @@ class MedicalHistoryDTO(CamelBase):
     clinic_name: Optional[str] = Field(None, alias="clinicName")
     item_count: Optional[int] = Field(0, alias="itemCount")
     diagnosis: Optional[str] = None
-
+    tags: List[str] = Field(default_factory=list)  # ✅ 새로 추가
 
 class ScheduleDTO(CamelBase):
     title: str
