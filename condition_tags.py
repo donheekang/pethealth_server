@@ -3,7 +3,7 @@
 AI 케어 분석에서 태그 매칭 및 케어 가이드 제공에 사용됨.
 """
 
-from _future_ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Dict, Literal
