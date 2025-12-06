@@ -704,7 +704,8 @@ def get_cert_list(petId: str = Query(...)):
 # ------------------------------------------------
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Dict, List, Tuple
+
 
 def _parse_visit_date(s: str | None) -> date | None:
     """'2025-12-03' 또는 '2025-12-03 10:30' 형식 날짜 문자열 파싱."""
@@ -712,48 +713,55 @@ def _parse_visit_date(s: str | None) -> date | None:
         return None
     s = s.strip()
     try:
-        # ISO 포맷 전체
         return datetime.fromisoformat(s).date()
     except Exception:
         try:
-            # 앞부분만 날짜로 쓰기
             part = s.split()[0]
             return datetime.strptime(part, "%Y-%m-%d").date()
         except Exception:
             return None
 
 
-def _build_tag_stats(medical_history: list[MedicalHistoryDTO]) -> tuple[list[dict], dict[str, dict[str, int]]]:
+def _build_tag_stats(
+    medical_history: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
     """
-    진료 이력 리스트에서 CONDITION_TAGS 를 기준으로
+    iOS 에서 넘어온 medicalHistory(dict 리스트)를 받아서
 
     - tags: [{tag, label, count, recentDates}]
     - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
 
-    를 만들어서 반환.
+    를 계산해서 돌려준다.
 
-    1순위: iOS 에서 넘어온 record.tags 사용
-    2순위: record.tags 가 비어 있을 때만 diagnosis/clinic_name 에서 키워드 검색
+    1순위: record["tags"] 사용
+    2순위: tags 가 비어 있으면 diagnosis/clinicName 텍스트에서 키워드 매칭
     """
     today = date.today()
 
-    # tag_code -> 집계
-    agg: dict[str, dict[str, Any]] = {}
-
-    # 기간별 통계 초기값
-    period_stats: dict[str, dict[str, int]] = {
+    agg: Dict[str, Dict[str, Any]] = {}
+    period_stats: Dict[str, Dict[str, int]] = {
         "1m": {},
         "3m": {},
         "1y": {},
     }
 
     for mh in medical_history:
-        visit_str = getattr(mh, "visit_date", "") or ""
+        if not isinstance(mh, dict):
+            continue
+
+        # visitDate / visit_date 둘 다 대응
+        visit_str = (
+            mh.get("visitDate")
+            or mh.get("visit_date")
+            or ""
+        )
         visit_dt = _parse_visit_date(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
 
-        # ✅ 1) 우선 iOS가 준 tags 그대로 사용
-        record_tags: list[str] = getattr(mh, "tags", []) or []
+        # ✅ 1) iOS 에서 보내준 tags 그대로 사용
+        record_tags: List[str] = mh.get("tags") or []
+        if not isinstance(record_tags, list):
+            record_tags = []
 
         used_codes: set[str] = set()
 
@@ -786,10 +794,10 @@ def _build_tag_stats(medical_history: list[MedicalHistoryDTO]) -> tuple[list[dic
                     if days <= 30:
                         period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
 
-        # ✅ 2) tags 가 비어있는 기록만, 기존처럼 키워드 매칭 fallback
+        # ✅ 2) tags 가 비어 있는 경우에만 diagnosis/clinicName 으로 Fallback
         if not record_tags:
-            diag = getattr(mh, "diagnosis", "") or ""
-            clinic = getattr(mh, "clinic_name", "") or ""
+            diag = mh.get("diagnosis") or ""
+            clinic = mh.get("clinicName") or mh.get("clinic_name") or ""
             base_text = f"{diag} {clinic}".strip()
             if not base_text:
                 continue
@@ -811,7 +819,6 @@ def _build_tag_stats(medical_history: list[MedicalHistoryDTO]) -> tuple[list[dic
                 if not keyword_hit:
                     continue
 
-                # 중복 방지
                 if cfg.code in used_codes:
                     continue
                 used_codes.add(cfg.code)
@@ -838,13 +845,11 @@ def _build_tag_stats(medical_history: list[MedicalHistoryDTO]) -> tuple[list[dic
                     if days <= 30:
                         period_stats["1m"][cfg.code] = period_stats["1m"].get(cfg.code, 0) + 1
 
-    # recentDates 최신순 정렬
+    # 날짜 최신순 정렬
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
-    # count 기준 내림차순 정렬
     tags = sorted(agg.values(), key=lambda x: x["count"], reverse=True)
-
     return tags, period_stats
 
 # 태그 코드별 기본 케어 가이드
