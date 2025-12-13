@@ -13,7 +13,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import vision
 import boto3
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import NoCredentialsError, ClientError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -90,6 +90,34 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
         raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
+
+
+def delete_from_s3(key: str) -> None:
+    """
+    S3 객체 삭제.
+    - 존재 확인(head_object) 후 delete_object 실행
+    - 없으면 404 반환
+    """
+    try:
+        s3_client.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        s3_client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+
+    except ClientError as e:
+        err = e.response.get("Error") or {}
+        code = err.get("Code", "")
+
+        # NotFound 계열
+        if code in ("404", "NoSuchKey", "NotFound"):
+            raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+        # 권한 문제 등
+        raise HTTPException(status_code=500, detail=f"S3 삭제 실패: {e}")
+
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 삭제 실패: {e}")
 
 
 # ------------------------------------------------
@@ -549,6 +577,7 @@ async def upload_receipt(
         "s3Url": file_url,
         "parsed": parsed_for_dto,
         "notes": ocr_text,
+        "objectKey": key,  # (옵션) receipts도 추후 관리/삭제 대비
     }
 
 
@@ -570,13 +599,17 @@ async def upload_lab_pdf(
     url = upload_to_s3(file.file, key, "application/pdf")
     created_at_iso = datetime.utcnow().isoformat()
 
+    filename = key.split("/")[-1]
+    base_name, _ = os.path.splitext(filename)
+
     return {
-        "id": key.split("/")[-1],
+        "id": base_name,          # ✅ 확장자 없는 id로 통일 (리스트와 동일)
         "petId": petId,
         "title": original_base,
         "memo": memo,
         "s3Url": url,
         "createdAt": created_at_iso,
+        "objectKey": key,         # ✅ 디버깅/삭제에 도움
     }
 
 
@@ -597,14 +630,57 @@ async def upload_cert_pdf(
     url = upload_to_s3(file.file, key, "application/pdf")
     created_at_iso = datetime.utcnow().isoformat()
 
+    filename = key.split("/")[-1]
+    base_name, _ = os.path.splitext(filename)
+
     return {
-        "id": key.split("/")[-1],
+        "id": base_name,          # ✅ 확장자 없는 id로 통일 (리스트와 동일)
         "petId": petId,
         "title": original_base,
         "memo": memo,
         "s3Url": url,
         "createdAt": created_at_iso,
+        "objectKey": key,
     }
+
+
+# (2-1) PDF 삭제 (검사/증명서) ✅ 추가
+@app.delete("/lab/delete")
+@app.delete("/labs/delete")
+@app.delete("/api/lab/delete")
+@app.delete("/api/labs/delete")
+def delete_lab_pdf(
+    petId: str = Query(...),
+    id: str = Query(...),
+):
+    object_id = (id or "").strip()
+    if not object_id:
+        raise HTTPException(status_code=400, detail="id is required")
+
+    filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
+    key = f"lab/{petId}/{filename}"
+
+    delete_from_s3(key)
+    return {"ok": True, "deletedKey": key}
+
+
+@app.delete("/cert/delete")
+@app.delete("/certs/delete")
+@app.delete("/api/cert/delete")
+@app.delete("/api/certs/delete")
+def delete_cert_pdf(
+    petId: str = Query(...),
+    id: str = Query(...),
+):
+    object_id = (id or "").strip()
+    if not object_id:
+        raise HTTPException(status_code=400, detail="id is required")
+
+    filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
+    key = f"cert/{petId}/{filename}"
+
+    delete_from_s3(key)
+    return {"ok": True, "deletedKey": key}
 
 
 # (3) 검사/증명서 리스트 조회
@@ -645,6 +721,7 @@ def get_lab_list(petId: str = Query(...)):
                     "title": f"검사결과 ({date_str})",
                     "s3Url": url,
                     "createdAt": created_at_iso,
+                    "objectKey": key,  # (옵션)
                 }
             )
 
@@ -689,6 +766,7 @@ def get_cert_list(petId: str = Query(...)):
                     "title": f"증명서 ({date_str})",
                     "s3Url": url,
                     "createdAt": created_at_iso,
+                    "objectKey": key,  # (옵션)
                 }
             )
 
@@ -740,7 +818,6 @@ def _build_tag_stats(
     }
 
     for mh in medical_history:
-        # dict 기준으로 안전하게 꺼내기
         visit_str = (
             mh.get("visitDate")
             or mh.get("visit_date")
@@ -845,7 +922,6 @@ def _build_tag_stats(
     return tags, period_stats
 
 
-# 기본 케어 가이드 (코드별)
 DEFAULT_CARE_GUIDE: Dict[str, List[str]] = {
     "ortho_patella": [
         "미끄럽지 않은 매트를 깔아주세요.",
@@ -875,13 +951,11 @@ def _build_gemini_prompt(
     period_stats: Dict[str, Dict[str, int]],
     body: Dict[str, Any],
 ) -> str:
-    """Gemini에 줄 프롬프트 생성 (토큰 절약 버전)."""
     profile = body.get("profile") or {}
     species = profile.get("species", "dog")
     age_text = profile.get("ageText") or profile.get("age_text") or ""
     weight = profile.get("weightCurrent") or profile.get("weight_current")
 
-    # 최근 진료 이력 최대 5개만 요약
     mh_list = body.get("medicalHistory") or []
     mh_summary_lines = []
     for mh in mh_list[:5]:
@@ -928,8 +1002,6 @@ def _generate_gemini_summary(
     period_stats: Dict[str, Dict[str, int]],
     body: Dict[str, Any],
 ) -> Optional[str]:
-    """Gemini를 실제로 호출해 요약을 생성. 실패하면 None."""
-    # 태그 없으면 굳이 AI 호출 안 함
     if not tags:
         return None
 
@@ -956,7 +1028,6 @@ def _generate_gemini_summary(
         if not summary:
             return None
 
-        # 코드블록/따옴표 제거
         summary = summary.strip("`").strip()
         return summary
 
@@ -975,8 +1046,6 @@ async def analyze_pet_health(body: Dict[str, Any]):
     PetHealth+ AI 케어: iOS에서 보내는 raw JSON을 그대로 받아
     진료 태그 기반 요약/통계 리포트를 생성.
     """
-
-    # 디버그용 로그
     try:
         print("[AI] raw body =", json.dumps(body, ensure_ascii=False))
     except Exception:
@@ -986,17 +1055,15 @@ async def analyze_pet_health(body: Dict[str, Any]):
     pet_name = profile.get("name") or "반려동물"
 
     medical_history = (
-        body.get("medicalHistory")      # camelCase (나중에 쓸 수도 있으니까 유지)
-        or body.get("medical_history")  # 지금 iOS에서 보내는 snake_case
+        body.get("medicalHistory")
+        or body.get("medical_history")
         or []
     )
 
     has_history = len(medical_history) > 0
 
-    # 1) 태그 집계
     tags, period_stats = _build_tag_stats(medical_history)
 
-    # 2) 기본 요약 (룰 기반 – Gemini 실패 시 fallback)
     if not has_history:
         summary = (
             f"{pet_name}의 진료 기록이 없어서 현재 상태에 대한 "
@@ -1016,12 +1083,10 @@ async def analyze_pet_health(body: Dict[str, Any]):
             "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸어요."
         )
 
-        # 🔥 Gemini 호출 시도 (성공하면 summary 덮어쓰기)
         ai_summary = _generate_gemini_summary(pet_name, tags, period_stats, body)
         if ai_summary:
             summary = ai_summary
 
-    # 3) 케어 가이드
     care_guide: Dict[str, List[str]] = {}
     for t in tags:
         code = t["tag"]
