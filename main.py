@@ -106,11 +106,9 @@ def delete_from_s3(key: str) -> None:
         err = e.response.get("Error") or {}
         code = err.get("Code", "")
 
-        # NotFound 계열
         if code in ("404", "NoSuchKey", "NotFound"):
             raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
 
-        # 권한 문제 등
         raise HTTPException(status_code=500, detail=f"S3 삭제 실패: {e}")
 
     except NoCredentialsError:
@@ -130,11 +128,9 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
         raise Exception("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 비어있습니다.")
 
     try:
-        # JSON 문자열로 넘어온 경우
         info = json.loads(cred_value)
         return vision.ImageAnnotatorClient.from_service_account_info(info)
     except json.JSONDecodeError:
-        # 파일 경로로 넘어온 경우
         if not os.path.exists(cred_value):
             raise Exception(
                 "GOOGLE_APPLICATION_CREDENTIALS가 JSON도 아니고, "
@@ -215,10 +211,8 @@ def parse_receipt_kor(text: str) -> dict:
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # 1) 병원명 추정
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 날짜 추정
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
@@ -239,7 +233,6 @@ def parse_receipt_kor(text: str) -> dict:
                 visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
                 break
 
-    # 3) 금액 추정
     amt_pattern_total = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(원)?\s*$")
     candidate_totals: List[int] = []
     for line in lines:
@@ -256,7 +249,6 @@ def parse_receipt_kor(text: str) -> dict:
         if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액", "결제요청"]):
             candidate_totals.append(amount)
 
-    # 4) 항목 블록 추출
     start_idx = None
     for i, line in enumerate(lines):
         if "[날짜" in line:
@@ -342,27 +334,27 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
-        너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
-        다음은 OCR로 읽은 영수증 텍스트야:
+너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+다음은 OCR로 읽은 영수증 텍스트야:
 
-        \"\"\"{raw_text}\"\"\"
+\"\"\"{raw_text}\"\"\"
 
-        이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
+이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
 
-        {{
-          "clinicName": string or null,
-          "visitDate": string or null,
-          "diseaseName": string or null,
-          "symptomsSummary": string or null,
-          "items": [
-            {{
-              "name": string,
-              "price": integer or null
-            }}
-          ],
-          "totalAmount": integer or null
-        }}
-        """
+{{
+  "clinicName": string or null,
+  "visitDate": string or null,
+  "diseaseName": string or null,
+  "symptomsSummary": string or null,
+  "items": [
+    {{
+      "name": string,
+      "price": integer or null
+    }}
+  ],
+  "totalAmount": integer or null
+}}
+""".strip()
 
         resp = model.generate_content(prompt)
 
@@ -392,9 +384,7 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
             if isinstance(it, dict):
                 name = it.get("name", "항목")
                 price = it.get("price") or 0
-                fixed_items.append(
-                    {"name": str(name), "price": int(price)}
-                )
+                fixed_items.append({"name": str(name), "price": int(price)})
         data["items"] = fixed_items
 
         return data
@@ -454,7 +444,7 @@ class AICareRequest(CamelBase):
 # 6. FASTAPI APP SETUP
 # ------------------------------------------------
 
-app = FastAPI(title="PetHealth+ Server", version="1.1.0")
+app = FastAPI(title="PetHealth+ Server", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -485,7 +475,6 @@ def health():
 # 7. ENDPOINTS – 영수증 / PDF
 # ------------------------------------------------
 
-# (1) 영수증 업로드 & 분석
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -507,19 +496,16 @@ async def upload_receipt(
 
     key = f"receipts/{petId}/{rec_id}{ext}"
 
-    # 파일 데이터 읽기
     data = await upload.read()
     file_like = io.BytesIO(data)
     file_like.seek(0)
 
-    # 1) S3 업로드
     file_url = upload_to_s3(
         file_like,
         key,
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR 실행
     ocr_text = ""
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
@@ -530,7 +516,6 @@ async def upload_receipt(
         print("OCR error:", e)
         ocr_text = ""
 
-    # 3) AI 파싱 시도 → 실패 시 정규식 파서로 Fallback
     ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
 
     use_ai = False
@@ -567,7 +552,6 @@ async def upload_receipt(
             "totalAmount": fallback.get("totalAmount"),
         }
 
-    # 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
@@ -577,11 +561,10 @@ async def upload_receipt(
         "s3Url": file_url,
         "parsed": parsed_for_dto,
         "notes": ocr_text,
-        "objectKey": key,  # (옵션) receipts도 추후 관리/삭제 대비
+        "objectKey": key,
     }
 
 
-# (2) PDF 업로드 (검사/증명서)
 @app.post("/lab/upload-pdf")
 @app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
@@ -603,13 +586,13 @@ async def upload_lab_pdf(
     base_name, _ = os.path.splitext(filename)
 
     return {
-        "id": base_name,          # ✅ 확장자 없는 id로 통일 (리스트와 동일)
+        "id": base_name,
         "petId": petId,
         "title": original_base,
         "memo": memo,
         "s3Url": url,
         "createdAt": created_at_iso,
-        "objectKey": key,         # ✅ 디버깅/삭제에 도움
+        "objectKey": key,
     }
 
 
@@ -634,7 +617,7 @@ async def upload_cert_pdf(
     base_name, _ = os.path.splitext(filename)
 
     return {
-        "id": base_name,          # ✅ 확장자 없는 id로 통일 (리스트와 동일)
+        "id": base_name,
         "petId": petId,
         "title": original_base,
         "memo": memo,
@@ -644,7 +627,6 @@ async def upload_cert_pdf(
     }
 
 
-# (2-1) PDF 삭제 (검사/증명서) ✅ 추가
 @app.delete("/lab/delete")
 @app.delete("/labs/delete")
 @app.delete("/api/lab/delete")
@@ -683,7 +665,6 @@ def delete_cert_pdf(
     return {"ok": True, "deletedKey": key}
 
 
-# (3) 검사/증명서 리스트 조회
 @app.get("/lab/list")
 @app.get("/labs/list")
 @app.get("/api/lab/list")
@@ -721,7 +702,7 @@ def get_lab_list(petId: str = Query(...)):
                     "title": f"검사결과 ({date_str})",
                     "s3Url": url,
                     "createdAt": created_at_iso,
-                    "objectKey": key,  # (옵션)
+                    "objectKey": key,
                 }
             )
 
@@ -766,7 +747,7 @@ def get_cert_list(petId: str = Query(...)):
                     "title": f"증명서 ({date_str})",
                     "s3Url": url,
                     "createdAt": created_at_iso,
-                    "objectKey": key,  # (옵션)
+                    "objectKey": key,
                 }
             )
 
@@ -775,14 +756,14 @@ def get_cert_list(petId: str = Query(...)):
 
 
 # ------------------------------------------------
-# 8. AI 케어 – 태그 통계 & 케어 가이드
+# 8. AI 케어 – 태그 통계 & 케어 가이드 (+ 체중/일정 신호 추가)
 # ------------------------------------------------
 
 def _parse_visit_date(s: Optional[str]) -> Optional[date]:
     """'2025-12-03' 또는 '2025-12-03 10:30' 형식 날짜 문자열 파싱."""
     if not s:
         return None
-    s = s.strip()
+    s = str(s).strip()
     try:
         return datetime.fromisoformat(s).date()
     except Exception:
@@ -791,6 +772,194 @@ def _parse_visit_date(s: Optional[str]) -> Optional[date]:
             return datetime.strptime(part, "%Y-%m-%d").date()
         except Exception:
             return None
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _is_exam_like_tag(code: str, cfg: Any = None) -> bool:
+    """
+    ✅ 검사/영상/패널 같은 'exam' 태그는
+    - 컨디션(질환)처럼 요약/조언 대상으로 쓰지 않기 위해 분리한다.
+    """
+    c = (code or "").strip().lower()
+
+    if c.startswith(("exam_", "test_", "lab_", "imaging_")):
+        return True
+
+    grp = getattr(cfg, "group", None)
+    if isinstance(grp, str) and grp.lower() in ("exam", "test", "lab", "imaging"):
+        return True
+
+    # 보조 휴리스틱: label에 검사성 단어가 있으면 exam 취급
+    label = getattr(cfg, "label", None)
+    if isinstance(label, str):
+        if any(k in label for k in ["검사", "엑스레이", "X-ray", "초음파", "혈액", "패널", "영상"]):
+            return True
+
+    return False
+
+
+def _split_tag_stats(
+    tags: List[Dict[str, Any]],
+    period_stats: Dict[str, Dict[str, int]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
+    """
+    tags/periodStats 를
+    - condition(컨디션/질환/예방/약 등)
+    - exam(검사/영상)
+    으로 분리한다.
+    """
+    cond: List[Dict[str, Any]] = []
+    exam: List[Dict[str, Any]] = []
+
+    for t in tags:
+        code = (t.get("tag") or "").strip()
+        cfg = CONDITION_TAGS.get(code)
+        if _is_exam_like_tag(code, cfg):
+            exam.append(t)
+        else:
+            cond.append(t)
+
+    cond_codes = {t.get("tag") for t in cond}
+    exam_codes = {t.get("tag") for t in exam}
+
+    cond_period: Dict[str, Dict[str, int]] = {}
+    exam_period: Dict[str, Dict[str, int]] = {}
+
+    for period, d in (period_stats or {}).items():
+        d = d or {}
+        cond_period[period] = {k: v for k, v in d.items() if k in cond_codes}
+        exam_period[period] = {k: v for k, v in d.items() if k in exam_codes}
+
+    return cond, exam, cond_period, exam_period
+
+
+def _build_weight_stats(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    recentWeights + profile.weightCurrent 를 이용해 체중 흐름을 '팩트'로 만든다.
+    (LLM이 추론하지 않아도 되게)
+    """
+    profile = body.get("profile") or {}
+    recent = body.get("recentWeights") or body.get("recent_weights") or []
+
+    entries: List[Tuple[date, float]] = []
+    for it in recent:
+        if not isinstance(it, dict):
+            continue
+        d = _parse_visit_date(it.get("date"))
+        w = _safe_float(it.get("weight"))
+        if d and w is not None:
+            entries.append((d, w))
+
+    entries.sort(key=lambda x: x[0])
+
+    profile_w = _safe_float(profile.get("weightCurrent") or profile.get("weight_current"))
+
+    if len(entries) == 0:
+        if profile_w is None:
+            return {
+                "status": "none",
+                "latest": None,
+                "previous": None,
+                "deltaKg": None,
+                "message": "체중 기록이 아직 없어요.",
+            }
+        return {
+            "status": "single",
+            "latest": {"date": None, "weight": profile_w},
+            "previous": None,
+            "deltaKg": None,
+            "message": f"현재 체중은 약 {profile_w:.1f}kg이에요.",
+        }
+
+    latest_d, latest_w = entries[-1]
+    prev = entries[-2] if len(entries) >= 2 else None
+
+    if not prev:
+        return {
+            "status": "single",
+            "latest": {"date": latest_d.isoformat(), "weight": latest_w},
+            "previous": None,
+            "deltaKg": None,
+            "message": f"최근 체중 기록은 {latest_w:.1f}kg이에요.",
+        }
+
+    prev_d, prev_w = prev
+    delta = latest_w - prev_w
+    abs_delta = abs(delta)
+
+    if abs_delta < 0.05:
+        status = "stable"
+        msg = "최근 체중은 안정적인 편이에요."
+    elif delta > 0:
+        status = "up"
+        msg = f"최근 체중이 약 {abs_delta:.1f}kg 늘었어요."
+    else:
+        status = "down"
+        msg = f"최근 체중이 약 {abs_delta:.1f}kg 줄었어요."
+
+    return {
+        "status": status,
+        "latest": {"date": latest_d.isoformat(), "weight": latest_w},
+        "previous": {"date": prev_d.isoformat(), "weight": prev_w},
+        "deltaKg": round(delta, 2),
+        "message": msg,
+    }
+
+
+def _build_schedule_stats(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    schedules 를 이용해 '다가오는 약속'을 팩트로 만든다.
+    """
+    schedules = body.get("schedules") or body.get("schedule") or []
+    today = date.today()
+
+    upcoming: List[Tuple[date, str]] = []
+    for it in schedules:
+        if not isinstance(it, dict):
+            continue
+        title = (it.get("title") or "").strip() or "약속"
+        d = _parse_visit_date(it.get("date"))
+        if not d:
+            continue
+
+        is_upcoming = it.get("isUpcoming")
+        if is_upcoming is None:
+            is_upcoming = d >= today
+
+        if is_upcoming and d >= today:
+            upcoming.append((d, title))
+
+    upcoming.sort(key=lambda x: x[0])
+
+    if not upcoming:
+        return {
+            "upcomingCount": 0,
+            "next": None,
+            "message": "다가오는 약속이 아직 없어요.",
+        }
+
+    next_d, next_title = upcoming[0]
+    days = (next_d - today).days
+    if days == 0:
+        when = "오늘"
+    elif days == 1:
+        when = "내일"
+    else:
+        when = f"{days}일 뒤"
+
+    return {
+        "upcomingCount": len(upcoming),
+        "next": {"date": next_d.isoformat(), "title": next_title, "daysUntil": days},
+        "message": f"다가오는 약속이 {len(upcoming)}개 있어요. 가장 가까운 약속은 {when} ‘{next_title}’예요.",
+    }
 
 
 def _build_tag_stats(
@@ -806,6 +975,10 @@ def _build_tag_stats(
 
     1순위: iOS 에서 넘어온 record["tags"] 사용
     2순위: tags 가 비어 있을 때만 diagnosis/clinic_name 에서 키워드 검색
+
+    ✅ 변경:
+    - keyword 매칭(2순위)에서는 exam/test류 태그를 '추론'하지 않는다.
+      (검사는 질환이 아니라서, 기록만으로 AI가 판별하면 오해 가능성이 큼)
     """
     today = date.today()
 
@@ -818,21 +991,17 @@ def _build_tag_stats(
     }
 
     for mh in medical_history:
-        visit_str = (
-            mh.get("visitDate")
-            or mh.get("visit_date")
-            or ""
-        )
+        visit_str = mh.get("visitDate") or mh.get("visit_date") or ""
         visit_dt = _parse_visit_date(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
 
         record_tags: List[str] = mh.get("tags") or []
-
         used_codes: set[str] = set()
 
         # 1) tags 우선 사용
         if record_tags:
             for code in record_tags:
+                code = (code or "").strip()
                 cfg = CONDITION_TAGS.get(code)
                 if not cfg:
                     continue
@@ -863,11 +1032,7 @@ def _build_tag_stats(
         # 2) tags 없을 때만 diagnosis/clinic_name 키워드 매칭
         if not record_tags:
             diag = mh.get("diagnosis") or ""
-            clinic = (
-                mh.get("clinicName")
-                or mh.get("clinic_name")
-                or ""
-            )
+            clinic = mh.get("clinicName") or mh.get("clinic_name") or ""
             base_text = f"{diag} {clinic}".strip()
             if not base_text:
                 continue
@@ -875,14 +1040,18 @@ def _build_tag_stats(
             text_lower = base_text.lower()
 
             for cfg in CONDITION_TAGS.values():
+                # ✅ exam/test류는 추론(키워드 매칭) 대상에서 제외
+                if _is_exam_like_tag(cfg.code, cfg):
+                    continue
+
                 code_lower = cfg.code.lower()
                 keyword_hit = False
 
                 if code_lower in text_lower:
                     keyword_hit = True
                 else:
-                    for kw in cfg.keywords:
-                        if kw.lower() in text_lower:
+                    for kw in getattr(cfg, "keywords", []) or []:
+                        if str(kw).lower() in text_lower:
                             keyword_hit = True
                             break
 
@@ -942,69 +1111,101 @@ DEFAULT_CARE_GUIDE: Dict[str, List[str]] = {
 
 
 # ------------------------------------------------
-# 9. Gemini 기반 AI 요약 생성
+# 9. Gemini 기반 AI 요약 생성 (✅ 체중/일정 포함 + 검사태그 추론 금지)
 # ------------------------------------------------
 
 def _build_gemini_prompt(
     pet_name: str,
-    tags: List[Dict[str, Any]],
+    condition_tags: List[Dict[str, Any]],
+    exam_tags: List[Dict[str, Any]],
     period_stats: Dict[str, Dict[str, int]],
+    weight_stats: Dict[str, Any],
+    schedule_stats: Dict[str, Any],
     body: Dict[str, Any],
+    max_condition_tags: int = 4,
+    max_exam_tags: int = 3,
 ) -> str:
     profile = body.get("profile") or {}
     species = profile.get("species", "dog")
     age_text = profile.get("ageText") or profile.get("age_text") or ""
-    weight = profile.get("weightCurrent") or profile.get("weight_current")
+    weight_current = profile.get("weightCurrent") or profile.get("weight_current")
+    allergies = profile.get("allergies") or []
 
-    mh_list = body.get("medicalHistory") or []
+    # 최근 진료 요약 (최대 4개)
+    mh_list = body.get("medicalHistory") or body.get("medical_history") or []
     mh_summary_lines = []
-    for mh in mh_list[:5]:
+    for mh in mh_list[:4]:
         clinic = mh.get("clinicName") or mh.get("clinic_name") or ""
         diag = mh.get("diagnosis") or ""
         visit = mh.get("visitDate") or mh.get("visit_date") or ""
-        mh_summary_lines.append(f"- {visit} / {clinic} / {diag}")
+        mh_summary_lines.append(f"- {visit} / {clinic} / {diag}".strip())
 
-    tag_lines = []
-    for t in tags:
-        recent_dates = ", ".join(t.get("recentDates", [])[:3])
-        tag_lines.append(
-            f"- {t['label']} : {t['count']}회 (최근 기록일: {recent_dates or '정보 없음'})"
+    # 컨디션 태그 라인(Top N)
+    cond_lines = []
+    for t in (condition_tags or [])[:max_condition_tags]:
+        recent_dates = ", ".join((t.get("recentDates") or [])[:2])
+        cond_lines.append(
+            f"- {t.get('label')} ({t.get('tag')}) : {t.get('count')}회 (최근: {recent_dates or '정보 없음'})"
         )
+
+    # 검사 태그 라인(Top N)
+    exam_lines = []
+    for t in (exam_tags or [])[:max_exam_tags]:
+        recent_dates = ", ".join((t.get("recentDates") or [])[:2])
+        exam_lines.append(
+            f"- {t.get('label')} ({t.get('tag')}) : {t.get('count')}회 (최근: {recent_dates or '정보 없음'})"
+        )
+
+    # 체중/일정 팩트 라인
+    w_line = weight_stats.get("message") if isinstance(weight_stats, dict) else ""
+    s_line = schedule_stats.get("message") if isinstance(schedule_stats, dict) else ""
 
     prompt = f"""
 당신은 반려동물 건강관리 전문가입니다.
-아래 정보를 바탕으로 보호자에게 한국어로 3~5문장 정도의 간단한 설명을 해주세요.
+아래 '사실 정보'만을 바탕으로 보호자에게 한국어로 3~5문장 정도의 따뜻하고 차분한 요약을 해주세요.
 
 [반려동물 기본 정보]
 •⁠  ⁠이름: {pet_name}
 •⁠  ⁠종: {species}
 •⁠  ⁠나이 정보: {age_text or '정보 없음'}
-•⁠  ⁠현재 체중: {weight if weight is not None else '정보 없음'} kg
+•⁠  ⁠현재 체중(프로필): {weight_current if weight_current is not None else '정보 없음'} kg
+•⁠  ⁠알러지: {", ".join(allergies) if allergies else "정보 없음"}
 
-[최근 진료 태그 통계]
-{os.linesep.join(tag_lines) if tag_lines else '태그 통계 없음'}
+[체중 기록 요약(팩트)]
+{w_line or "체중 정보가 아직 부족해요."}
 
-[최근 진료 이력 요약(최대 5개)]
-{os.linesep.join(mh_summary_lines) if mh_summary_lines else '진료 내역 없음'}
+[다가오는 약속 요약(팩트)]
+{s_line or "약속 정보가 아직 없어요."}
 
-설명은 다음 가이드를 꼭 지켜주세요.
-1) 보호자에게 말하듯이 존댓말로 이야기합니다.
-2) 태그를 하나씩 짚어 주면서 어떤 의미인지, 앞으로 어떤 관리를 하면 좋은지 알려주세요.
-3) 너무 무섭게 말하지 말고, 안심시키면서 현실적인 행동 조언을 주세요.
-4) 출력은 마크다운 없이 '문장만' 출력합니다. 불릿, 번호, 따옴표, ``` 코드블록은 쓰지 마세요.
-"""
-    return prompt.strip()
+[컨디션/예방 태그 통계(기록 기반)]
+{os.linesep.join(cond_lines) if cond_lines else "해석 가능한 컨디션 태그가 아직 없어요."}
+
+[검사/영상 태그 통계(참고)]
+{os.linesep.join(exam_lines) if exam_lines else "최근 검사 태그 정보 없음"}
+
+[최근 진료 이력 요약(최대 4개)]
+{os.linesep.join(mh_summary_lines) if mh_summary_lines else "진료 내역 없음"}
+
+작성 가이드:
+1) 보호자에게 말하듯이 존댓말로, 과하게 겁주지 말고 안정감을 주세요.
+2) '컨디션/예방 태그'는 기록 카테고리이며, 태그만으로 질병을 확정하지 마세요. (단정 금지)
+3) '검사/영상 태그'는 '진단'이 아닙니다. 검사 결과를 추론하거나 병명을 만들어내지 마세요.
+4) 데이터가 부족하면 솔직히 "아직 기록이 부족해요"라고 말하고, 다음에 기록하면 좋은 항목을 1개만 제안해 주세요.
+5) 출력은 마크다운 없이 문장만 출력합니다. 불릿/번호/따옴표/코드블록을 쓰지 마세요.
+""".strip()
+
+    return prompt
 
 
 def _generate_gemini_summary(
     pet_name: str,
-    tags: List[Dict[str, Any]],
+    condition_tags: List[Dict[str, Any]],
+    exam_tags: List[Dict[str, Any]],
     period_stats: Dict[str, Dict[str, int]],
+    weight_stats: Dict[str, Any],
+    schedule_stats: Dict[str, Any],
     body: Dict[str, Any],
 ) -> Optional[str]:
-    if not tags:
-        return None
-
     if settings.GEMINI_ENABLED.lower() != "true":
         return None
     if not settings.GEMINI_API_KEY:
@@ -1012,11 +1213,24 @@ def _generate_gemini_summary(
     if genai is None:
         return None
 
+    # 기록이 너무 빈약하면 Gemini 대신 fallback이 더 안전
+    has_any_signal = bool(condition_tags) or bool(exam_tags) or bool(weight_stats) or bool(schedule_stats)
+    if not has_any_signal:
+        return None
+
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
-        prompt = _build_gemini_prompt(pet_name, tags, period_stats, body)
+        prompt = _build_gemini_prompt(
+            pet_name=pet_name,
+            condition_tags=condition_tags,
+            exam_tags=exam_tags,
+            period_stats=period_stats,
+            weight_stats=weight_stats,
+            schedule_stats=schedule_stats,
+            body=body,
+        )
         resp = model.generate_content(prompt)
 
         text = getattr(resp, "text", None)
@@ -1036,15 +1250,65 @@ def _generate_gemini_summary(
         return None
 
 
+def _fallback_summary(
+    pet_name: str,
+    has_history: bool,
+    condition_tags: List[Dict[str, Any]],
+    exam_tags: List[Dict[str, Any]],
+    weight_stats: Dict[str, Any],
+    schedule_stats: Dict[str, Any],
+) -> str:
+    """
+    ✅ Gemini가 꺼져 있거나, 방어적으로 fallback이 필요할 때 쓰는 요약.
+    (따뜻한 톤 + 과잉해석 방지)
+    """
+    pieces: List[str] = []
+
+    w_msg = (weight_stats or {}).get("message")
+    s_msg = (schedule_stats or {}).get("message")
+
+    if w_msg:
+        pieces.append(w_msg)
+    if s_msg:
+        pieces.append(s_msg)
+
+    if has_history and condition_tags:
+        top = condition_tags[0]
+        pieces.append(f"최근 기록에는 ‘{top.get('label')}’ 관련 항목이 {top.get('count')}회 있었어요.")
+    elif has_history and not condition_tags:
+        pieces.append("진료 기록은 있지만, 아직 컨디션으로 정리할 단서가 조금 더 필요해요.")
+    else:
+        pieces.append(f"{pet_name}의 기록이 아직 많지 않아요. 천천히 쌓이면 더 잘 정리해 드릴게요.")
+
+    # 검사 태그는 '사실'로만 언급
+    if exam_tags:
+        top_exam = exam_tags[0]
+        pieces.append(f"참고로 최근에 ‘{top_exam.get('label')}’ 같은 검사 기록도 있었어요.")
+
+    # 마지막은 안심 문장
+    pieces.append("오늘은 이 정도만 확인해도 충분해요. 필요한 순간에만 조금씩 기록해 주세요.")
+
+    # 3~5문장 정도로 정리
+    return " ".join(pieces[:5])
+
+
 # ------------------------------------------------
-# 10. AI 케어 분석 엔드포인트
+# 10. AI 케어 분석 엔드포인트 (✅ 태그+체중+일정 반영)
 # ------------------------------------------------
 
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(body: Dict[str, Any]):
     """
-    PetHealth+ AI 케어: iOS에서 보내는 raw JSON을 그대로 받아
-    진료 태그 기반 요약/통계 리포트를 생성.
+    PetHealth+ AI 케어:
+    - medicalHistory.tags 기반 통계(우선)
+    - 체중 흐름(recentWeights)
+    - 다가오는 약속(schedules)
+    를 함께 반영해 요약을 만든다.
+
+    ✅ 핵심 변경
+    1) weights/schedules를 실제로 읽어서 summary에 반영
+    2) exam_* 태그는 '질환/컨디션'으로 해석하지 않게 분리
+    3) Gemini 프롬프트에서 검사 결과/병명 추론 금지
     """
     try:
         print("[AI] raw body =", json.dumps(body, ensure_ascii=False))
@@ -1054,51 +1318,79 @@ async def analyze_pet_health(body: Dict[str, Any]):
     profile = body.get("profile") or {}
     pet_name = profile.get("name") or "반려동물"
 
-    medical_history = (
-        body.get("medicalHistory")
-        or body.get("medical_history")
-        or []
-    )
-
+    medical_history = body.get("medicalHistory") or body.get("medical_history") or []
     has_history = len(medical_history) > 0
 
-    tags, period_stats = _build_tag_stats(medical_history)
+    # ✅ 팩트 신호(체중/일정)
+    weight_stats = _build_weight_stats(body)
+    schedule_stats = _build_schedule_stats(body)
 
-    if not has_history:
-        summary = (
-            f"{pet_name}의 진료 기록이 없어서 현재 상태에 대한 "
-            "구체적인 조언을 드리기 어렵습니다. 진단명이 포함된 영수증을 "
-            "조금 더 기록해 주시면 통계를 만들어 드릴 수 있어요."
-        )
-    elif not tags:
-        summary = (
-            f"{pet_name}의 진료 기록은 있지만, 아직 슬개골·피부·관절 같은 "
-            "특정 컨디션 태그로 분류할 수 있는 단서가 부족해요. "
-            "영수증에 진단명이나 증상이 보이도록 기록하면 태그 통계를 만들어 드릴게요."
-        )
-    else:
-        top = tags[0]
-        summary = (
-            f"최근 진료에서 '{top['label']}' 관련 기록이 {top['count']}회 확인됐어요. "
-            "기간별 통계를 바탕으로 관리 포인트를 정리해 드렸어요."
-        )
+    # ✅ 태그 통계
+    all_tags, all_period_stats = _build_tag_stats(medical_history)
 
-        ai_summary = _generate_gemini_summary(pet_name, tags, period_stats, body)
-        if ai_summary:
-            summary = ai_summary
+    # ✅ 컨디션 태그 vs 검사 태그 분리 + periodStats도 분리
+    condition_tags, exam_tags, period_stats, exam_period_stats = _split_tag_stats(all_tags, all_period_stats)
 
+    # ✅ careGuide는 컨디션 태그에만
     care_guide: Dict[str, List[str]] = {}
-    for t in tags:
-        code = t["tag"]
+    for t in condition_tags:
+        code = t.get("tag")
         if code in DEFAULT_CARE_GUIDE:
             care_guide[code] = DEFAULT_CARE_GUIDE[code]
 
+    # ✅ 요약 생성
+    summary: str
+
+    if settings.STUB_MODE.lower() == "true":
+        summary = (
+            f"{pet_name}의 기록을 차분히 정리해 봤어요. "
+            f"{weight_stats.get('message', '')} "
+            f"{schedule_stats.get('message', '')} "
+            "오늘은 이 정도만 확인해도 충분해요."
+        ).strip()
+    else:
+        # 1) 기록이 거의 없으면 기본 문구
+        if not has_history and (weight_stats.get("status") in ("none",) and schedule_stats.get("upcomingCount") == 0):
+            summary = (
+                f"{pet_name}의 기록이 아직 많지 않아요. "
+                "필요할 때 한 줄씩만 남겨도, 다음부터는 더 잘 정리해 드릴게요."
+            )
+        else:
+            # 2) Gemini 시도 → 실패 시 fallback
+            ai_summary = _generate_gemini_summary(
+                pet_name=pet_name,
+                condition_tags=condition_tags,
+                exam_tags=exam_tags,
+                period_stats=period_stats,
+                weight_stats=weight_stats,
+                schedule_stats=schedule_stats,
+                body=body,
+            )
+            if ai_summary:
+                summary = ai_summary
+            else:
+                summary = _fallback_summary(
+                    pet_name=pet_name,
+                    has_history=has_history,
+                    condition_tags=condition_tags,
+                    exam_tags=exam_tags,
+                    weight_stats=weight_stats,
+                    schedule_stats=schedule_stats,
+                )
+
     response = {
+        # 기존 호환
         "summary": summary,
-        "tags": tags,
+        "tags": condition_tags,
         "periodStats": period_stats,
         "careGuide": care_guide,
+
+        # ✅ 추가 필드(기존 iOS에서 몰라도 무시됨)
+        "examTags": exam_tags,
+        "examPeriodStats": exam_period_stats,
+        "weightStats": weight_stats,
+        "scheduleStats": schedule_stats,
     }
 
-    print(f"[AI] response tags={len(tags)}")
+    print(f"[AI] response condition_tags={len(condition_tags)} exam_tags={len(exam_tags)}")
     return response
