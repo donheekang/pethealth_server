@@ -527,4 +527,4 @@ for alias_key, canonical_key in ALIASES.items():
         CONDITION_TAGS[alias_key] = CONDITION_TAGS[canonical_key]
 
 
-_all_ = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
+__all__ = ["ConditionTagConfig", "CONDITION_TAGS", "SpeciesType"]
