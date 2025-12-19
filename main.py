@@ -163,7 +163,7 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------------
-# 4. 영수증 파서 (Kor 파서 + AI 파서)
+# 4. 영수증 파서 (✅ 최소 추출: 병원명/날짜만)
 # ------------------------------------------------
 
 def guess_hospital_name(lines: List[str]) -> str:
@@ -206,17 +206,17 @@ def guess_hospital_name(lines: List[str]) -> str:
     return best_line or ""
 
 
-def parse_receipt_kor(text: str) -> dict:
+def parse_receipt_minimal(text: str) -> dict:
     """
-    OCR 텍스트를 한국 동물병원 영수증 형태라고 가정하고
-    병원명 / 날짜 / 항목 / 합계를 최대한 맞춰보는 파서.
+    ✅ OCR 텍스트에서 "병원명/방문일"만 안전하게 추출.
+    - items / totalAmount 추출하지 않음 (앱에서 수기 입력 & 자동합계가 더 안전)
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     # 1) 병원명 추정
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 날짜 추정
+    # 2) 날짜 추정 (시간 포함 우선)
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
@@ -237,96 +237,16 @@ def parse_receipt_kor(text: str) -> dict:
                 visit_at = datetime(y, mo, d).strftime("%Y-%m-%d")
                 break
 
-    # 3) 금액 추정
-    amt_pattern_total = re.compile(r"(?:₩|￦)?\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(원)?\s*$")
-    candidate_totals: List[int] = []
-    for line in lines:
-        m = amt_pattern_total.search(line)
-        if not m:
-            continue
-        amount_str = m.group(1).replace(",", "")
-        try:
-            amount = int(amount_str)
-        except ValueError:
-            continue
-
-        lowered = line.replace(" ", "")
-        if any(k in lowered for k in ["합계", "총액", "총금액", "합계금액", "결제요청"]):
-            candidate_totals.append(amount)
-
-    # 4) 항목 블록 추출
-    start_idx = None
-    for i, line in enumerate(lines):
-        if "[날짜" in line:
-            start_idx = i + 1
-            break
-        if ("진료" in line and "내역" in line) or ("진료 및" in line and "내역" in line):
-            start_idx = i + 1
-
-    if start_idx is None:
-        start_idx = 0
-
-    end_idx = len(lines)
-    for i in range(start_idx, len(lines)):
-        if any(k in lines[i] for k in ["소 계", "소계", "합계", "결제요청"]):
-            end_idx = i
-            break
-
-    item_block = lines[start_idx:end_idx]
-
-    names: List[str] = []
-    prices: List[int] = []
-
-    for line in item_block:
-        if any(k in line for k in ["동물명", "항목", "단가", "수량", "금액"]):
-            continue
-
-        if line.startswith("*"):
-            name = line.lstrip("*").strip().strip(".")
-            if name:
-                names.append(name)
-            continue
-
-        if re.fullmatch(r"[0-9,\s]+", line):
-            m = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)", line)
-            if m:
-                amt = int(m.group(1).replace(",", ""))
-                if amt > 0:
-                    prices.append(amt)
-            continue
-
-        m = re.search(r"(.+?)\s+(\d{1,3}(?:,\d{3})+|\d+)", line)
-        if m and ":" not in line and "[" not in line:
-            name = m.group(1).strip()
-            amt = int(m.group(2).replace(",", ""))
-            if name:
-                names.append(name)
-                prices.append(amt)
-
-    items: List[Dict[str, Any]] = []
-    pair_count = min(len(names), len(prices))
-    for i in range(pair_count):
-        items.append({"name": names[i], "amount": prices[i]})
-
-    if candidate_totals:
-        total_amount = max(candidate_totals)
-    elif prices:
-        total_amount = sum(prices)
-    else:
-        total_amount = 0
-
     return {
         "hospitalName": hospital_name,
         "visitAt": visit_at,
-        "items": items,
-        "totalAmount": total_amount,
     }
 
 
 def parse_receipt_ai(raw_text: str) -> Optional[dict]:
     """
-    Gemini를 써서 영수증을 파싱하는 버전.
-    실패하면 None을 돌려준다.
+    (유지) Gemini를 써서 영수증을 파싱하는 버전.
+    ⚠️ 현재는 "최소 입력" 정책으로 receipt에서 사용하지 않음.
     """
     if settings.GEMINI_ENABLED.lower() != "true":
         return None
@@ -340,27 +260,27 @@ def parse_receipt_ai(raw_text: str) -> Optional[dict]:
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
 
         prompt = f"""
-너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
-다음은 OCR로 읽은 영수증 텍스트야:
+        너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
+        다음은 OCR로 읽은 영수증 텍스트야:
 
-\"\"\"{raw_text}\"\"\"
+        \"\"\"{raw_text}\"\"\"
 
-이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
+        이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
 
-{{
-  "clinicName": string or null,
-  "visitDate": string or null,
-  "diseaseName": string or null,
-  "symptomsSummary": string or null,
-  "items": [
-    {{
-      "name": string,
-      "price": integer or null
-    }}
-  ],
-  "totalAmount": integer or null
-}}
-"""
+        {{
+          "clinicName": string or null,
+          "visitDate": string or null,
+          "diseaseName": string or null,
+          "symptomsSummary": string or null,
+          "items": [
+            {{
+              "name": string,
+              "price": integer or null
+            }}
+          ],
+          "totalAmount": integer or null
+        }}
+        """
 
         resp = model.generate_content(prompt)
 
@@ -474,7 +394,6 @@ def health():
         "gemini_model": settings.GEMINI_MODEL_NAME,
         "gemini_enabled": settings.GEMINI_ENABLED,
         "stub_mode": settings.STUB_MODE,
-        "keyword_tag_fallback": "disabled",  # ✅ 추정 태그(키워드 매칭) 완전 비활성
     }
 
 
@@ -482,6 +401,7 @@ def health():
 # 7. ENDPOINTS – 영수증 / PDF
 # ------------------------------------------------
 
+# (1) 영수증 업로드 & 분석
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -503,6 +423,7 @@ async def upload_receipt(
 
     key = f"receipts/{petId}/{rec_id}{ext}"
 
+    # 파일 데이터 읽기
     data = await upload.read()
     file_like = io.BytesIO(data)
     file_like.seek(0)
@@ -525,43 +446,20 @@ async def upload_receipt(
         print("OCR error:", e)
         ocr_text = ""
 
-    # 3) AI 파싱 시도 → 실패 시 정규식 파서로 Fallback
-    ai_parsed = parse_receipt_ai(ocr_text) if ocr_text else None
+    # ✅ 3) 최소 파싱: 병원명/날짜만
+    minimal = parse_receipt_minimal(ocr_text) if ocr_text else {"hospitalName": "", "visitAt": None}
 
-    use_ai = False
-    if ai_parsed:
-        ai_items = ai_parsed.get("items") or []
-        ai_total = ai_parsed.get("totalAmount") or 0
-        if len(ai_items) > 0 and ai_total > 0:
-            use_ai = True
+    parsed_for_dto = {
+        "clinicName": (minimal.get("hospitalName") or "").strip(),
+        "visitDate": minimal.get("visitAt"),
+        # ✅ 아래는 "자동 입력" 안 함 (앱에서 수기 입력/자동 합계)
+        "diseaseName": None,
+        "symptomsSummary": None,
+        "items": [],
+        "totalAmount": None,
+    }
 
-    if use_ai:
-        parsed_for_dto = ai_parsed
-    else:
-        fallback = (
-            parse_receipt_kor(ocr_text)
-            if ocr_text
-            else {"hospitalName": "", "visitAt": None, "items": [], "totalAmount": 0}
-        )
-
-        dto_items = []
-        for it in fallback.get("items", []):
-            dto_items.append(
-                {
-                    "name": it.get("name", "항목"),
-                    "price": it.get("amount") or 0,
-                }
-            )
-
-        parsed_for_dto = {
-            "clinicName": fallback.get("hospitalName"),
-            "visitDate": fallback.get("visitAt"),
-            "diseaseName": None,
-            "symptomsSummary": None,
-            "items": dto_items,
-            "totalAmount": fallback.get("totalAmount"),
-        }
-
+    # 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
@@ -570,11 +468,12 @@ async def upload_receipt(
         "petId": petId,
         "s3Url": file_url,
         "parsed": parsed_for_dto,
-        "notes": ocr_text,
+        "notes": ocr_text,     # (선택) 디버그/재파싱용
         "objectKey": key,
     }
 
 
+# (2) PDF 업로드 (검사/증명서)
 @app.post("/lab/upload-pdf")
 @app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
@@ -637,6 +536,7 @@ async def upload_cert_pdf(
     }
 
 
+# (2-1) PDF 삭제
 @app.delete("/lab/delete")
 @app.delete("/labs/delete")
 @app.delete("/api/lab/delete")
@@ -675,6 +575,7 @@ def delete_cert_pdf(
     return {"ok": True, "deletedKey": key}
 
 
+# (3) 검사/증명서 리스트 조회
 @app.get("/lab/list")
 @app.get("/labs/list")
 @app.get("/api/lab/list")
@@ -784,47 +685,25 @@ def _parse_visit_date(s: Optional[str]) -> Optional[date]:
             return None
 
 
-def _canonicalize_tag_code(raw_code: str) -> Optional[str]:
-    """
-    입력된 태그 코드(raw)가 alias/canonical 어떤 형태든,
-    CONDITION_TAGS에서 찾은 cfg.code(=canonical snake_case)로 정규화.
-    못 찾으면 None.
-    """
-    if not raw_code:
-        return None
-    code = raw_code.strip()
-    if not code:
-        return None
-
-    cfg = CONDITION_TAGS.get(code)
-    if cfg:
-        return getattr(cfg, "code", code)
-
-    # 약간의 방어(문자 변형 케이스)
-    code2 = code.replace("-", "_").strip()
-    cfg = CONDITION_TAGS.get(code2)
-    if cfg:
-        return getattr(cfg, "code", code2)
-
-    return None
-
-
 def _build_tag_stats(
     medical_history: List[Dict[str, Any]]
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
     """
-    ✅ 안전 모드(프리미엄/신뢰 우선):
-    - 1순위: iOS에서 넘어온 record["tags"]만 사용
-    - ❌ 2순위(추정): diagnosis/clinic_name 키워드 매칭은 완전 비활성
+    ✅ record.tags(서버 코드)만 사용해서 통계 생성.
+    ❌ diagnosis/clinic_name 기반 "키워드 추정"은 완전 제거 (안전/신뢰 우선)
 
-    반환:
-    - tags: [{tag, label, count, recentDates}]
+    - tags: [{tag, label, group, count, recentDates}]
     - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
     """
     today = date.today()
 
     agg: Dict[str, Dict[str, Any]] = {}
-    period_stats: Dict[str, Dict[str, int]] = {"1m": {}, "3m": {}, "1y": {}}
+
+    period_stats: Dict[str, Dict[str, int]] = {
+        "1m": {},
+        "3m": {},
+        "1y": {},
+    }
 
     for mh in medical_history:
         visit_str = mh.get("visitDate") or mh.get("visit_date") or ""
@@ -832,29 +711,27 @@ def _build_tag_stats(
         visit_date_str = visit_dt.isoformat() if visit_dt else None
 
         record_tags: List[str] = mh.get("tags") or []
+        if not record_tags:
+            continue
+
         used_codes: set[str] = set()
 
-        # ✅ tags만 사용 (추정 매칭 OFF)
-        for raw in record_tags:
-            canonical = _canonicalize_tag_code(raw)
-            if not canonical:
-                continue
-
-            cfg = CONDITION_TAGS.get(canonical)
+        for code in record_tags:
+            cfg = CONDITION_TAGS.get(code)
             if not cfg:
-                # canonical 키가 dict에 없을 수도 있어 방어
-                # (하지만 네 condition_tags.py 구조면 canonical 키는 반드시 있음)
                 continue
 
-            if canonical in used_codes:
+            canonical_code = cfg.code  # alias가 들어와도 canonical code로 집계
+            if canonical_code in used_codes:
                 continue
-            used_codes.add(canonical)
+            used_codes.add(canonical_code)
 
             stat = agg.setdefault(
-                canonical,
+                canonical_code,
                 {
-                    "tag": canonical,
-                    "label": getattr(cfg, "label", canonical),
+                    "tag": canonical_code,
+                    "label": cfg.label,
+                    "group": getattr(cfg, "group", ""),
                     "count": 0,
                     "recentDates": [],
                 },
@@ -866,63 +743,17 @@ def _build_tag_stats(
             if visit_dt:
                 days = (today - visit_dt).days
                 if days <= 365:
-                    period_stats["1y"][canonical] = period_stats["1y"].get(canonical, 0) + 1
+                    period_stats["1y"][canonical_code] = period_stats["1y"].get(canonical_code, 0) + 1
                 if days <= 90:
-                    period_stats["3m"][canonical] = period_stats["3m"].get(canonical, 0) + 1
+                    period_stats["3m"][canonical_code] = period_stats["3m"].get(canonical_code, 0) + 1
                 if days <= 30:
-                    period_stats["1m"][canonical] = period_stats["1m"].get(canonical, 0) + 1
+                    period_stats["1m"][canonical_code] = period_stats["1m"].get(canonical_code, 0) + 1
 
     for stat in agg.values():
         stat["recentDates"] = sorted(stat["recentDates"], reverse=True)
 
     tags = sorted(agg.values(), key=lambda x: x["count"], reverse=True)
     return tags, period_stats
-
-
-def _summarize_recent_weights(body: Dict[str, Any]) -> List[str]:
-    """
-    recentWeights를 사람이 읽을 수 있는 한 줄 요약 리스트로 변환.
-    예: ["2025-12-03: 8.1kg", "2025-12-19: 8.2kg"]
-    """
-    rows = body.get("recentWeights") or body.get("recent_weights") or []
-    parsed: List[Tuple[datetime, float]] = []
-    for r in rows:
-        try:
-            ds = (r.get("date") or "").strip()
-            w = r.get("weight")
-            if not ds or w is None:
-                continue
-            dt = datetime.strptime(ds, "%Y-%m-%d")
-            parsed.append((dt, float(w)))
-        except Exception:
-            continue
-
-    parsed.sort(key=lambda x: x[0])
-    return [f"{dt.strftime('%Y-%m-%d')}: {w:.1f}kg" for dt, w in parsed[-6:]]
-
-
-def _summarize_schedules(body: Dict[str, Any]) -> List[str]:
-    """
-    schedules에서 isUpcoming=True 위주로 가까운 일정 몇 개를 요약.
-    예: ["2025-12-24: 종합백신", "2026-01-09: 심장사상충"]
-    """
-    rows = body.get("schedules") or []
-    parsed: List[Tuple[datetime, str]] = []
-    for r in rows:
-        try:
-            title = (r.get("title") or "").strip() or "일정"
-            ds = (r.get("date") or "").strip()
-            if not ds:
-                continue
-            is_upcoming = bool(r.get("isUpcoming", False))
-            dt = datetime.strptime(ds, "%Y-%m-%d")
-            if is_upcoming:
-                parsed.append((dt, title))
-        except Exception:
-            continue
-
-    parsed.sort(key=lambda x: x[0])
-    return [f"{dt.strftime('%Y-%m-%d')}: {title}" for dt, title in parsed[:5]]
 
 
 # ------------------------------------------------
@@ -940,60 +771,49 @@ def _build_gemini_prompt(
     age_text = profile.get("ageText") or profile.get("age_text") or ""
     weight = profile.get("weightCurrent") or profile.get("weight_current")
 
-    mh_list = body.get("medicalHistory") or body.get("medical_history") or []
+    mh_list = body.get("medicalHistory") or []
     mh_summary_lines = []
-    for mh in mh_list[:5]:
+    for mh in mh_list[:8]:
         clinic = mh.get("clinicName") or mh.get("clinic_name") or ""
-        diag = mh.get("diagnosis") or ""
         visit = mh.get("visitDate") or mh.get("visit_date") or ""
-        # diagnosis가 비어도 괜찮게
-        mh_summary_lines.append(f"- {visit} / {clinic} / {diag}")
+        tag_list = mh.get("tags") or []
+        mh_summary_lines.append(f"- {visit} / {clinic} / tags={tag_list}")
 
     tag_lines = []
     for t in tags:
-        code = t.get("tag")
-        cfg = CONDITION_TAGS.get(code) if code else None
-        group = getattr(cfg, "group", "") if cfg else ""
         recent_dates = ", ".join(t.get("recentDates", [])[:3])
+        group = t.get("group") or ""
         tag_lines.append(
-            f"- {t.get('label','')} ({group}) : {t.get('count',0)}회 (최근 기록일: {recent_dates or '정보 없음'})"
+            f"- {t['label']} ({t['tag']}, group={group}) : {t['count']}회 (최근: {recent_dates or '정보 없음'})"
         )
 
-    weight_lines = _summarize_recent_weights(body)
-    schedule_lines = _summarize_schedules(body)
-
     prompt = f"""
-당신은 반려동물 건강관리 전문가입니다.
-아래 제공된 정보만을 근거로 보호자에게 한국어로 3~6문장 정도의 간단한 설명을 해주세요.
+당신은 반려동물 건강 기록을 '정리/요약'해 주는 어시스턴트입니다.
+아래 입력은 보호자가 앱에서 직접 기록한 태그(확정 정보)입니다.
+
+[중요 규칙]
+1) 아래 '태그'에 없는 질환/컨디션을 새로 추정하거나 만들어내지 마세요.
+2) group=exam/medication/procedure 태그는 '질환 진단'이 아니라 검사/처방/시술 기록입니다. 이를 근거로 질환을 단정하지 마세요.
+3) 의료적 진단/판단을 하지 말고, 보호자 관점의 정리/안심/현실적인 관리 팁만 제공하세요.
+4) 출력은 마크다운 없이 '문장만' 출력합니다. 불릿/번호/따옴표/코드블록 금지.
 
 [반려동물 기본 정보]
 이름: {pet_name}
 종: {species}
-나이 정보: {age_text or '정보 없음'}
+나이: {age_text or '정보 없음'}
 현재 체중: {weight if weight is not None else '정보 없음'} kg
 
-[최근 체중 기록(최대 6개)]
-{os.linesep.join(weight_lines) if weight_lines else '체중 기록 없음'}
+[확정 태그 통계]
+{os.linesep.join(tag_lines) if tag_lines else '태그 없음'}
 
-[다가오는 일정(최대 5개)]
-{os.linesep.join(schedule_lines) if schedule_lines else '다가오는 일정 없음'}
-
-[최근 진료 태그 통계]
-{os.linesep.join(tag_lines) if tag_lines else '태그 통계 없음'}
-
-[최근 진료 이력 요약(최대 5개)]
+[최근 진료 이력 요약(최대 8개)]
 {os.linesep.join(mh_summary_lines) if mh_summary_lines else '진료 내역 없음'}
 
-반드시 지켜야 할 규칙:
-1) 제공된 태그/진료이력/체중/일정 정보에 없는 질환명, 검사명, 진단을 새로 추측하거나 만들어내지 마세요.
-2) 태그 그룹 해석:
-   - group이 exam/medication/procedure인 태그는 '검사/처치/처방 기록'입니다. 이것만으로 질환을 추론하지 마세요.
-   - group이 preventive인 태그는 '예방 관리'입니다. 일정/주기 관리 관점으로만 안내하세요.
-   - dermatology/orthopedics/cardiology/wellness 등은 '관리 포인트'로 부드럽게 정리하세요.
-3) 너무 무섭게 말하지 말고, 안심시키면서 현실적인 관리 조언을 1~2개만 제안하세요.
-4) 출력은 마크다운 없이 문장만 출력하세요. 불릿/번호/따옴표/코드블록을 쓰지 마세요.
-"""
-    return prompt.strip()
+요약은 3~5문장으로 짧게 작성해 주세요.
+너무 무섭게 말하지 말고, "잘 관리되고 있다"는 안정감을 주는 톤으로 작성해 주세요.
+""".strip()
+
+    return prompt
 
 
 def _generate_gemini_summary(
@@ -1009,6 +829,7 @@ def _generate_gemini_summary(
     if genai is None:
         return None
 
+    # ✅ tags가 비어도(기록이 없더라도) 요약은 가능하도록 열어둠
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
@@ -1040,8 +861,9 @@ def _generate_gemini_summary(
 @app.post("/api/ai/analyze")
 async def analyze_pet_health(body: Dict[str, Any]):
     """
-    PetHealth+ AI 케어: iOS에서 보내는 raw JSON을 그대로 받아
-    ✅ record.tags 기반으로만 통계/요약 리포트를 생성 (추정 태그 OFF)
+    PetHealth+ AI 케어:
+    - ✅ record.tags(확정 태그)만 기반으로 통계/요약 생성
+    - ❌ diagnosis/clinic_name 키워드 추정 OFF
     """
     try:
         print("[AI] raw body =", json.dumps(body, ensure_ascii=False))
@@ -1056,46 +878,43 @@ async def analyze_pet_health(body: Dict[str, Any]):
 
     tags, period_stats = _build_tag_stats(medical_history)
 
-    # tags 기반 케어 가이드: condition_tags.py의 guide 사용
+    # 케어 가이드: condition_tags.py의 guide를 그대로 사용
     care_guide: Dict[str, List[str]] = {}
     for t in tags:
-        code = t.get("tag")
-        cfg = CONDITION_TAGS.get(code) if code else None
-        guide = getattr(cfg, "guide", None) if cfg else None
-        if code and guide:
-            care_guide[code] = guide
+        code = t["tag"]
+        cfg = CONDITION_TAGS.get(code)
+        if cfg and getattr(cfg, "guide", None):
+            care_guide[code] = list(cfg.guide)
 
-    # 기본 summary (Gemini 없거나 데이터 부족 시)
-    if not has_history:
-        summary = (
-            f"{pet_name}의 진료 기록이 아직 많지 않아요. "
-            "진료기록을 남길 때 태그를 함께 선택해 주시면, "
-            "다음부터는 컨디션별로 더 정확하게 정리해 드릴게요."
-        )
-    elif not tags:
-        summary = (
-            f"{pet_name}의 진료 기록은 있지만, 태그가 비어 있어 통계를 만들기 어려워요. "
-            "기록 저장 시 컨디션/예방/검사 태그를 선택해 주시면 "
-            "홈과 분석 화면에서 더 정확히 정리해 드릴게요."
-        )
-    else:
-        top = tags[0]
-        summary = (
-            f"최근 기록에서 '{top.get('label','')}' 관련 태그가 {top.get('count',0)}회 확인됐어요. "
-            "기록을 바탕으로 관리 포인트를 정리해 드렸어요."
-        )
-
-    # Gemini 요약(있으면 덮어씀) - 단, 규칙에 따라 '추측/환각' 최소화
+    # 요약 문장 (Gemini 우선, 없으면 규칙 기반)
     ai_summary = _generate_gemini_summary(pet_name, tags, period_stats, body)
+
     if ai_summary:
         summary = ai_summary
+    else:
+        if not has_history:
+            summary = (
+                f"{pet_name}의 병원 기록이 아직 많지 않아요. "
+                "필요할 때 한 줄씩만 남겨도, 다음부터는 더 잘 정리해 드릴게요."
+            )
+        elif not tags:
+            summary = (
+                f"{pet_name}의 병원 기록은 있지만, "
+                "아직 확정 태그가 저장된 기록이 없어서 컨디션별 통계를 만들기 어려워요. "
+                "기록할 때 태그가 함께 저장되면 더 정확하게 정리해 드릴게요."
+            )
+        else:
+            top = tags[0]
+            summary = (
+                f"최근 기록에서 '{top['label']}' 관련 태그가 {top['count']}회 확인됐어요. "
+                "기록을 바탕으로 관리 포인트를 차분히 정리해 드렸어요."
+            )
 
     response = {
         "summary": summary,
         "tags": tags,
         "periodStats": period_stats,
         "careGuide": care_guide,
-        "tagFallback": "disabled",  # 디버그/신뢰 표시
     }
 
     print(f"[AI] response tags={len(tags)}")
