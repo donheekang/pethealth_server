@@ -1,26 +1,33 @@
-# main.py
-
 import os
 import io
 import json
 import uuid
 import tempfile
 import re
-from datetime import datetime, timedelta, date
+import base64
+from datetime import datetime, date
 from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 from google.cloud import vision
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
+
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Firebase Admin (Auth only)
+import firebase_admin
+from firebase_admin import credentials as fb_credentials
+from firebase_admin import auth as fb_auth
+
 
 # ------------------------------------------------
 # 1. 설정 / 외부 모듈
 # ------------------------------------------------
-
 try:
     from condition_tags import CONDITION_TAGS
 except ImportError:
@@ -35,32 +42,143 @@ except ImportError:
 
 
 class Settings(BaseSettings):
+    # --- AWS / S3 ---
     AWS_ACCESS_KEY_ID: str
     AWS_SECRET_ACCESS_KEY: str
-    AWS_REGION: str
+    AWS_REGION: str = "ap-northeast-2"
     S3_BUCKET_NAME: str
 
-    # Google Vision
-    GOOGLE_APPLICATION_CREDENTIALS: str = ""
+    # --- Google Vision ---
+    # Render에서는 JSON 전문을 환경변수로 넣는 경우가 많아서 문자열(JSON)도 허용
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""  # JSON string or file path
 
-    # Gemini
-    GEMINI_ENABLED: str = "false"        # "true" / "false"
+    # --- Gemini ---
+    GEMINI_ENABLED: str = "false"  # "true"/"false"
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
 
-    # 디버그용 스텁 모드
-    STUB_MODE: str = "false"
+    # --- Firebase Auth (verify ID token) ---
+    AUTH_REQUIRED: str = "true"  # "true"/"false"
+    FIREBASE_ADMIN_SA_JSON: str = ""  # service account JSON string
+    FIREBASE_ADMIN_SA_B64: str = ""   # base64-encoded JSON string (optional)
 
-    class Config:
-        env_file = ".env"
+    # --- 디버그용 스텁 모드 ---
+    STUB_MODE: str = "false"  # "true"면 인증/외부 호출 일부를 우회 가능
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
 
-# ------------------------------------------------
-# 2. S3 클라이언트
-# ------------------------------------------------
 
+# ------------------------------------------------
+# 2. Firebase Admin 초기화 & 인증 의존성
+# ------------------------------------------------
+_firebase_initialized = False
+auth_scheme = HTTPBearer(auto_error=False)
+
+
+def _normalize_private_key_newlines(info: dict) -> dict:
+    """
+    일부 배포 환경에서 private_key가 '\\n' 형태로 남아있는 경우를 대비해 정규화.
+    """
+    if not isinstance(info, dict):
+        return info
+    pk = info.get("private_key")
+    if isinstance(pk, str) and "\\n" in pk:
+        info["private_key"] = pk.replace("\\n", "\n")
+    return info
+
+
+def _load_firebase_service_account() -> Optional[dict]:
+    """
+    Render 환경변수에 넣은 Firebase Admin 서비스계정 JSON을 안전하게 로딩.
+    우선순위:
+      1) FIREBASE_ADMIN_SA_JSON (plain JSON)
+      2) FIREBASE_ADMIN_SA_B64  (base64 JSON)
+    """
+    if settings.FIREBASE_ADMIN_SA_JSON:
+        try:
+            info = json.loads(settings.FIREBASE_ADMIN_SA_JSON)
+        except Exception as e:
+            raise RuntimeError(f"FIREBASE_ADMIN_SA_JSON JSON 파싱 실패: {e}")
+        return _normalize_private_key_newlines(info)
+
+    if settings.FIREBASE_ADMIN_SA_B64:
+        try:
+            raw = base64.b64decode(settings.FIREBASE_ADMIN_SA_B64).decode("utf-8")
+            info = json.loads(raw)
+        except Exception as e:
+            raise RuntimeError(f"FIREBASE_ADMIN_SA_B64 디코드/파싱 실패: {e}")
+        return _normalize_private_key_newlines(info)
+
+    return None
+
+
+def init_firebase_admin() -> None:
+    global _firebase_initialized
+    if _firebase_initialized:
+        return
+
+    # STUB_MODE거나 AUTH_REQUIRED=false면 초기화 생략 가능
+    if settings.STUB_MODE.lower() == "true" or settings.AUTH_REQUIRED.lower() != "true":
+        print("[Auth] Firebase init skipped (STUB_MODE or AUTH_REQUIRED=false).")
+        _firebase_initialized = True
+        return
+
+    info = _load_firebase_service_account()
+    if not info:
+        raise RuntimeError(
+            "Firebase Auth가 활성화(AUTH_REQUIRED=true)인데, "
+            "FIREBASE_ADMIN_SA_JSON 또는 FIREBASE_ADMIN_SA_B64가 비어있습니다."
+        )
+
+    try:
+        cred = fb_credentials.Certificate(info)
+        firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        print("[Auth] Firebase Admin initialized.")
+    except Exception as e:
+        raise RuntimeError(f"Firebase Admin initialize 실패: {e}")
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
+) -> Dict[str, Any]:
+    """
+    Authorization: Bearer <Firebase ID Token>
+    을 검증하고, decoded token dict를 반환.
+    """
+    # STUB_MODE면 임시 유저 반환 (로컬 테스트용)
+    if settings.STUB_MODE.lower() == "true" or settings.AUTH_REQUIRED.lower() != "true":
+        return {"uid": "dev", "email": "dev@example.com"}
+
+    init_firebase_admin()
+
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+
+    token = credentials.credentials
+    try:
+        decoded = fb_auth.verify_id_token(token)
+        return decoded
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
+
+
+def _user_prefix(user_uid: str, pet_id: str) -> str:
+    """
+    ✅ S3 키를 사용자(uid) 단위로 네임스페이스 분리.
+    - petId만 믿으면 다른 유저가 다른 petId를 넣어 접근할 수 있어서 위험.
+    """
+    safe_uid = re.sub(r"[^a-zA-Z0-9_\-]", "_", user_uid or "unknown")
+    safe_pet = re.sub(r"[^a-zA-Z0-9_\-]", "_", pet_id or "unknown")
+    return f"users/{safe_uid}/pets/{safe_pet}"
+
+
+# ------------------------------------------------
+# 3. S3 클라이언트
+# ------------------------------------------------
 s3_client = boto3.client(
     "s3",
     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
@@ -119,10 +237,16 @@ def delete_from_s3(key: str) -> None:
 
 
 # ------------------------------------------------
-# 3. Google Vision OCR
+# 4. Google Vision OCR
 # ------------------------------------------------
+_vision_client: Optional[vision.ImageAnnotatorClient] = None
+
 
 def get_vision_client() -> vision.ImageAnnotatorClient:
+    global _vision_client
+    if _vision_client is not None:
+        return _vision_client
+
     cred_value = settings.GOOGLE_APPLICATION_CREDENTIALS
     if not cred_value:
         raise Exception("GOOGLE_APPLICATION_CREDENTIALS 환경변수가 비어있습니다.")
@@ -130,7 +254,10 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
     try:
         # JSON 문자열로 넘어온 경우
         info = json.loads(cred_value)
-        return vision.ImageAnnotatorClient.from_service_account_info(info)
+        if isinstance(info, dict) and isinstance(info.get("private_key"), str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        _vision_client = vision.ImageAnnotatorClient.from_service_account_info(info)
+        return _vision_client
     except json.JSONDecodeError:
         # 파일 경로로 넘어온 경우
         if not os.path.exists(cred_value):
@@ -138,7 +265,8 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
                 "GOOGLE_APPLICATION_CREDENTIALS가 JSON도 아니고, "
                 f"파일 경로({cred_value})도 아닙니다."
             )
-        return vision.ImageAnnotatorClient.from_service_account_file(cred_value)
+        _vision_client = vision.ImageAnnotatorClient.from_service_account_file(cred_value)
+        return _vision_client
     except Exception as e:
         raise Exception(f"OCR 클라이언트 생성 실패: {e}")
 
@@ -163,9 +291,8 @@ def run_vision_ocr(image_path: str) -> str:
 
 
 # ------------------------------------------------
-# 4. 영수증 파서 (✅ 최소 추출: 병원명/날짜만)
+# 5. 영수증 파서 (✅ 최소 추출: 병원명/날짜만)
 # ------------------------------------------------
-
 def guess_hospital_name(lines: List[str]) -> str:
     keywords = [
         "동물병원", "동물 병원", "동물의료", "동물메디컬", "동물 메디컬",
@@ -209,14 +336,12 @@ def guess_hospital_name(lines: List[str]) -> str:
 def parse_receipt_minimal(text: str) -> dict:
     """
     ✅ OCR 텍스트에서 "병원명/방문일"만 안전하게 추출.
-    - items / totalAmount 추출하지 않음 (앱에서 수기 입력 & 자동합계가 더 안전)
+    - items / totalAmount 추출하지 않음
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # 1) 병원명 추정
     hospital_name = guess_hospital_name(lines)
 
-    # 2) 날짜 추정 (시간 포함 우선)
     visit_at = None
     dt_pattern = re.compile(
         r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2}).*?(\d{1,2}):(\d{2})"
@@ -243,91 +368,12 @@ def parse_receipt_minimal(text: str) -> dict:
     }
 
 
-def parse_receipt_ai(raw_text: str) -> Optional[dict]:
-    """
-    (유지) Gemini를 써서 영수증을 파싱하는 버전.
-    ⚠️ 현재는 "최소 입력" 정책으로 receipt에서 사용하지 않음.
-    """
-    if settings.GEMINI_ENABLED.lower() != "true":
-        return None
-    if not settings.GEMINI_API_KEY:
-        return None
-    if genai is None:
-        return None
-
-    try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
-
-        prompt = f"""
-        너는 한국 동물병원 영수증을 구조화된 JSON으로 정리하는 어시스턴트야.
-        다음은 OCR로 읽은 영수증 텍스트야:
-
-        \"\"\"{raw_text}\"\"\"
-
-        이 텍스트를 분석해서 아래 형식의 JSON만 돌려줘.
-
-        {{
-          "clinicName": string or null,
-          "visitDate": string or null,
-          "diseaseName": string or null,
-          "symptomsSummary": string or null,
-          "items": [
-            {{
-              "name": string,
-              "price": integer or null
-            }}
-          ],
-          "totalAmount": integer or null
-        }}
-        """
-
-        resp = model.generate_content(prompt)
-
-        text = getattr(resp, "text", None)
-        if not text and getattr(resp, "candidates", None):
-            parts = resp.candidates[0].content.parts
-            text = "".join(getattr(p, "text", "") for p in parts)
-
-        text = (text or "").strip()
-
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1:
-            text = text[start:end + 1]
-
-        data = json.loads(text)
-
-        for key in ["clinicName", "visitDate", "items", "totalAmount"]:
-            if key not in data:
-                return None
-
-        if not isinstance(data.get("items"), list):
-            data["items"] = []
-
-        fixed_items = []
-        for it in data["items"]:
-            if isinstance(it, dict):
-                name = it.get("name", "항목")
-                price = it.get("price") or 0
-                fixed_items.append({"name": str(name), "price": int(price)})
-        data["items"] = fixed_items
-
-        return data
-
-    except Exception as e:
-        print("parse_receipt_ai error:", e)
-        return None
-
-
 # ------------------------------------------------
-# 5. DTO 정의 (현재는 참고용)
+# 6. DTO (참고용)
 # ------------------------------------------------
-
 class CamelBase(BaseModel):
     class Config:
-        allow_population_by_field_name = True
-        orm_mode = True
+        populate_by_name = True
         extra = "ignore"
 
 
@@ -367,18 +413,29 @@ class AICareRequest(CamelBase):
 
 
 # ------------------------------------------------
-# 6. FASTAPI APP SETUP
+# 7. FASTAPI APP
 # ------------------------------------------------
-
-app = FastAPI(title="PetHealth+ Server", version="1.2.0")
+app = FastAPI(title="PetHealth+ Server", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 운영에서는 도메인 제한 권장
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _startup():
+    # AUTH_REQUIRED=true이면 startup 시점에 Firebase 초기화 시도 (빠르게 오류 탐지)
+    if settings.AUTH_REQUIRED.lower() == "true" and settings.STUB_MODE.lower() != "true":
+        try:
+            init_firebase_admin()
+        except Exception as e:
+            print("[Startup] Firebase init failed:", e)
+    else:
+        print("[Startup] Auth not required or STUB_MODE. Skipping Firebase init.")
 
 
 @app.get("/")
@@ -394,14 +451,18 @@ def health():
         "gemini_model": settings.GEMINI_MODEL_NAME,
         "gemini_enabled": settings.GEMINI_ENABLED,
         "stub_mode": settings.STUB_MODE,
+        "auth_required": settings.AUTH_REQUIRED,
     }
 
 
-# ------------------------------------------------
-# 7. ENDPOINTS – 영수증 / PDF
-# ------------------------------------------------
+@app.get("/api/me")
+def me(user: Dict[str, Any] = Depends(get_current_user)):
+    return {"uid": user.get("uid"), "email": user.get("email")}
 
-# (1) 영수증 업로드 & 분석
+
+# ------------------------------------------------
+# 8. ENDPOINTS – 영수증 / PDF
+# ------------------------------------------------
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -411,31 +472,31 @@ async def upload_receipt(
     petId: str = Form(...),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
+    user: Dict[str, Any] = Depends(get_current_user),
 ):
     upload: Optional[UploadFile] = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail="no file or image field")
+
+    uid = user.get("uid") or "unknown"
 
     rec_id = str(uuid.uuid4())
     _, ext = os.path.splitext(upload.filename or "")
     if not ext:
         ext = ".jpg"
 
-    key = f"receipts/{petId}/{rec_id}{ext}"
+    key = f"{_user_prefix(uid, petId)}/receipts/{rec_id}{ext}"
 
-    # 파일 데이터 읽기
     data = await upload.read()
     file_like = io.BytesIO(data)
     file_like.seek(0)
 
-    # 1) S3 업로드
     file_url = upload_to_s3(
         file_like,
         key,
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR 실행
     ocr_text = ""
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
@@ -446,34 +507,31 @@ async def upload_receipt(
         print("OCR error:", e)
         ocr_text = ""
 
-    # ✅ 3) 최소 파싱: 병원명/날짜만
     minimal = parse_receipt_minimal(ocr_text) if ocr_text else {"hospitalName": "", "visitAt": None}
 
     parsed_for_dto = {
         "clinicName": (minimal.get("hospitalName") or "").strip(),
         "visitDate": minimal.get("visitAt"),
-        # ✅ 아래는 "자동 입력" 안 함 (앱에서 수기 입력/자동 합계)
         "diseaseName": None,
         "symptomsSummary": None,
         "items": [],
         "totalAmount": None,
     }
 
-    # 병원명 앞의 '원 명:' 같은 접두어 제거
     clinic_name = (parsed_for_dto.get("clinicName") or "").strip()
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
 
     return {
+        "uid": uid,
         "petId": petId,
         "s3Url": file_url,
         "parsed": parsed_for_dto,
-        "notes": ocr_text,     # (선택) 디버그/재파싱용
+        "notes": ocr_text,
         "objectKey": key,
     }
 
 
-# (2) PDF 업로드 (검사/증명서)
 @app.post("/lab/upload-pdf")
 @app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
@@ -483,10 +541,14 @@ async def upload_lab_pdf(
     title: str = Form("검사결과"),
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(get_current_user),
 ):
+    uid = user.get("uid") or "unknown"
+
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
-    safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
-    key = f"lab/{petId}/{safe_base}{uuid.uuid4()}.pdf"
+    safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
+
+    key = f"{user_prefix(uid, petId)}/lab/{safe_base}{uuid.uuid4().hex}.pdf"
 
     url = upload_to_s3(file.file, key, "application/pdf")
     created_at_iso = datetime.utcnow().isoformat()
@@ -496,8 +558,9 @@ async def upload_lab_pdf(
 
     return {
         "id": base_name,
+        "uid": uid,
         "petId": petId,
-        "title": original_base,
+        "title": title or original_base,
         "memo": memo,
         "s3Url": url,
         "createdAt": created_at_iso,
@@ -514,10 +577,14 @@ async def upload_cert_pdf(
     title: str = Form("증명서"),
     memo: Optional[str] = Form(None),
     file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(get_current_user),
 ):
+    uid = user.get("uid") or "unknown"
+
     original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
-    safe_base = original_base.replace("/", "").replace("\\", "").replace(" ", "_")
-    key = f"cert/{petId}/{safe_base}{uuid.uuid4()}.pdf"
+    safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
+
+    key = f"{user_prefix(uid, petId)}/cert/{safe_base}{uuid.uuid4().hex}.pdf"
 
     url = upload_to_s3(file.file, key, "application/pdf")
     created_at_iso = datetime.utcnow().isoformat()
@@ -527,8 +594,9 @@ async def upload_cert_pdf(
 
     return {
         "id": base_name,
+        "uid": uid,
         "petId": petId,
-        "title": original_base,
+        "title": title or original_base,
         "memo": memo,
         "s3Url": url,
         "createdAt": created_at_iso,
@@ -536,7 +604,6 @@ async def upload_cert_pdf(
     }
 
 
-# (2-1) PDF 삭제
 @app.delete("/lab/delete")
 @app.delete("/labs/delete")
 @app.delete("/api/lab/delete")
@@ -544,13 +611,16 @@ async def upload_cert_pdf(
 def delete_lab_pdf(
     petId: str = Query(...),
     id: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
 ):
+    uid = user.get("uid") or "unknown"
+
     object_id = (id or "").strip()
     if not object_id:
         raise HTTPException(status_code=400, detail="id is required")
 
     filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
-    key = f"lab/{petId}/{filename}"
+    key = f"{_user_prefix(uid, petId)}/lab/{filename}"
 
     delete_from_s3(key)
     return {"ok": True, "deletedKey": key}
@@ -563,30 +633,35 @@ def delete_lab_pdf(
 def delete_cert_pdf(
     petId: str = Query(...),
     id: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
 ):
+    uid = user.get("uid") or "unknown"
+
     object_id = (id or "").strip()
     if not object_id:
         raise HTTPException(status_code=400, detail="id is required")
 
     filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
-    key = f"cert/{petId}/{filename}"
+    key = f"{_user_prefix(uid, petId)}/cert/{filename}"
 
     delete_from_s3(key)
     return {"ok": True, "deletedKey": key}
 
 
-# (3) 검사/증명서 리스트 조회
 @app.get("/lab/list")
 @app.get("/labs/list")
 @app.get("/api/lab/list")
 @app.get("/api/labs/list")
-def get_lab_list(petId: str = Query(...)):
-    prefix = f"lab/{petId}/"
-    response = s3_client.list_objects_v2(
-        Bucket=settings.S3_BUCKET_NAME, Prefix=prefix
-    )
+def get_lab_list(
+    petId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or "unknown"
 
-    items = []
+    prefix = f"{_user_prefix(uid, petId)}/lab/"
+    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
+
+    items: List[Dict[str, Any]] = []
     if "Contents" in response:
         for obj in response["Contents"]:
             key = obj["Key"]
@@ -603,12 +678,13 @@ def get_lab_list(petId: str = Query(...)):
             url = s3_client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=604800,
+                ExpiresIn=7 * 24 * 3600,
             )
 
             items.append(
                 {
                     "id": base_name,
+                    "uid": uid,
                     "petId": petId,
                     "title": f"검사결과 ({date_str})",
                     "s3Url": url,
@@ -625,13 +701,16 @@ def get_lab_list(petId: str = Query(...)):
 @app.get("/certs/list")
 @app.get("/api/cert/list")
 @app.get("/api/certs/list")
-def get_cert_list(petId: str = Query(...)):
-    prefix = f"cert/{petId}/"
-    response = s3_client.list_objects_v2(
-        Bucket=settings.S3_BUCKET_NAME, Prefix=prefix
-    )
+def get_cert_list(
+    petId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or "unknown"
 
-    items = []
+    prefix = f"{_user_prefix(uid, petId)}/cert/"
+    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
+
+    items: List[Dict[str, Any]] = []
     if "Contents" in response:
         for obj in response["Contents"]:
             key = obj["Key"]
@@ -648,12 +727,13 @@ def get_cert_list(petId: str = Query(...)):
             url = s3_client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=604800,
+                ExpiresIn=7 * 24 * 3600,
             )
 
             items.append(
                 {
                     "id": base_name,
+                    "uid": uid,
                     "petId": petId,
                     "title": f"증명서 ({date_str})",
                     "s3Url": url,
@@ -667,11 +747,9 @@ def get_cert_list(petId: str = Query(...)):
 
 
 # ------------------------------------------------
-# 8. AI 케어 – 태그 통계 & 케어 가이드
+# 9. AI 케어 – 태그 통계 & 케어 가이드
 # ------------------------------------------------
-
 def _parse_visit_date(s: Optional[str]) -> Optional[date]:
-    """'2025-12-03' 또는 '2025-12-03 10:30' 형식 날짜 문자열 파싱."""
     if not s:
         return None
     s = s.strip()
@@ -686,24 +764,12 @@ def _parse_visit_date(s: Optional[str]) -> Optional[date]:
 
 
 def _build_tag_stats(
-    medical_history: List[Dict[str, Any]]
+    medical_history: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
-    """
-    ✅ record.tags(서버 코드)만 사용해서 통계 생성.
-    ❌ diagnosis/clinic_name 기반 "키워드 추정"은 완전 제거 (안전/신뢰 우선)
-
-    - tags: [{tag, label, group, count, recentDates}]
-    - periodStats: {"1m": {...}, "3m": {...}, "1y": {...}}
-    """
     today = date.today()
 
     agg: Dict[str, Dict[str, Any]] = {}
-
-    period_stats: Dict[str, Dict[str, int]] = {
-        "1m": {},
-        "3m": {},
-        "1y": {},
-    }
+    period_stats: Dict[str, Dict[str, int]] = {"1m": {}, "3m": {}, "1y": {}}
 
     for mh in medical_history:
         visit_str = mh.get("visitDate") or mh.get("visit_date") or ""
@@ -721,7 +787,7 @@ def _build_tag_stats(
             if not cfg:
                 continue
 
-            canonical_code = cfg.code  # alias가 들어와도 canonical code로 집계
+            canonical_code = cfg.code
             if canonical_code in used_codes:
                 continue
             used_codes.add(canonical_code)
@@ -757,9 +823,8 @@ def _build_tag_stats(
 
 
 # ------------------------------------------------
-# 9. Gemini 기반 AI 요약 생성
+# 10. Gemini 기반 AI 요약 (기존 로직 유지)
 # ------------------------------------------------
-
 def _build_gemini_prompt(
     pet_name: str,
     tags: List[Dict[str, Any]],
@@ -788,8 +853,7 @@ def _build_gemini_prompt(
         )
 
     prompt = f"""
-당신은 반려동물 건강 기록을 '정리/요약'해 주는 어시스턴트입니다.
-아래 입력은 보호자가 앱에서 직접 기록한 태그(확정 정보)입니다.
+당신은 반려동물 건강 기록을 '정리/요약'해 주는 어시스턴트입니다. 아래 입력은 보호자가 앱에서 직접 기록한 태그(확정 정보)입니다.
 
 [중요 규칙]
 1) 아래 '태그'에 없는 질환/컨디션을 새로 추정하거나 만들어내지 마세요.
@@ -809,8 +873,7 @@ def _build_gemini_prompt(
 [최근 진료 이력 요약(최대 8개)]
 {os.linesep.join(mh_summary_lines) if mh_summary_lines else '진료 내역 없음'}
 
-요약은 3~5문장으로 짧게 작성해 주세요.
-너무 무섭게 말하지 말고, "잘 관리되고 있다"는 안정감을 주는 톤으로 작성해 주세요.
+요약은 3~5문장으로 짧게 작성해 주세요. 너무 무섭게 말하지 말고, "잘 관리되고 있다"는 안정감을 주는 톤으로 작성해 주세요.
 """.strip()
 
     return prompt
@@ -829,7 +892,6 @@ def _generate_gemini_summary(
     if genai is None:
         return None
 
-    # ✅ tags가 비어도(기록이 없더라도) 요약은 가능하도록 열어둠
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
         model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
@@ -854,22 +916,11 @@ def _generate_gemini_summary(
         return None
 
 
-# ------------------------------------------------
-# 10. AI 케어 분석 엔드포인트
-# ------------------------------------------------
-
 @app.post("/api/ai/analyze")
-async def analyze_pet_health(body: Dict[str, Any]):
-    """
-    PetHealth+ AI 케어:
-    - ✅ record.tags(확정 태그)만 기반으로 통계/요약 생성
-    - ❌ diagnosis/clinic_name 키워드 추정 OFF
-    """
-    try:
-        print("[AI] raw body =", json.dumps(body, ensure_ascii=False))
-    except Exception:
-        print("[AI] raw body (repr) =", repr(body))
-
+async def analyze_pet_health(
+    body: Dict[str, Any],
+    user: Dict[str, Any] = Depends(get_current_user),
+):
     profile = body.get("profile") or {}
     pet_name = profile.get("name") or "반려동물"
 
@@ -878,7 +929,6 @@ async def analyze_pet_health(body: Dict[str, Any]):
 
     tags, period_stats = _build_tag_stats(medical_history)
 
-    # 케어 가이드: condition_tags.py의 guide를 그대로 사용
     care_guide: Dict[str, List[str]] = {}
     for t in tags:
         code = t["tag"]
@@ -886,7 +936,6 @@ async def analyze_pet_health(body: Dict[str, Any]):
         if cfg and getattr(cfg, "guide", None):
             care_guide[code] = list(cfg.guide)
 
-    # 요약 문장 (Gemini 우선, 없으면 규칙 기반)
     ai_summary = _generate_gemini_summary(pet_name, tags, period_stats, body)
 
     if ai_summary:
@@ -910,12 +959,10 @@ async def analyze_pet_health(body: Dict[str, Any]):
                 "기록을 바탕으로 관리 포인트를 차분히 정리해 드렸어요."
             )
 
-    response = {
+    return {
+        "uid": user.get("uid"),
         "summary": summary,
         "tags": tags,
         "periodStats": period_stats,
         "careGuide": care_guide,
     }
-
-    print(f"[AI] response tags={len(tags)}")
-    return response
