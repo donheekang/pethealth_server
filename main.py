@@ -8,7 +8,16 @@ import base64
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException,
+    Query,
+    Form,
+    Depends,
+    Body,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -59,8 +68,13 @@ class Settings(BaseSettings):
 
     # --- Firebase Auth (verify ID token) ---
     AUTH_REQUIRED: str = "true"  # "true"/"false"
+    AUTH_CHECK_REVOKED: str = "false"  # "true"/"false" (원하면 true로)
     FIREBASE_ADMIN_SA_JSON: str = ""  # service account JSON string
     FIREBASE_ADMIN_SA_B64: str = ""   # base64-encoded JSON string (optional)
+
+    # --- 백업 관련 ---
+    BACKUP_MAX_BYTES: int = 5_000_000   # 5MB (원하면 키워도 됨)
+    BACKUP_LIST_LIMIT: int = 50
 
     # --- 디버그용 스텁 모드 ---
     STUB_MODE: str = "false"  # "true"면 인증/외부 호출 일부를 우회 가능
@@ -79,9 +93,7 @@ auth_scheme = HTTPBearer(auto_error=False)
 
 
 def _normalize_private_key_newlines(info: dict) -> dict:
-    """
-    일부 배포 환경에서 private_key가 '\\n' 형태로 남아있는 경우를 대비해 정규화.
-    """
+    """일부 배포 환경에서 private_key가 '\\n' 형태로 남아있는 경우 정규화."""
     if not isinstance(info, dict):
         return info
     pk = info.get("private_key")
@@ -160,10 +172,17 @@ def get_current_user(
 
     token = credentials.credentials
     try:
-        decoded = fb_auth.verify_id_token(token)
+        decoded = fb_auth.verify_id_token(
+            token,
+            check_revoked=(settings.AUTH_CHECK_REVOKED.lower() == "true"),
+        )
         return decoded
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
+
+
+def _safe_component(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", (s or "unknown"))
 
 
 def _user_prefix(user_uid: str, pet_id: str) -> str:
@@ -171,9 +190,14 @@ def _user_prefix(user_uid: str, pet_id: str) -> str:
     ✅ S3 키를 사용자(uid) 단위로 네임스페이스 분리.
     - petId만 믿으면 다른 유저가 다른 petId를 넣어 접근할 수 있어서 위험.
     """
-    safe_uid = re.sub(r"[^a-zA-Z0-9_\-]", "_", user_uid or "unknown")
-    safe_pet = re.sub(r"[^a-zA-Z0-9_\-]", "_", pet_id or "unknown")
+    safe_uid = _safe_component(user_uid or "unknown")
+    safe_pet = _safe_component(pet_id or "unknown")
     return f"users/{safe_uid}/pets/{safe_pet}"
+
+
+def _backup_prefix(user_uid: str) -> str:
+    safe_uid = _safe_component(user_uid or "unknown")
+    return f"users/{safe_uid}/backup"
 
 
 # ------------------------------------------------
@@ -210,6 +234,38 @@ def upload_to_s3(file_obj, key: str, content_type: str) -> str:
         raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {e}")
 
 
+def put_json_to_s3(obj: Dict[str, Any], key: str) -> None:
+    """JSON을 S3에 저장."""
+    try:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        s3_client.put_object(
+            Bucket=settings.S3_BUCKET_NAME,
+            Key=key,
+            Body=data,
+            ContentType="application/json; charset=utf-8",
+        )
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="AWS S3 인증 실패")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3(JSON) 저장 실패: {e}")
+
+
+def get_json_from_s3(key: str) -> Dict[str, Any]:
+    """S3에서 JSON 읽기."""
+    try:
+        obj = s3_client.get_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        raw = obj["Body"].read()
+        return json.loads(raw.decode("utf-8"))
+    except ClientError as e:
+        err = e.response.get("Error") or {}
+        code = err.get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            raise HTTPException(status_code=404, detail="백업 파일을 찾을 수 없습니다.")
+        raise HTTPException(status_code=500, detail=f"S3(JSON) 읽기 실패: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3(JSON) 읽기 실패: {e}")
+
+
 def delete_from_s3(key: str) -> None:
     """
     S3 객체 삭제.
@@ -234,6 +290,20 @@ def delete_from_s3(key: str) -> None:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 삭제 실패: {e}")
+
+
+def list_s3_objects(prefix: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """S3 prefix 하위 객체 목록 (LastModified 포함)."""
+    try:
+        resp = s3_client.list_objects_v2(
+            Bucket=settings.S3_BUCKET_NAME,
+            Prefix=prefix,
+            MaxKeys=max(1, min(limit, 1000)),
+        )
+        items = resp.get("Contents", []) or []
+        return items
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 리스트 실패: {e}")
 
 
 # ------------------------------------------------
@@ -415,7 +485,7 @@ class AICareRequest(CamelBase):
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.3.0")
+app = FastAPI(title="PetHealth+ Server", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -458,6 +528,139 @@ def health():
 @app.get("/api/me")
 def me(user: Dict[str, Any] = Depends(get_current_user)):
     return {"uid": user.get("uid"), "email": user.get("email")}
+
+
+# ------------------------------------------------
+# 7-1. ✅ BACKUP ENDPOINTS (MVP)
+# ------------------------------------------------
+@app.post("/api/backup/upload")
+async def backup_upload(
+    payload: Dict[str, Any] = Body(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    iOS에서 Firebase ID Token을 Authorization Bearer로 보내고,
+    snapshot(JSON)을 body로 보내면 서버가 S3에 저장.
+
+    payload 예시(권장):
+    {
+      "snapshot": { ...앱 전체 데이터... },
+      "clientTime": "2025-12-29T12:34:56+09:00",
+      "appVersion": "1.0.0",
+      "device": "iPhone",
+      "note": "manual backup"
+    }
+
+    또는 body 자체를 snapshot으로 보내도 됨.
+    """
+    uid = user.get("uid") or "unknown"
+
+    # snapshot 래핑 지원
+    snapshot = payload.get("snapshot", payload)
+
+    # 용량 제한(너무 큰 JSON 방지)
+    raw = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
+    if len(raw) > settings.BACKUP_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Backup payload too large. max={settings.BACKUP_MAX_BYTES} bytes",
+        )
+
+    backup_id = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex}"
+    key = f"{_backup_prefix(uid)}/snapshots/{backup_id}.json"
+
+    doc = {
+        "meta": {
+            "uid": uid,
+            "backupId": backup_id,
+            "createdAt": datetime.utcnow().isoformat() + "Z",
+            "clientTime": payload.get("clientTime"),
+            "appVersion": payload.get("appVersion"),
+            "device": payload.get("device"),
+            "note": payload.get("note"),
+        },
+        "snapshot": snapshot,
+    }
+
+    put_json_to_s3(doc, key)
+
+    return {
+        "ok": True,
+        "uid": uid,
+        "backupId": backup_id,
+        "objectKey": key,
+    }
+
+
+@app.get("/api/backup/list")
+def backup_list(
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """유저의 백업 스냅샷 목록."""
+    uid = user.get("uid") or "unknown"
+    prefix = f"{_backup_prefix(uid)}/snapshots/"
+
+    objs = list_s3_objects(prefix=prefix, limit=settings.BACKUP_LIST_LIMIT)
+    items: List[Dict[str, Any]] = []
+
+    for obj in objs:
+        key = obj.get("Key", "")
+        if not key.endswith(".json"):
+            continue
+        filename = key.split("/")[-1]
+        backup_id = filename.replace(".json", "")
+        last_modified = obj.get("LastModified")
+        created_at = last_modified.isoformat() if last_modified else None
+
+        items.append(
+            {
+                "backupId": backup_id,
+                "createdAt": created_at,
+                "objectKey": key,
+            }
+        )
+
+    items.sort(key=lambda x: x["createdAt"] or "", reverse=True)
+    return {"uid": uid, "items": items}
+
+
+@app.get("/api/backup/latest")
+def backup_latest(
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """가장 최신 백업 JSON 반환(복구용)."""
+    uid = user.get("uid") or "unknown"
+    prefix = f"{_backup_prefix(uid)}/snapshots/"
+
+    objs = list_s3_objects(prefix=prefix, limit=1000)
+    json_objs = [o for o in objs if (o.get("Key", "").endswith(".json"))]
+
+    if not json_objs:
+        raise HTTPException(status_code=404, detail="No backups found")
+
+    # LastModified 기준 최신
+    latest = max(json_objs, key=lambda o: o.get("LastModified"))
+    key = latest["Key"]
+
+    doc = get_json_from_s3(key)
+    return {
+        "uid": uid,
+        "objectKey": key,
+        "data": doc,
+    }
+
+
+@app.delete("/api/backup/delete")
+def backup_delete(
+    backupId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or "unknown"
+    safe_id = _safe_component(backupId)
+    key = f"{_backup_prefix(uid)}/snapshots/{safe_id}.json"
+
+    delete_from_s3(key)
+    return {"ok": True, "uid": uid, "deletedKey": key}
 
 
 # ------------------------------------------------
@@ -548,6 +751,7 @@ async def upload_lab_pdf(
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
     safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
 
+    # ✅ BUGFIX: user_prefix -> _user_prefix
     key = f"{user_prefix(uid, petId)}/lab/{safe_base}{uuid.uuid4().hex}.pdf"
 
     url = upload_to_s3(file.file, key, "application/pdf")
@@ -584,6 +788,7 @@ async def upload_cert_pdf(
     original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
     safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
 
+    # ✅ BUGFIX: user_prefix -> _user_prefix
     key = f"{user_prefix(uid, petId)}/cert/{safe_base}{uuid.uuid4().hex}.pdf"
 
     url = upload_to_s3(file.file, key, "application/pdf")
