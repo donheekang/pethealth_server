@@ -16,7 +16,7 @@ from google.cloud import vision
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Firebase Admin (Auth only)
@@ -173,7 +173,7 @@ def _backup_prefix(user_uid: str) -> str:
 
 
 # ------------------------------------------------
-# 3. S3 클라이언트
+# 3. S3 클라이언트 & 헬퍼
 # ------------------------------------------------
 s3_client = boto3.client(
     "s3",
@@ -184,6 +184,9 @@ s3_client = boto3.client(
 
 
 def upload_to_s3(file_obj, key: str, content_type: str) -> str:
+    """
+    파일을 S3에 업로드하고 7일 presigned URL을 반환.
+    """
     try:
         s3_client.upload_fileobj(
             file_obj,
@@ -237,6 +240,14 @@ def get_json_from_s3(key: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"S3 get_object 실패: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"백업 JSON 로드 실패: {e}")
+
+
+def _presign_get_url(key: str, expires_seconds: int = 7 * 24 * 3600) -> str:
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
+        ExpiresIn=expires_seconds,
+    )
 
 
 # ------------------------------------------------
@@ -366,16 +377,7 @@ def parse_receipt_minimal(text: str) -> dict:
 
 
 # ------------------------------------------------
-# 6. DTO (참고용)
-# ------------------------------------------------
-class CamelBase(BaseModel):
-    class Config:
-        populate_by_name = True
-        extra = "ignore"
-
-
-# ------------------------------------------------
-# 7. BACKUP DTO
+# 6. BACKUP DTO
 # ------------------------------------------------
 class BackupUploadRequest(BaseModel):
     snapshot: Any
@@ -409,9 +411,9 @@ class BackupDocument(BaseModel):
 
 
 # ------------------------------------------------
-# 8. FASTAPI APP
+# 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.4.0")
+app = FastAPI(title="PetHealth+ Server", version="1.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -456,7 +458,7 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # ------------------------------------------------
-# 9. BACKUP ENDPOINTS (업로드/복구/리스트)
+# 8. BACKUP ENDPOINTS (업로드/복구/리스트)
 # ------------------------------------------------
 @app.post("/api/backup/upload", response_model=BackupUploadResponse)
 async def backup_upload(
@@ -467,20 +469,23 @@ async def backup_upload(
     backup_id = uuid.uuid4().hex
     created_at = datetime.utcnow().isoformat()
 
-    meta = BackupMeta(
-        uid=uid,
-        backupId=backup_id,
-        createdAt=created_at,
-        clientTime=req.clientTime,
-        appVersion=req.appVersion,
-        device=req.device,
-        note=req.note,
-    ).model_dump()
-
-    doc = {"meta": meta, "snapshot": req.snapshot}
+    # snapshot이 JSON으로 덤프 가능한지 체크 (에러 메시지 개선)
+    try:
+        meta = BackupMeta(
+            uid=uid,
+            backupId=backup_id,
+            createdAt=created_at,
+            clientTime=req.clientTime,
+            appVersion=req.appVersion,
+            device=req.device,
+            note=req.note,
+        ).model_dump()
+        doc = {"meta": meta, "snapshot": req.snapshot}
+        raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"backup snapshot JSON 직렬화 실패: {e}")
 
     key = f"{_backup_prefix(uid)}/{backup_id}.json"
-    raw = json.dumps(doc, ensure_ascii=False).encode("utf-8")
     bio = io.BytesIO(raw)
     bio.seek(0)
 
@@ -496,9 +501,7 @@ async def backup_upload(
 
 
 @app.get("/api/backup/latest", response_model=BackupDocument)
-def backup_latest(
-    user: Dict[str, Any] = Depends(get_current_user),
-):
+def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     prefix = f"{_backup_prefix(uid)}/"
 
@@ -512,7 +515,6 @@ def backup_latest(
 
     doc = get_json_from_s3(key)
 
-    # 최소 방어
     if not isinstance(doc, dict) or "meta" not in doc or "snapshot" not in doc:
         raise HTTPException(status_code=500, detail="백업 파일 형식이 올바르지 않습니다.")
 
@@ -534,13 +536,12 @@ def backup_get(
 
     if not isinstance(doc, dict) or "meta" not in doc or "snapshot" not in doc:
         raise HTTPException(status_code=500, detail="백업 파일 형식이 올바르지 않습니다.")
+
     return doc
 
 
 @app.get("/api/backup/list")
-def backup_list(
-    user: Dict[str, Any] = Depends(get_current_user),
-):
+def backup_list(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     prefix = f"{_backup_prefix(uid)}/"
     resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
@@ -566,9 +567,13 @@ def backup_list(
 
 
 # ------------------------------------------------
-# 10. ENDPOINTS – 영수증 / PDF (기존 로직 + user_prefix 오타 수정)
+# 9. 영수증 업로드 (alias 다수 지원)
 # ------------------------------------------------
+@app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
+@app.post("/api/receipts/upload")
+@app.post("/api/receipt/analyze")
+@app.post("/api/receipts/analyze")
 async def upload_receipt(
     petId: str = Form(...),
     file: Optional[UploadFile] = File(None),
@@ -633,7 +638,15 @@ async def upload_receipt(
     }
 
 
+# ------------------------------------------------
+# 10. PDF 업로드/리스트/삭제 (alias 다수 지원: Not Found 방지)
+# ------------------------------------------------
+
+# ✅ LAB 업로드: /api/lab/upload-pdf 뿐 아니라 /api/labs/upload-pdf도 받음
+@app.post("/lab/upload-pdf")
+@app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
+@app.post("/api/labs/upload-pdf")
 async def upload_lab_pdf(
     petId: str = Form(...),
     title: str = Form("검사결과"),
@@ -646,6 +659,7 @@ async def upload_lab_pdf(
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
     safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
 
+    # ✅ 오타 수정: user_prefix -> _user_prefix
     key = f"{user_prefix(uid, petId)}/lab/{safe_base}{uuid.uuid4().hex}.pdf"
 
     url = upload_to_s3(file.file, key, "application/pdf")
@@ -666,7 +680,13 @@ async def upload_lab_pdf(
     }
 
 
+# ✅ CERT 업로드: /api/cert/upload-pdf 뿐 아니라 /api/certs/upload-pdf도 받음
+@app.post("/cert/upload-pdf")
+@app.post("/certs/upload-pdf")
+@app.post("/certificates/upload-pdf")        # 혹시 예전 경로 대응
 @app.post("/api/cert/upload-pdf")
+@app.post("/api/certs/upload-pdf")
+@app.post("/api/certificates/upload-pdf")   # 혹시 예전 경로 대응
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form("증명서"),
@@ -679,6 +699,7 @@ async def upload_cert_pdf(
     original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
     safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
 
+    # ✅ 오타 수정: user_prefix -> _user_prefix
     key = f"{user_prefix(uid, petId)}/cert/{safe_base}{uuid.uuid4().hex}.pdf"
 
     url = upload_to_s3(file.file, key, "application/pdf")
@@ -699,6 +720,10 @@ async def upload_cert_pdf(
     }
 
 
+# ✅ LAB 리스트: 단수/복수 모두
+@app.get("/lab/list")
+@app.get("/labs/list")
+@app.get("/api/lab/list")
 @app.get("/api/labs/list")
 def get_lab_list(
     petId: str = Query(...),
@@ -710,42 +735,43 @@ def get_lab_list(
     response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
 
     items: List[Dict[str, Any]] = []
-    if "Contents" in response:
-        for obj in response["Contents"]:
-            key = obj["Key"]
-            if not key.endswith(".pdf"):
-                continue
+    for obj in response.get("Contents") or []:
+        key = obj["Key"]
+        if not key.endswith(".pdf"):
+            continue
 
-            filename = key.split("/")[-1]
-            base_name, _ = os.path.splitext(filename)
+        filename = key.split("/")[-1]
+        base_name, _ = os.path.splitext(filename)
 
-            created_dt = obj["LastModified"]
-            created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
-            date_str = created_dt.strftime("%Y-%m-%d")
+        created_dt = obj["LastModified"]
+        created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        date_str = created_dt.strftime("%Y-%m-%d")
 
-            url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=7 * 24 * 3600,
-            )
+        url = _presign_get_url(key)
 
-            items.append(
-                {
-                    "id": base_name,
-                    "uid": uid,
-                    "petId": petId,
-                    "title": f"검사결과 ({date_str})",
-                    "s3Url": url,
-                    "createdAt": created_at_iso,
-                    "objectKey": key,
-                }
-            )
+        items.append(
+            {
+                "id": base_name,
+                "uid": uid,
+                "petId": petId,
+                "title": f"검사결과 ({date_str})",
+                "s3Url": url,
+                "createdAt": created_at_iso,
+                "objectKey": key,
+            }
+        )
 
     items.sort(key=lambda x: x["createdAt"], reverse=True)
     return items
 
 
+# ✅ CERT 리스트: 단수/복수/예전 certificates 도 모두
+@app.get("/cert/list")
+@app.get("/certs/list")
+@app.get("/certificates/list")
 @app.get("/api/cert/list")
+@app.get("/api/certs/list")
+@app.get("/api/certificates/list")
 def get_cert_list(
     petId: str = Query(...),
     user: Dict[str, Any] = Depends(get_current_user),
@@ -756,42 +782,41 @@ def get_cert_list(
     response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
 
     items: List[Dict[str, Any]] = []
-    if "Contents" in response:
-        for obj in response["Contents"]:
-            key = obj["Key"]
-            if not key.endswith(".pdf"):
-                continue
+    for obj in response.get("Contents") or []:
+        key = obj["Key"]
+        if not key.endswith(".pdf"):
+            continue
 
-            filename = key.split("/")[-1]
-            base_name, _ = os.path.splitext(filename)
+        filename = key.split("/")[-1]
+        base_name, _ = os.path.splitext(filename)
 
-            created_dt = obj["LastModified"]
-            created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
-            date_str = created_dt.strftime("%Y-%m-%d")
+        created_dt = obj["LastModified"]
+        created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        date_str = created_dt.strftime("%Y-%m-%d")
 
-            url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
-                ExpiresIn=7 * 24 * 3600,
-            )
+        url = _presign_get_url(key)
 
-            items.append(
-                {
-                    "id": base_name,
-                    "uid": uid,
-                    "petId": petId,
-                    "title": f"증명서 ({date_str})",
-                    "s3Url": url,
-                    "createdAt": created_at_iso,
-                    "objectKey": key,
-                }
-            )
+        items.append(
+            {
+                "id": base_name,
+                "uid": uid,
+                "petId": petId,
+                "title": f"증명서 ({date_str})",
+                "s3Url": url,
+                "createdAt": created_at_iso,
+                "objectKey": key,
+            }
+        )
 
     items.sort(key=lambda x: x["createdAt"], reverse=True)
     return items
 
 
+# ✅ LAB 삭제: 단수/복수 모두
+@app.delete("/lab/delete")
+@app.delete("/labs/delete")
 @app.delete("/api/lab/delete")
+@app.delete("/api/labs/delete")
 def delete_lab_pdf(
     petId: str = Query(...),
     id: str = Query(...),
@@ -810,7 +835,13 @@ def delete_lab_pdf(
     return {"ok": True, "deletedKey": key}
 
 
+# ✅ CERT 삭제: 단수/복수/예전 certificates 모두
+@app.delete("/cert/delete")
+@app.delete("/certs/delete")
+@app.delete("/certificates/delete")
 @app.delete("/api/cert/delete")
+@app.delete("/api/certs/delete")
+@app.delete("/api/certificates/delete")
 def delete_cert_pdf(
     petId: str = Query(...),
     id: str = Query(...),
@@ -863,7 +894,7 @@ def _build_tag_stats(
         if not record_tags:
             continue
 
-        used_codes: set[str] = set()
+        used_codes = set()
 
         for code in record_tags:
             cfg = CONDITION_TAGS.get(code)
