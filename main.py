@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import io
 import json
@@ -6,11 +8,13 @@ import tempfile
 import re
 import base64
 from datetime import datetime, date
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Iterable
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
 
 from google.cloud import vision
 import boto3
@@ -183,16 +187,21 @@ s3_client = boto3.client(
 )
 
 
-def upload_to_s3(file_obj, key: str, content_type: str) -> str:
+def upload_to_s3(file_obj, key: str, content_type: str, metadata: Optional[Dict[str, str]] = None) -> str:
     """
     파일을 S3에 업로드하고 7일 presigned URL을 반환.
     """
     try:
+        extra = {"ContentType": content_type}
+        if metadata:
+            # S3 metadata는 dict[str,str] 이어야 함
+            extra["Metadata"] = {str(k).lower(): str(v) for k, v in metadata.items() if v is not None}
+
         s3_client.upload_fileobj(
             file_obj,
             settings.S3_BUCKET_NAME,
             key,
-            ExtraArgs={"ContentType": content_type},
+            ExtraArgs=extra,
         )
         url = s3_client.generate_presigned_url(
             "get_object",
@@ -248,6 +257,44 @@ def _presign_get_url(key: str, expires_seconds: int = 7 * 24 * 3600) -> str:
         Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
         ExpiresIn=expires_seconds,
     )
+
+
+def _list_objects_all(prefix: str) -> List[Dict[str, Any]]:
+    """
+    Prefix로 S3 object 전체를 페이지네이션 포함해서 가져오기
+    """
+    out: List[Dict[str, Any]] = []
+    token = None
+
+    while True:
+        if token:
+            resp = s3_client.list_objects_v2(
+                Bucket=settings.S3_BUCKET_NAME,
+                Prefix=prefix,
+                ContinuationToken=token,
+            )
+        else:
+            resp = s3_client.list_objects_v2(
+                Bucket=settings.S3_BUCKET_NAME,
+                Prefix=prefix,
+            )
+
+        out.extend(resp.get("Contents") or [])
+
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+
+    return out
+
+
+def _head_metadata_safe(key: str) -> Dict[str, str]:
+    try:
+        head = s3_client.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        return head.get("Metadata") or {}
+    except Exception:
+        return {}
 
 
 # ------------------------------------------------
@@ -413,7 +460,7 @@ class BackupDocument(BaseModel):
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.4.1")
+app = FastAPI(title="PetHealth+ Server", version="1.4.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -422,6 +469,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # 운영에서 로그 확인용 (렌더 로그에 찍힘)
+    print("[UNHANDLED ERROR]", repr(exc))
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal Server Error",
+            "error": str(exc),
+            "path": str(request.url),
+        },
+    )
 
 
 @app.on_event("startup")
@@ -505,8 +566,7 @@ def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     prefix = f"{_backup_prefix(uid)}/"
 
-    resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-    contents = resp.get("Contents") or []
+    contents = _list_objects_all(prefix)
     if not contents:
         raise HTTPException(status_code=404, detail="백업이 아직 없어요.")
 
@@ -544,10 +604,10 @@ def backup_get(
 def backup_list(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     prefix = f"{_backup_prefix(uid)}/"
-    resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
+    contents = _list_objects_all(prefix)
 
     out = []
-    for obj in resp.get("Contents") or []:
+    for obj in contents:
         key = obj["Key"]
         if not key.endswith(".json"):
             continue
@@ -639,8 +699,78 @@ async def upload_receipt(
 
 
 # ------------------------------------------------
-# 10. PDF 업로드/리스트/삭제 (alias 다수 지원: Not Found 방지)
+# 10. PDF 업로드/리스트/삭제 (alias 다수 지원)
+#     - 기존 S3 폴더가 lab/labs, cert/certs/certificates 섞여있어도 list/delete에서 다 잡도록 처리
 # ------------------------------------------------
+LAB_DIRS = ["lab", "labs"]
+CERT_DIRS = ["cert", "certs", "certificates"]
+
+
+def _pdf_key_candidates(uid: str, petId: str, dirs: List[str], filename: str) -> List[str]:
+    base = _user_prefix(uid, petId)
+    return [f"{base}/{d}/{filename}" for d in dirs]
+
+
+def _delete_pdf_any(uid: str, petId: str, dirs: List[str], object_id: str) -> str:
+    filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
+    keys = _pdf_key_candidates(uid, petId, dirs, filename)
+
+    last_404 = None
+    for key in keys:
+        try:
+            delete_from_s3(key)
+            return key
+        except HTTPException as e:
+            if e.status_code == 404:
+                last_404 = e
+                continue
+            raise
+    raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+
+def _list_pdf_any(uid: str, petId: str, dirs: List[str]) -> List[Dict[str, Any]]:
+    base = _user_prefix(uid, petId)
+
+    objects: List[Dict[str, Any]] = []
+    for d in dirs:
+        prefix = f"{base}/{d}/"
+        objects.extend(_list_objects_all(prefix))
+
+    items: List[Dict[str, Any]] = []
+    for obj in objects:
+        key = obj["Key"]
+        if not key.endswith(".pdf"):
+            continue
+
+        filename = key.split("/")[-1]
+        base_name, _ = os.path.splitext(filename)
+
+        created_dt = obj["LastModified"]
+        created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        date_str = created_dt.strftime("%Y-%m-%d")
+
+        url = _presign_get_url(key)
+
+        md = _head_metadata_safe(key)
+        stored_title = (md.get("title") or "").strip()
+        stored_memo = (md.get("memo") or "").strip()
+
+        items.append(
+            {
+                "id": base_name,
+                "uid": uid,
+                "petId": petId,
+                "title": stored_title if stored_title else f"문서 ({date_str})",
+                "memo": stored_memo if stored_memo else None,
+                "s3Url": url,
+                "createdAt": created_at_iso,
+                "objectKey": key,
+            }
+        )
+
+    items.sort(key=lambda x: x["createdAt"], reverse=True)
+    return items
+
 
 # ✅ LAB 업로드: /api/lab/upload-pdf 뿐 아니라 /api/labs/upload-pdf도 받음
 @app.post("/lab/upload-pdf")
@@ -659,10 +789,20 @@ async def upload_lab_pdf(
     original_base = os.path.splitext(file.filename or "")[0].strip() or "검사결과"
     safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
 
-    # ✅ 오타 수정: user_prefix -> _user_prefix
+    # ✅ 핵심: _user_prefix 사용
     key = f"{user_prefix(uid, petId)}/lab/{safe_base}{uuid.uuid4().hex}.pdf"
 
-    url = upload_to_s3(file.file, key, "application/pdf")
+    # ✅ 안정적으로: await read() -> BytesIO
+    data = await file.read()
+    bio = io.BytesIO(data)
+    bio.seek(0)
+
+    url = upload_to_s3(
+        bio,
+        key,
+        "application/pdf",
+        metadata={"title": title or original_base, "memo": memo or ""},
+    )
     created_at_iso = datetime.utcnow().isoformat()
 
     filename = key.split("/")[-1]
@@ -683,10 +823,10 @@ async def upload_lab_pdf(
 # ✅ CERT 업로드: /api/cert/upload-pdf 뿐 아니라 /api/certs/upload-pdf도 받음
 @app.post("/cert/upload-pdf")
 @app.post("/certs/upload-pdf")
-@app.post("/certificates/upload-pdf")        # 혹시 예전 경로 대응
+@app.post("/certificates/upload-pdf")
 @app.post("/api/cert/upload-pdf")
 @app.post("/api/certs/upload-pdf")
-@app.post("/api/certificates/upload-pdf")   # 혹시 예전 경로 대응
+@app.post("/api/certificates/upload-pdf")
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form("증명서"),
@@ -699,10 +839,20 @@ async def upload_cert_pdf(
     original_base = os.path.splitext(file.filename or "")[0].strip() or "증명서"
     safe_base = re.sub(r"[^a-zA-Z0-9_\-가-힣]", "_", original_base)
 
-    # ✅ 오타 수정: user_prefix -> _user_prefix
+    # ✅ 핵심: _user_prefix 사용
     key = f"{user_prefix(uid, petId)}/cert/{safe_base}{uuid.uuid4().hex}.pdf"
 
-    url = upload_to_s3(file.file, key, "application/pdf")
+    # ✅ 안정적으로: await read() -> BytesIO
+    data = await file.read()
+    bio = io.BytesIO(data)
+    bio.seek(0)
+
+    url = upload_to_s3(
+        bio,
+        key,
+        "application/pdf",
+        metadata={"title": title or original_base, "memo": memo or ""},
+    )
     created_at_iso = datetime.utcnow().isoformat()
 
     filename = key.split("/")[-1]
@@ -730,38 +880,13 @@ def get_lab_list(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or "unknown"
+    items = _list_pdf_any(uid, petId, LAB_DIRS)
 
-    prefix = f"{_user_prefix(uid, petId)}/lab/"
-    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-
-    items: List[Dict[str, Any]] = []
-    for obj in response.get("Contents") or []:
-        key = obj["Key"]
-        if not key.endswith(".pdf"):
-            continue
-
-        filename = key.split("/")[-1]
-        base_name, _ = os.path.splitext(filename)
-
-        created_dt = obj["LastModified"]
-        created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        date_str = created_dt.strftime("%Y-%m-%d")
-
-        url = _presign_get_url(key)
-
-        items.append(
-            {
-                "id": base_name,
-                "uid": uid,
-                "petId": petId,
-                "title": f"검사결과 ({date_str})",
-                "s3Url": url,
-                "createdAt": created_at_iso,
-                "objectKey": key,
-            }
-        )
-
-    items.sort(key=lambda x: x["createdAt"], reverse=True)
+    # title 기본값 개선(검사결과로)
+    for it in items:
+        if it.get("title", "").startswith("문서"):
+            created = it.get("createdAt", "")[:10]
+            it["title"] = f"검사결과 ({created})"
     return items
 
 
@@ -777,42 +902,17 @@ def get_cert_list(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or "unknown"
+    items = _list_pdf_any(uid, petId, CERT_DIRS)
 
-    prefix = f"{_user_prefix(uid, petId)}/cert/"
-    response = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-
-    items: List[Dict[str, Any]] = []
-    for obj in response.get("Contents") or []:
-        key = obj["Key"]
-        if not key.endswith(".pdf"):
-            continue
-
-        filename = key.split("/")[-1]
-        base_name, _ = os.path.splitext(filename)
-
-        created_dt = obj["LastModified"]
-        created_at_iso = created_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        date_str = created_dt.strftime("%Y-%m-%d")
-
-        url = _presign_get_url(key)
-
-        items.append(
-            {
-                "id": base_name,
-                "uid": uid,
-                "petId": petId,
-                "title": f"증명서 ({date_str})",
-                "s3Url": url,
-                "createdAt": created_at_iso,
-                "objectKey": key,
-            }
-        )
-
-    items.sort(key=lambda x: x["createdAt"], reverse=True)
+    # title 기본값 개선(증명서로)
+    for it in items:
+        if it.get("title", "").startswith("문서"):
+            created = it.get("createdAt", "")[:10]
+            it["title"] = f"증명서 ({created})"
     return items
 
 
-# ✅ LAB 삭제: 단수/복수 모두
+# ✅ LAB 삭제: 단수/복수 모두 (lab/labs 둘 다 시도)
 @app.delete("/lab/delete")
 @app.delete("/labs/delete")
 @app.delete("/api/lab/delete")
@@ -823,19 +923,15 @@ def delete_lab_pdf(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or "unknown"
-
     object_id = (id or "").strip()
     if not object_id:
         raise HTTPException(status_code=400, detail="id is required")
 
-    filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
-    key = f"{_user_prefix(uid, petId)}/lab/{filename}"
-
-    delete_from_s3(key)
-    return {"ok": True, "deletedKey": key}
+    deleted_key = _delete_pdf_any(uid, petId, LAB_DIRS, object_id)
+    return {"ok": True, "deletedKey": deleted_key}
 
 
-# ✅ CERT 삭제: 단수/복수/예전 certificates 모두
+# ✅ CERT 삭제: cert/certs/certificates 모두 시도
 @app.delete("/cert/delete")
 @app.delete("/certs/delete")
 @app.delete("/certificates/delete")
@@ -848,16 +944,12 @@ def delete_cert_pdf(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or "unknown"
-
     object_id = (id or "").strip()
     if not object_id:
         raise HTTPException(status_code=400, detail="id is required")
 
-    filename = object_id if object_id.endswith(".pdf") else f"{object_id}.pdf"
-    key = f"{_user_prefix(uid, petId)}/cert/{filename}"
-
-    delete_from_s3(key)
-    return {"ok": True, "deletedKey": key}
+    deleted_key = _delete_pdf_any(uid, petId, CERT_DIRS, object_id)
+    return {"ok": True, "deletedKey": deleted_key}
 
 
 # ------------------------------------------------
