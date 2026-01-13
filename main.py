@@ -138,7 +138,6 @@ def get_current_user(
     을 검증하고, decoded token dict를 반환.
     """
     if settings.STUB_MODE.lower() == "true" or settings.AUTH_REQUIRED.lower() != "true":
-        # 개발 스텁
         return {"uid": "dev", "email": "dev@example.com"}
 
     init_firebase_admin()
@@ -191,13 +190,33 @@ def _presign_get_url(key: str, expires_seconds: int = 7 * 24 * 3600) -> str:
     )
 
 
+def _list_all_objects(prefix: str) -> List[Dict[str, Any]]:
+    """
+    ✅ list_objects_v2는 1000개 제한이 있으니 pagination 처리.
+    """
+    out: List[Dict[str, Any]] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": settings.S3_BUCKET_NAME, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+
+        resp = s3_client.list_objects_v2(**kwargs)
+        out.extend(resp.get("Contents") or [])
+
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return out
+
+
 def upload_to_s3(file_obj, key: str, content_type: str) -> str:
     """
     파일을 S3에 업로드하고 7일 presigned URL을 반환.
     ⚠️ S3 object Metadata는 ASCII만 허용이라, title/memo 같은 한글은 절대 Metadata로 넣지 않음.
     """
     try:
-        # 혹시 stream 포인터가 끝에 있을 수 있으니 0으로 이동
         try:
             file_obj.seek(0)
         except Exception:
@@ -433,7 +452,7 @@ class BackupDocument(BaseModel):
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.5.0")
+app = FastAPI(title="PetHealth+ Server", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -490,7 +509,6 @@ async def backup_upload(
     backup_id = uuid.uuid4().hex
     created_at = datetime.utcnow().isoformat()
 
-    # snapshot이 JSON으로 덤프 가능한지 체크 (에러 메시지 개선)
     try:
         meta = BackupMeta(
             uid=uid,
@@ -521,8 +539,7 @@ def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     prefix = f"{_backup_prefix(uid)}/"
 
-    resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-    contents = resp.get("Contents") or []
+    contents = _list_all_objects(prefix)
     if not contents:
         raise HTTPException(status_code=404, detail="백업이 아직 없어요.")
 
@@ -558,10 +575,11 @@ def backup_get(
 def backup_list(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     prefix = f"{_backup_prefix(uid)}/"
-    resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
+
+    objects = _list_all_objects(prefix)
 
     out = []
-    for obj in resp.get("Contents") or []:
+    for obj in objects:
         key = obj["Key"]
         if not key.endswith(".json"):
             continue
@@ -581,8 +599,46 @@ def backup_list(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # ------------------------------------------------
-# 9. 영수증 업로드 (alias 다수 지원)
+# 9. 영수증 업로드/저장 (OCR + 이미지 + meta.json 저장)
+#    ✅ 변경점:
+#    - 기존처럼 이미지 업로드 + OCR 분석 결과 반환은 유지
+#    - 추가로 receipts/<id>.json 메타 파일을 S3에 저장
+#    - list/get/delete API도 추가해서 "계정 스코프"로 동작하게 가능
 # ------------------------------------------------
+def _receipt_keys(uid: str, petId: str, rec_id: str, ext: str) -> Tuple[str, str]:
+    base = _user_prefix(uid, petId)
+    img_key = f"{base}/receipts/{rec_id}{ext}"
+    meta_key = f"{base}/receipts/{rec_id}.json"
+    return img_key, meta_key
+
+
+def _build_receipt_item(
+    uid: str,
+    petId: str,
+    meta_key: str,
+    meta: Dict[str, Any],
+    include_notes: bool = False,
+) -> Dict[str, Any]:
+    rec_id = meta.get("id") or meta_key.split("/")[-1].replace(".json", "")
+    img_key = meta.get("imageObjectKey") or meta.get("objectKey") or ""
+    parsed = meta.get("parsed") or {}
+    notes = meta.get("notes") if include_notes else None
+
+    created_at = meta.get("createdAt") or meta.get("created_at") or None
+
+    return {
+        "id": rec_id,
+        "uid": uid,
+        "petId": petId,
+        "createdAt": created_at,
+        "s3Url": _presign_get_url(img_key) if img_key else None,
+        "objectKey": img_key,
+        "metaObjectKey": meta_key,
+        "parsed": parsed,
+        "notes": notes,
+    }
+
+
 @app.post("/receipts/upload")
 @app.post("/api/receipt/upload")
 @app.post("/api/receipts/upload")
@@ -605,18 +661,20 @@ async def upload_receipt(
     if not ext:
         ext = ".jpg"
 
-    key = f"{_user_prefix(uid, petId)}/receipts/{rec_id}{ext}"
-
     data = await upload.read()
     if not data:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
 
+    img_key, meta_key = _receipt_keys(uid, petId, rec_id, ext)
+
+    # 1) 이미지 업로드
     file_url = upload_bytes_to_s3(
         data,
-        key,
+        img_key,
         content_type=upload.content_type or "image/jpeg",
     )
 
+    # 2) OCR
     ocr_text = ""
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
@@ -642,28 +700,150 @@ async def upload_receipt(
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
 
+    # ✅ 3) meta.json 저장 (서버에서 list/get/delete 가능해짐)
+    created_at = datetime.utcnow().isoformat()
+    receipt_meta = {
+        "schemaVersion": 1,
+        "id": rec_id,
+        "uid": uid,
+        "petId": petId,
+        "createdAt": created_at,
+        "imageObjectKey": img_key,
+        "contentType": upload.content_type or "image/jpeg",
+        "parsed": parsed_for_dto,
+        "notes": ocr_text,
+    }
+    upload_json_to_s3(receipt_meta, meta_key)
+
+    # ✅ 기존 응답 키는 유지 (Swift DTO 깨지지 않게)
     return {
+        "id": rec_id,                      # (추가) 안전
+        "createdAt": created_at,           # (추가) 안전
         "uid": uid,
         "petId": petId,
         "s3Url": file_url,
         "parsed": parsed_for_dto,
         "notes": ocr_text,
-        "objectKey": key,
+        "objectKey": img_key,
+        "metaObjectKey": meta_key,         # (추가) 안전
     }
+
+
+# ✅ 영수증 목록
+@app.get("/receipts/list")
+@app.get("/receipt/list")
+@app.get("/api/receipts/list")
+@app.get("/api/receipt/list")
+def list_receipts(
+    petId: str = Query(...),
+    includeNotes: bool = Query(False),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or "unknown"
+    base = _user_prefix(uid, petId)
+    prefix = f"{base}/receipts/"
+
+    objects = _list_all_objects(prefix)
+
+    meta_keys = [o["Key"] for o in objects if o["Key"].endswith(".json")]
+    # 최신 meta 먼저
+    meta_keys.sort(reverse=True)
+
+    items: List[Dict[str, Any]] = []
+    for mk in meta_keys:
+        meta = get_json_from_s3_optional(mk)
+        if not meta:
+            continue
+        items.append(_build_receipt_item(uid, petId, mk, meta, include_notes=includeNotes))
+
+    # createdAt 기준 정렬(없으면 id로 fallback)
+    def _sort_key(it: Dict[str, Any]) -> str:
+        return (it.get("createdAt") or "") + (it.get("id") or "")
+
+    items.sort(key=_sort_key, reverse=True)
+    return items
+
+
+# ✅ 영수증 단건 조회
+@app.get("/receipts/get")
+@app.get("/receipt/get")
+@app.get("/api/receipts/get")
+@app.get("/api/receipt/get")
+def get_receipt(
+    petId: str = Query(...),
+    id: str = Query(...),
+    includeNotes: bool = Query(True),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or "unknown"
+    rec_id = (id or "").strip()
+    if not rec_id:
+        raise HTTPException(status_code=400, detail="id is required")
+
+    base = _user_prefix(uid, petId)
+    meta_key = f"{base}/receipts/{rec_id}.json"
+
+    meta = get_json_from_s3_optional(meta_key)
+    if not meta:
+        raise HTTPException(status_code=404, detail="영수증 메타를 찾을 수 없습니다.")
+
+    return _build_receipt_item(uid, petId, meta_key, meta, include_notes=includeNotes)
+
+
+# ✅ 영수증 삭제 (이미지 + meta.json 같이 삭제)
+@app.delete("/receipts/delete")
+@app.delete("/receipt/delete")
+@app.delete("/api/receipts/delete")
+@app.delete("/api/receipt/delete")
+def delete_receipt(
+    petId: str = Query(...),
+    id: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or "unknown"
+    rec_id = (id or "").strip()
+    if not rec_id:
+        raise HTTPException(status_code=400, detail="id is required")
+
+    base = _user_prefix(uid, petId)
+
+    # 1) meta를 먼저 읽어서 이미지 key를 알아내기
+    meta_key = f"{base}/receipts/{rec_id}.json"
+    meta = get_json_from_s3_optional(meta_key)
+
+    deleted_keys = []
+
+    if meta:
+        img_key = meta.get("imageObjectKey") or meta.get("objectKey")
+        if img_key:
+            try:
+                delete_from_s3(img_key)
+                deleted_keys.append(img_key)
+            except HTTPException as e:
+                if e.status_code != 404:
+                    raise
+        delete_from_s3_if_exists(meta_key)
+        deleted_keys.append(meta_key)
+        return {"ok": True, "deleted": deleted_keys}
+
+    # 2) meta가 없으면 prefix로 싹 지우기(확장자 모를 때 대비)
+    prefix = f"{base}/receipts/{rec_id}"
+    objects = _list_all_objects(prefix)
+    if not objects:
+        raise HTTPException(status_code=404, detail="삭제할 영수증을 찾을 수 없습니다.")
+
+    for obj in objects:
+        k = obj["Key"]
+        s3_client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=k)
+        deleted_keys.append(k)
+
+    return {"ok": True, "deleted": deleted_keys}
 
 
 # ------------------------------------------------
 # 10. PDF 업로드/리스트/삭제 (검사결과 / 접종증명서)
-#     - 핵심 수정 포인트:
-#       1) user_prefix 오타 제거 → 반드시 _user_prefix 사용
-#       2) S3 Metadata에 title/memo(한글) 넣지 않음 → meta는 별도 JSON 파일로 저장
-#       3) /api/labs/... /api/certs/... 등 여러 경로를 모두 받도록 alias 추가
 # ------------------------------------------------
 def _pdf_prefix_candidates(uid: str, petId: str, kind: str) -> List[str]:
-    """
-    kind = "lab" or "cert"
-    예전 경로(labs, certs, certificates) 호환을 위해 후보 prefix를 여러 개 둠.
-    """
     base = _user_prefix(uid, petId)
 
     if kind == "lab":
@@ -675,9 +855,6 @@ def _pdf_prefix_candidates(uid: str, petId: str, kind: str) -> List[str]:
 
 
 def _make_pdf_keys(uid: str, petId: str, kind: str, record_id: str) -> Tuple[str, str]:
-    """
-    canonical key만 생성 (저장은 이 경로로만 함)
-    """
     base = _user_prefix(uid, petId)
     pdf_key = f"{base}/{kind}/{record_id}.pdf"
     meta_key = f"{base}/{kind}/{record_id}.json"
@@ -714,7 +891,6 @@ def _build_pdf_item(
     }
 
 
-# ✅ LAB 업로드: /api/lab/upload-pdf 뿐 아니라 /api/labs/upload-pdf도 받음
 @app.post("/lab/upload-pdf")
 @app.post("/labs/upload-pdf")
 @app.post("/api/lab/upload-pdf")
@@ -735,10 +911,8 @@ async def upload_lab_pdf(
     record_id = uuid.uuid4().hex
     pdf_key, meta_key = _make_pdf_keys(uid, petId, "lab", record_id)
 
-    # 1) PDF 업로드
     pdf_url = upload_bytes_to_s3(data, pdf_key, "application/pdf")
 
-    # 2) meta JSON 업로드 (한글 안전)
     meta = {
         "id": record_id,
         "uid": uid,
@@ -764,13 +938,12 @@ async def upload_lab_pdf(
     }
 
 
-# ✅ CERT 업로드: /api/cert/upload-pdf 뿐 아니라 /api/certs/upload-pdf도 받음
 @app.post("/cert/upload-pdf")
 @app.post("/certs/upload-pdf")
-@app.post("/certificates/upload-pdf")        # 예전 경로 대응
+@app.post("/certificates/upload-pdf")
 @app.post("/api/cert/upload-pdf")
 @app.post("/api/certs/upload-pdf")
-@app.post("/api/certificates/upload-pdf")   # 예전 경로 대응
+@app.post("/api/certificates/upload-pdf")
 async def upload_cert_pdf(
     petId: str = Form(...),
     title: str = Form("접종증명서"),
@@ -787,10 +960,8 @@ async def upload_cert_pdf(
     record_id = uuid.uuid4().hex
     pdf_key, meta_key = _make_pdf_keys(uid, petId, "cert", record_id)
 
-    # 1) PDF 업로드
     pdf_url = upload_bytes_to_s3(data, pdf_key, "application/pdf")
 
-    # 2) meta JSON 업로드 (한글 안전)
     meta = {
         "id": record_id,
         "uid": uid,
@@ -816,7 +987,6 @@ async def upload_cert_pdf(
     }
 
 
-# ✅ LAB 리스트: 단수/복수 모두
 @app.get("/lab/list")
 @app.get("/labs/list")
 @app.get("/api/lab/list")
@@ -831,8 +1001,7 @@ def get_lab_list(
     seen: set[str] = set()
 
     for prefix in _pdf_prefix_candidates(uid, petId, "lab"):
-        resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-        for obj in resp.get("Contents") or []:
+        for obj in _list_all_objects(prefix):
             key = obj["Key"]
             if not key.endswith(".pdf"):
                 continue
@@ -842,7 +1011,7 @@ def get_lab_list(
 
             filename = key.split("/")[-1]
             record_id = os.path.splitext(filename)[0]
-            meta_key = f"{prefix}{record_id}.json"  # 같은 prefix에 meta가 있는 경우(호환)
+            meta_key = f"{prefix}{record_id}.json"
             meta = get_json_from_s3_optional(meta_key)
 
             items.append(_build_pdf_item("lab", uid, petId, key, obj["LastModified"], meta))
@@ -851,7 +1020,6 @@ def get_lab_list(
     return items
 
 
-# ✅ CERT 리스트: 단수/복수/예전 certificates 도 모두
 @app.get("/cert/list")
 @app.get("/certs/list")
 @app.get("/certificates/list")
@@ -868,8 +1036,7 @@ def get_cert_list(
     seen: set[str] = set()
 
     for prefix in _pdf_prefix_candidates(uid, petId, "cert"):
-        resp = s3_client.list_objects_v2(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix)
-        for obj in resp.get("Contents") or []:
+        for obj in _list_all_objects(prefix):
             key = obj["Key"]
             if not key.endswith(".pdf"):
                 continue
@@ -888,7 +1055,6 @@ def get_cert_list(
     return items
 
 
-# ✅ LAB 삭제: 단수/복수 모두
 @app.delete("/lab/delete")
 @app.delete("/labs/delete")
 @app.delete("/api/lab/delete")
@@ -903,7 +1069,6 @@ def delete_lab_pdf(
     if not record_id:
         raise HTTPException(status_code=400, detail="id is required")
 
-    # 여러 prefix 후보에서 찾아서 삭제
     deleted = False
     for prefix in _pdf_prefix_candidates(uid, petId, "lab"):
         pdf_key = f"{prefix}{record_id}.pdf"
@@ -915,7 +1080,6 @@ def delete_lab_pdf(
         except HTTPException as e:
             if e.status_code != 404:
                 raise
-        # meta는 없어도 됨
         delete_from_s3_if_exists(meta_key)
 
         if deleted:
@@ -924,7 +1088,6 @@ def delete_lab_pdf(
     raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
 
 
-# ✅ CERT 삭제: 단수/복수/예전 certificates 모두
 @app.delete("/cert/delete")
 @app.delete("/certs/delete")
 @app.delete("/certificates/delete")
@@ -1177,3 +1340,5 @@ async def analyze_pet_health(
         "periodStats": period_stats,
         "careGuide": care_guide,
     }
+
+
