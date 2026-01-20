@@ -6,7 +6,7 @@ import tempfile
 import re
 import base64
 from datetime import datetime, date
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,9 +29,11 @@ from firebase_admin import auth as fb_auth
 # 1. 설정 / 외부 모듈
 # ------------------------------------------------
 try:
-    from condition_tags import CONDITION_TAGS
+    # condition_tags.py (확장판) 기준
+    from condition_tags import CONDITION_TAGS, ConditionTagConfig
 except ImportError:
     CONDITION_TAGS = {}
+    ConditionTagConfig = Any  # type: ignore
     print("Warning: condition_tags.py not found. AI tagging will be limited.")
 
 try:
@@ -64,10 +66,319 @@ class Settings(BaseSettings):
     # --- 디버그용 스텁 모드 ---
     STUB_MODE: str = "false"  # "true"면 인증/외부 호출 일부를 우회 가능
 
+    # --- ✅ 태그 매칭 강화 옵션 ---
+    # tags가 없거나(혹은 전부 unknown)일 때, record 텍스트에서 키워드 기반 태그 추론(비진단 그룹만 기본)
+    TAG_INFERENCE_ENABLED: str = "true"
+    # 기본은 진단(orthopedics/dermatology/cardiology 등) 제외하고 안전한 그룹만
+    TAG_INFERENCE_ALLOWED_GROUPS: str = "exam,medication,procedure,preventive,wellness"
+    # 점수 임계값(높을수록 오탐 감소)
+    TAG_INFERENCE_MIN_SCORE: int = 170
+    # 한 레코드에서 최대 몇 개까지 자동 부여
+    TAG_INFERENCE_MAX_TAGS: int = 6
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
+
+
+# ------------------------------------------------
+# 1.1 ✅ 태그 매칭 강화 유틸 (문장 길어도 안 빠지게)
+# ------------------------------------------------
+def _is_single_latin_character(s: str) -> bool:
+    s = (s or "").strip()
+    if len(s) != 1:
+        return False
+    c = ord(s)
+    return (65 <= c <= 90) or (97 <= c <= 122)
+
+
+def _normalize_text(s: str) -> str:
+    """
+    소문자 + 알파뉴메릭만 남김 (한글도 isalnum=True로 포함됨)
+    """
+    s = (s or "").lower()
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _tokenize_text(s: str) -> List[str]:
+    """
+    알파뉴메릭 덩어리로 토큰화 (공백/특수문자 기준)
+    """
+    out: List[str] = []
+    cur: List[str] = []
+    for ch in (s or ""):
+        if ch.isalnum():
+            cur.append(ch)
+        else:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _is_short_ascii_token(norm: str) -> bool:
+    """
+    us/ua/pi/l2 같은 짧은 ASCII 토큰은 포함검색 오탐이 많아서 "토큰 일치"만 허용
+    """
+    if not norm:
+        return False
+    if len(norm) > 2:
+        return False
+    for ch in norm:
+        o = ord(ch)
+        ok = (48 <= o <= 57) or (97 <= o <= 122)  # 0-9, a-z
+        if not ok:
+            return False
+    return True
+
+
+_WEAK_KEYWORDS_NORM: Set[str] = set(map(_normalize_text, [
+    # 너무 광범위해서 오탐 위험 큰 단어(약하게 취급)
+    "검사", "진료", "기본진료", "상담", "진찰",
+    "약", "약값", "처방", "처방약",
+    "예방", "예방접종", "백신", "접종",
+    "처치", "시술", "처치료", "시술료",
+    "기타", "other", "etc",
+]))
+
+
+def _match_score(query_raw: str, keywords: List[str], strong_fields: Optional[List[str]] = None) -> int:
+    """
+    iOS에서 했던 방식 그대로: normalize + tokenize + (contains 양방향) + 짧은 약어는 token match
+    """
+    q_raw = (query_raw or "").strip()
+    if not q_raw:
+        return 0
+
+    if _is_single_latin_character(q_raw):
+        return 0
+
+    q_norm = _normalize_text(q_raw)
+    if not q_norm:
+        return 0
+
+    tokens = [_normalize_text(t) for t in _tokenize_text(q_raw)]
+    tokens = [t for t in tokens if t]
+    token_set = set(tokens)
+
+    best = 0
+    hit_count = 0
+    strong_hit = False
+
+    def bump(score: int, is_strong: bool) -> None:
+        nonlocal best, hit_count, strong_hit
+        if score > 0:
+            hit_count += 1
+        if is_strong and score > 0:
+            strong_hit = True
+        best = max(best, score)
+
+    # 1) strong_fields (code/label 같은 “정체성 필드”)가 문장 안에 포함되면 크게
+    if strong_fields:
+        for sf in strong_fields:
+            sf_norm = _normalize_text(sf)
+            if sf_norm and sf_norm in q_norm:
+                bump(200 + min(30, len(sf_norm)), is_strong=True)
+
+    # 2) keywords 매칭
+    for k in (keywords or []):
+        k_norm = _normalize_text(k)
+        if not k_norm:
+            continue
+
+        is_weak = (k_norm in _WEAK_KEYWORDS_NORM)
+
+        # 짧은 토큰은 토큰 일치만
+        if _is_short_ascii_token(k_norm):
+            if k_norm in token_set:
+                bump(70 if is_weak else 135, is_strong=not is_weak)
+            continue
+
+        if len(k_norm) <= 1:
+            continue
+
+        if k_norm == q_norm:
+            bump(110 if is_weak else 180, is_strong=not is_weak)
+        elif k_norm in q_norm:
+            base = 55 if is_weak else 120
+            bump(base + min(60, len(k_norm) * 2), is_strong=not is_weak)
+        elif q_norm in k_norm:
+            base = 35 if is_weak else 90
+            bump(base + min(40, len(q_norm) * 2), is_strong=not is_weak)
+
+    # 3) 여러 히트 보너스
+    if hit_count >= 2:
+        best += min(35, hit_count * (8 if strong_hit else 5))
+
+    return best
+
+
+def _normalize_tag_code(code: str) -> str:
+    """
+    tag code 입력이 제멋대로 들어와도 snake_case로 최대한 정리
+    - examXray / exam-xray / EXAM_XRAY → exam_xray
+    """
+    s = (code or "").strip()
+    if not s:
+        return ""
+
+    # 공백/하이픈 → _
+    s = re.sub(r"[\s\-]+", "_", s)
+
+    # camelCase → snake_case
+    s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", s)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def _resolve_tag_config(code: str) -> Optional[Any]:
+    """
+    들어온 tag code를 CONDITION_TAGS에서 최대한 찾아서 config로 반환
+    """
+    if not code:
+        return None
+
+    raw = code.strip()
+    if raw in CONDITION_TAGS:
+        return CONDITION_TAGS[raw]
+
+    norm = _normalize_tag_code(raw)
+    if norm in CONDITION_TAGS:
+        return CONDITION_TAGS[norm]
+
+    # 마지막 fallback: 대소문자/공백 제거 키도 시도
+    norm2 = _normalize_text(raw)
+    if norm2 and norm2 in CONDITION_TAGS:
+        return CONDITION_TAGS[norm2]
+
+    return None
+
+
+def _build_canonical_tag_map() -> Dict[str, Any]:
+    """
+    CONDITION_TAGS에는 alias key들도 들어있으니, canonical(code) 기준으로 1개씩만 남김
+    """
+    out: Dict[str, Any] = {}
+    for cfg in (CONDITION_TAGS or {}).values():
+        try:
+            c = getattr(cfg, "code", None)
+            if not c:
+                continue
+            if c not in out:
+                out[c] = cfg
+        except Exception:
+            continue
+    return out
+
+
+_CANONICAL_TAGS: Dict[str, Any] = _build_canonical_tag_map()
+
+
+def _allowed_inference_groups() -> Set[str]:
+    raw = (settings.TAG_INFERENCE_ALLOWED_GROUPS or "").strip()
+    if not raw:
+        return set()
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return set(parts)
+
+
+_ALLOWED_GROUPS = _allowed_inference_groups()
+
+
+def _collect_record_text(mh: Dict[str, Any]) -> str:
+    """
+    레코드 텍스트를 최대한 합쳐서(문장형 입력에서도) 태그 매칭에 사용
+    """
+    fields: List[str] = []
+
+    # 흔히 들어오는 필드들
+    for key in [
+        "clinicName", "clinic_name",
+        "diseaseName", "disease_name",
+        "symptomsSummary", "symptoms_summary",
+        "memo", "note", "notes", "description",
+        "diagnosis", "diagnosisText", "diagnosis_text",
+        "rawText", "raw_text",
+    ]:
+        v = mh.get(key)
+        if isinstance(v, str) and v.strip():
+            fields.append(v.strip())
+
+    # items(name)
+    items = mh.get("items")
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict):
+                name = it.get("name") or it.get("title")
+                if isinstance(name, str) and name.strip():
+                    fields.append(name.strip())
+            elif isinstance(it, str) and it.strip():
+                fields.append(it.strip())
+
+    # 혹시 tags도 텍스트로 섞어두는 케이스 방어
+    tags = mh.get("tags")
+    if isinstance(tags, list):
+        fields.extend([str(t) for t in tags if t])
+
+    return " ".join(fields)
+
+
+def _infer_tags_from_text(
+    mh: Dict[str, Any],
+    species: str = "both",
+    limit: Optional[int] = None,
+) -> List[str]:
+    """
+    tags가 비어있을 때, record 텍스트에서 키워드 매칭으로 태그 보강.
+    기본은 "진단 추정" 위험 줄이기 위해 allowed group만 대상으로 함.
+    """
+    if (settings.TAG_INFERENCE_ENABLED or "").lower() != "true":
+        return []
+
+    text = _collect_record_text(mh)
+    if not text.strip():
+        return []
+
+    limit = limit if limit is not None else settings.TAG_INFERENCE_MAX_TAGS
+    min_score = int(settings.TAG_INFERENCE_MIN_SCORE)
+
+    scored: List[Tuple[str, int]] = []
+
+    for code, cfg in _CANONICAL_TAGS.items():
+        try:
+            group = (getattr(cfg, "group", "") or "").lower()
+            if _ALLOWED_GROUPS and group not in _ALLOWED_GROUPS:
+                continue
+
+            cfg_species = (getattr(cfg, "species", "both") or "both").lower()
+            # species 필터(고양이/강아지)
+            if species in ("dog", "cat"):
+                if cfg_species not in ("both", species):
+                    continue
+
+            kw_list = []
+            # strong fields: code/label
+            strong_fields = [getattr(cfg, "code", ""), getattr(cfg, "label", "")]
+            # keywords: code/label + cfg.keywords
+            kw_list.extend(strong_fields)
+            kw_list.extend(getattr(cfg, "keywords", []) or [])
+
+            s = _match_score(text, kw_list, strong_fields=strong_fields)
+            if s >= min_score:
+                scored.append((code, s))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [c for (c, _) in scored[: max(1, int(limit))]]
+
 
 # ------------------------------------------------
 # 2. Firebase Admin 초기화 & 인증 의존성
@@ -452,7 +763,7 @@ class BackupDocument(BaseModel):
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.6.0")
+app = FastAPI(title="PetHealth+ Server", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -488,6 +799,9 @@ def health():
         "gemini_enabled": settings.GEMINI_ENABLED,
         "stub_mode": settings.STUB_MODE,
         "auth_required": settings.AUTH_REQUIRED,
+        "tag_inference_enabled": settings.TAG_INFERENCE_ENABLED,
+        "tag_inference_allowed_groups": settings.TAG_INFERENCE_ALLOWED_GROUPS,
+        "tag_inference_min_score": settings.TAG_INFERENCE_MIN_SCORE,
     }
 
 
@@ -600,10 +914,6 @@ def backup_list(user: Dict[str, Any] = Depends(get_current_user)):
 
 # ------------------------------------------------
 # 9. 영수증 업로드/저장 (OCR + 이미지 + meta.json 저장)
-#    ✅ 변경점:
-#    - 기존처럼 이미지 업로드 + OCR 분석 결과 반환은 유지
-#    - 추가로 receipts/<id>.json 메타 파일을 S3에 저장
-#    - list/get/delete API도 추가해서 "계정 스코프"로 동작하게 가능
 # ------------------------------------------------
 def _receipt_keys(uid: str, petId: str, rec_id: str, ext: str) -> Tuple[str, str]:
     base = _user_prefix(uid, petId)
@@ -700,7 +1010,7 @@ async def upload_receipt(
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
 
-    # ✅ 3) meta.json 저장 (서버에서 list/get/delete 가능해짐)
+    # ✅ 3) meta.json 저장
     created_at = datetime.utcnow().isoformat()
     receipt_meta = {
         "schemaVersion": 1,
@@ -715,21 +1025,19 @@ async def upload_receipt(
     }
     upload_json_to_s3(receipt_meta, meta_key)
 
-    # ✅ 기존 응답 키는 유지 (Swift DTO 깨지지 않게)
     return {
-        "id": rec_id,                      # (추가) 안전
-        "createdAt": created_at,           # (추가) 안전
+        "id": rec_id,
+        "createdAt": created_at,
         "uid": uid,
         "petId": petId,
         "s3Url": file_url,
         "parsed": parsed_for_dto,
         "notes": ocr_text,
         "objectKey": img_key,
-        "metaObjectKey": meta_key,         # (추가) 안전
+        "metaObjectKey": meta_key,
     }
 
 
-# ✅ 영수증 목록
 @app.get("/receipts/list")
 @app.get("/receipt/list")
 @app.get("/api/receipts/list")
@@ -746,7 +1054,6 @@ def list_receipts(
     objects = _list_all_objects(prefix)
 
     meta_keys = [o["Key"] for o in objects if o["Key"].endswith(".json")]
-    # 최신 meta 먼저
     meta_keys.sort(reverse=True)
 
     items: List[Dict[str, Any]] = []
@@ -756,7 +1063,6 @@ def list_receipts(
             continue
         items.append(_build_receipt_item(uid, petId, mk, meta, include_notes=includeNotes))
 
-    # createdAt 기준 정렬(없으면 id로 fallback)
     def _sort_key(it: Dict[str, Any]) -> str:
         return (it.get("createdAt") or "") + (it.get("id") or "")
 
@@ -764,7 +1070,6 @@ def list_receipts(
     return items
 
 
-# ✅ 영수증 단건 조회
 @app.get("/receipts/get")
 @app.get("/receipt/get")
 @app.get("/api/receipts/get")
@@ -790,7 +1095,6 @@ def get_receipt(
     return _build_receipt_item(uid, petId, meta_key, meta, include_notes=includeNotes)
 
 
-# ✅ 영수증 삭제 (이미지 + meta.json 같이 삭제)
 @app.delete("/receipts/delete")
 @app.delete("/receipt/delete")
 @app.delete("/api/receipts/delete")
@@ -807,7 +1111,6 @@ def delete_receipt(
 
     base = _user_prefix(uid, petId)
 
-    # 1) meta를 먼저 읽어서 이미지 key를 알아내기
     meta_key = f"{base}/receipts/{rec_id}.json"
     meta = get_json_from_s3_optional(meta_key)
 
@@ -826,7 +1129,6 @@ def delete_receipt(
         deleted_keys.append(meta_key)
         return {"ok": True, "deleted": deleted_keys}
 
-    # 2) meta가 없으면 prefix로 싹 지우기(확장자 모를 때 대비)
     prefix = f"{base}/receipts/{rec_id}"
     objects = _list_all_objects(prefix)
     if not objects:
@@ -1124,7 +1426,7 @@ def delete_cert_pdf(
 
 
 # ------------------------------------------------
-# 11. AI 케어 (기존 유지)
+# 11. AI 케어 (태그 매칭/정규화 강화)
 # ------------------------------------------------
 def _parse_visit_date(s: Optional[str]) -> Optional[date]:
     if not s:
@@ -1140,8 +1442,52 @@ def _parse_visit_date(s: Optional[str]) -> Optional[date]:
             return None
 
 
+def _resolve_record_tags(raw_tags: Any) -> List[str]:
+    """
+    record.tags 배열을 받아서:
+    - code 정규화
+    - alias/camel/hyphen 등 최대한 CONDITION_TAGS로 resolve
+    - 최종 canonical code list 반환
+    """
+    if not raw_tags:
+        return []
+    if not isinstance(raw_tags, list):
+        return []
+
+    out: List[str] = []
+    for t in raw_tags:
+        if not t:
+            continue
+        t_str = str(t).strip()
+        if not t_str:
+            continue
+
+        cfg = _resolve_tag_config(t_str)
+        if cfg:
+            out.append(getattr(cfg, "code", t_str))
+            continue
+
+        # 그래도 못 찾으면, snake로 정규화된 코드 자체를 넣어두되(후속 분석/로그용)
+        out.append(_normalize_tag_code(t_str))
+
+    # 빈값 제거 + 중복 제거(순서 유지)
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+    for c in out:
+        c = (c or "").strip()
+        if not c:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        cleaned.append(c)
+
+    return cleaned
+
+
 def _build_tag_stats(
     medical_history: List[Dict[str, Any]],
+    species: str = "both",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
     today = date.today()
 
@@ -1153,18 +1499,36 @@ def _build_tag_stats(
         visit_dt = _parse_visit_date(visit_str)
         visit_date_str = visit_dt.isoformat() if visit_dt else None
 
-        record_tags: List[str] = mh.get("tags") or []
-        if not record_tags:
+        raw_tags = mh.get("tags") or []
+        resolved = _resolve_record_tags(raw_tags)
+
+        # ✅ tags가 없거나, 전부 unknown(=CONDITION_TAGS resolve 안 된 것들)인 경우 텍스트에서 보강
+        # 여기서 "unknown" 판단 기준: resolve된 코드가 CONDITION_TAGS에 실제로 존재하는 canonical로 변환되는지
+        has_known = False
+        for code in resolved:
+            cfg = _resolve_tag_config(code)
+            if cfg:
+                has_known = True
+                break
+
+        if not has_known:
+            inferred = _infer_tags_from_text(mh, species=species, limit=settings.TAG_INFERENCE_MAX_TAGS)
+            # inferred는 canonical code들
+            if inferred:
+                resolved = inferred
+
+        if not resolved:
             continue
 
         used_codes = set()
 
-        for code in record_tags:
-            cfg = CONDITION_TAGS.get(code)
+        for code in resolved:
+            cfg = _resolve_tag_config(code)
             if not cfg:
+                # unknown이면 건너뜀 (통계/가이드에 쓰기 애매)
                 continue
 
-            canonical_code = cfg.code
+            canonical_code = getattr(cfg, "code", code)
             if canonical_code in used_codes:
                 continue
             used_codes.add(canonical_code)
@@ -1173,7 +1537,7 @@ def _build_tag_stats(
                 canonical_code,
                 {
                     "tag": canonical_code,
-                    "label": cfg.label,
+                    "label": getattr(cfg, "label", canonical_code),
                     "group": getattr(cfg, "group", ""),
                     "count": 0,
                     "recentDates": [],
@@ -1227,13 +1591,14 @@ def _build_gemini_prompt(
         )
 
     prompt = f"""
-당신은 반려동물 건강 기록을 '정리/요약'해 주는 어시스턴트입니다. 아래 입력은 보호자가 앱에서 직접 기록한 태그(확정 정보)입니다.
+당신은 반려동물 건강 기록을 '정리/요약'해 주는 어시스턴트입니다.
 
 [중요 규칙]
-1) 아래 '태그'에 없는 질환/컨디션을 새로 추정하거나 만들어내지 마세요.
-2) group=exam/medication/procedure 태그는 '질환 진단'이 아니라 검사/처방/시술 기록입니다. 이를 근거로 질환을 단정하지 마세요.
-3) 의료적 진단/판단을 하지 말고, 보호자 관점의 정리/안심/현실적인 관리 팁만 제공하세요.
-4) 출력은 마크다운 없이 '문장만' 출력합니다. 불릿/번호/따옴표/코드블록 금지.
+1) 아래 '태그 통계'에 없는 질환/컨디션을 새로 추정하거나 만들어내지 마세요.
+2) group=exam/medication/procedure/preventive/wellness 태그는 '질환 진단'이 아니라 검사/처방/시술/예방/기록 분류입니다. 이를 근거로 질환을 단정하지 마세요.
+3) 태그는 보호자가 저장한 tags가 기본이며, tags가 비어있는 일부 기록은 메모/항목 텍스트에서 키워드 매칭으로 분류된(비진단 위주) 태그가 포함될 수 있습니다.
+4) 의료적 진단/판단을 하지 말고, 보호자 관점의 정리/안심/현실적인 관리 팁만 제공하세요.
+5) 출력은 마크다운 없이 '문장만' 출력합니다. 불릿/번호/따옴표/코드블록 금지.
 
 [반려동물 기본 정보]
 이름: {pet_name}
@@ -1241,7 +1606,7 @@ def _build_gemini_prompt(
 나이: {age_text or '정보 없음'}
 현재 체중: {weight if weight is not None else '정보 없음'} kg
 
-[확정 태그 통계]
+[태그 통계]
 {os.linesep.join(tag_lines) if tag_lines else '태그 없음'}
 
 [최근 진료 이력 요약(최대 8개)]
@@ -1298,15 +1663,20 @@ async def analyze_pet_health(
     profile = body.get("profile") or {}
     pet_name = profile.get("name") or "반려동물"
 
+    species_raw = (profile.get("species") or "dog")
+    species_norm = str(species_raw).strip().lower()
+    if species_norm not in ("dog", "cat"):
+        species_norm = "both"
+
     medical_history = body.get("medicalHistory") or body.get("medical_history") or []
     has_history = len(medical_history) > 0
 
-    tags, period_stats = _build_tag_stats(medical_history)
+    tags, period_stats = _build_tag_stats(medical_history, species=species_norm)
 
     care_guide: Dict[str, List[str]] = {}
     for t in tags:
         code = t["tag"]
-        cfg = CONDITION_TAGS.get(code)
+        cfg = _resolve_tag_config(code)
         if cfg and getattr(cfg, "guide", None):
             care_guide[code] = list(cfg.guide)
 
@@ -1323,7 +1693,7 @@ async def analyze_pet_health(
         elif not tags:
             summary = (
                 f"{pet_name}의 병원 기록은 있지만, "
-                "아직 확정 태그가 저장된 기록이 없어서 컨디션별 통계를 만들기 어려워요. "
+                "아직 태그가 확인되는 기록이 충분하지 않아서 컨디션별 통계를 만들기 어려워요. "
                 "기록할 때 태그가 함께 저장되면 더 정확하게 정리해 드릴게요."
             )
         else:
