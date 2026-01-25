@@ -967,6 +967,37 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
 # ------------------------------------------------
 # ✅ 7.1 DB APIs (Render Postgres)
 # ------------------------------------------------
+# ※ 아래 함수/라우터들은 네 main.py의 기존 DB/인증 헬퍼들(아래 이름들)을 그대로 사용한다는 전제:
+# - get_current_user, get_admin_user
+# - db_fetchone, db_fetchall
+# - PetUpsertRequest, VisitUpsertRequest
+# - app, uuid, datetime, Dict, Any, Optional, Query, Depends, HTTPException, jsonable_encoder
+
+from datetime import datetime
+
+# ✅ IMPORTANT: users 테이블에 last_seen_at 컬럼이 이미 추가되어 있어야 함
+# ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+
+def db_upsert_user(uid: str):
+    uid = (uid or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    # ✅ last_seen_at / updated_at은 요청마다 갱신
+    row = db_fetchone(
+        """
+        INSERT INTO users (firebase_uid, created_at, updated_at, last_seen_at)
+        VALUES (%s, now(), now(), now())
+        ON CONFLICT (firebase_uid) DO UPDATE SET
+            updated_at = now(),
+            last_seen_at = now()
+        RETURNING firebase_uid, created_at, updated_at, last_seen_at
+        """,
+        (uid,),
+    )
+    return row
+
+
 @app.post("/api/db/user/upsert")
 def api_user_upsert(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
@@ -977,7 +1008,7 @@ def api_user_upsert(user: Dict[str, Any] = Depends(get_current_user)):
 @app.post("/api/db/pets/upsert")
 def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
-    db_upsert_user(uid)
+    db_upsert_user(uid)  # ✅ 여기서 last_seen_at 갱신됨
 
     pet_id = (req.id or "").strip() or str(uuid.uuid4())
     name = req.name.strip()
@@ -1021,9 +1052,12 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
 @app.post("/api/db/visits/upsert")
 def api_visit_upsert(req: VisitUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
-    db_upsert_user(uid)
+    db_upsert_user(uid)  # ✅ 여기서 last_seen_at 갱신됨
 
     visit_id = (req.id or "").strip() or str(uuid.uuid4())
+
+    # ✅ 여기 부분은 네 VisitUpsertRequest 필드명에 맞춰야 함
+    # 네가 올린 코드 기준: req.pet_id, req.visited_at, req.hospital_name ...
     pet_id = req.pet_id
     visited_at = req.visited_at
     hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) else None
@@ -1107,6 +1141,23 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
     }
 
 
+# ✅ NEW: 날짜별 DAU (last_seen_at 기반)
+@app.get("/api/admin/dau")
+def admin_dau(admin: Dict[str, Any] = Depends(get_admin_user)):
+    rows = db_fetchall(
+        """
+        SELECT
+            DATE(last_seen_at) AS day,
+            COUNT(*)::int AS dau
+        FROM users
+        WHERE last_seen_at IS NOT NULL
+        GROUP BY day
+        ORDER BY day DESC
+        """
+    )
+    return jsonable_encoder(rows)
+
+
 @app.get("/api/admin/users")
 def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
     rows = db_fetchall(
@@ -1114,6 +1165,8 @@ def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
         SELECT
             u.firebase_uid,
             u.created_at,
+            u.updated_at,
+            u.last_seen_at,
             COALESCE(p.cnt, 0)::int AS pets_count,
             COALESCE(v.cnt, 0)::int AS visits_count,
             COALESCE(v.sum_cost, 0)::bigint AS total_cost_sum,
@@ -1129,7 +1182,7 @@ def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
             FROM visits
             GROUP BY user_uid
         ) v ON v.user_uid = u.firebase_uid
-        ORDER BY u.created_at DESC
+        ORDER BY u.last_seen_at DESC NULLS LAST, u.created_at DESC
         """
     )
     return jsonable_encoder(rows)
@@ -1138,7 +1191,10 @@ def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
 @app.get("/api/admin/user/{firebase_uid}")
 def admin_user_detail(firebase_uid: str, admin: Dict[str, Any] = Depends(get_admin_user)):
     uid = firebase_uid.strip()
-    user_row = db_fetchone("SELECT firebase_uid, created_at FROM users WHERE firebase_uid=%s", (uid,))
+    user_row = db_fetchone(
+        "SELECT firebase_uid, created_at, updated_at, last_seen_at FROM users WHERE firebase_uid=%s",
+        (uid,),
+    )
     if not user_row:
         raise HTTPException(status_code=404, detail="user not found")
 
@@ -1157,6 +1213,8 @@ def admin_user_detail(firebase_uid: str, admin: Dict[str, Any] = Depends(get_adm
     )
 
     return jsonable_encoder({"user": user_row, "pets": pets, "visits": visits})
+
+
 
 
 # ------------------------------------------------
@@ -2044,3 +2102,4 @@ async def analyze_pet_health(
         "periodStats": period_stats,
         "careGuide": care_guide,
     }
+
