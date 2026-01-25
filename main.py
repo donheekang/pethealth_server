@@ -20,6 +20,11 @@ from google.cloud import vision
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# ✅ Postgres (Render)
+import psycopg2
+from psycopg2.pool import SimpleConnectionPool
+from psycopg2.extras import register_uuid
+
 # Firebase Admin (Auth only)
 import firebase_admin
 from firebase_admin import credentials as fb_credentials
@@ -66,6 +71,17 @@ class Settings(BaseSettings):
     # --- 디버그용 스텁 모드 ---
     STUB_MODE: str = "false"  # "true"면 인증/외부 호출 일부를 우회 가능
 
+    # ✅ -----------------------------
+    # ✅ Render Postgres (DB)
+    # ✅ -----------------------------
+    DATABASE_URL: str = ""        # Render Internal Database URL
+    DB_AUTO_MIGRATE: str = "true" # 서버 시작 시 테이블/컬럼 보정
+    DB_POOL_MIN: int = 1
+    DB_POOL_MAX: int = 5
+
+    # ✅ 관리자 통계 API 접근 가능한 Firebase UID들(쉼표로 구분)
+    ADMIN_UIDS: str = ""
+
     # --- ✅ 태그 매칭 강화 옵션 ---
     # tags가 없거나(혹은 전부 unknown)일 때, record 텍스트에서 키워드 기반 태그 추론(비진단 그룹만 기본)
     TAG_INFERENCE_ENABLED: str = "true"
@@ -80,6 +96,182 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ------------------------------------------------
+# ✅ 1.0 Render Postgres 연결 (DB Pool + Schema)
+# ------------------------------------------------
+_db_pool: Optional[SimpleConnectionPool] = None
+
+
+def _admin_uid_set() -> Set[str]:
+    return {u.strip() for u in (settings.ADMIN_UIDS or "").split(",") if u.strip()}
+
+
+def _normalize_database_url(url: str) -> str:
+    """
+    Render에서 DATABASE_URL이 postgres:// 로 오는 경우가 있는데,
+    일부 환경에서 postgresql:// 을 기대하는 경우가 있어 안전하게 변환.
+    psycopg2는 대부분 postgres:// 도 되지만, 그냥 안전하게 처리.
+    """
+    u = (url or "").strip()
+    if u.startswith("postgres://"):
+        return "postgresql://" + u[len("postgres://"):]
+    return u
+
+
+def init_db_pool() -> None:
+    global _db_pool
+    if _db_pool is not None:
+        return
+
+    if not (settings.DATABASE_URL or "").strip():
+        print("[DB] DATABASE_URL empty -> DB features disabled.")
+        return
+
+    dsn = _normalize_database_url(settings.DATABASE_URL)
+
+    try:
+        register_uuid()
+        _db_pool = SimpleConnectionPool(
+            minconn=int(settings.DB_POOL_MIN),
+            maxconn=int(settings.DB_POOL_MAX),
+            dsn=dsn,
+        )
+        print("[DB] Pool initialized.")
+
+        if (settings.DB_AUTO_MIGRATE or "").lower() == "true":
+            conn = _db_pool.getconn()
+            try:
+                _init_db_schema(conn)
+                conn.commit()
+                print("[DB] Schema ensured.")
+            finally:
+                _db_pool.putconn(conn)
+
+    except Exception as e:
+        print("[DB] init failed:", e)
+        _db_pool = None
+        raise
+
+
+def close_db_pool() -> None:
+    global _db_pool
+    if _db_pool is None:
+        return
+    try:
+        _db_pool.closeall()
+        print("[DB] Pool closed.")
+    except Exception as e:
+        print("[DB] close failed:", e)
+    finally:
+        _db_pool = None
+
+
+def get_db_conn():
+    """
+    FastAPI dependency:
+    - conn 빌려주고
+    - 정상 commit / 에러 rollback
+    """
+    if _db_pool is None:
+        raise HTTPException(status_code=503, detail="DB not configured (DATABASE_URL missing)")
+
+    conn = _db_pool.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _db_pool.putconn(conn)
+
+
+def _init_db_schema(conn) -> None:
+    """
+    ✅ 이미 테이블이 있어도 안전하게:
+    - create table if not exists
+    - alter table add column if not exists
+    - index 생성
+    """
+    with conn.cursor() as cur:
+        # users
+        cur.execute("""
+        create table if not exists users (
+          firebase_uid text primary key,
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now()
+        );
+        """)
+        cur.execute("alter table users add column if not exists created_at timestamptz not null default now();")
+        cur.execute("alter table users add column if not exists updated_at timestamptz not null default now();")
+        cur.execute("create unique index if not exists users_firebase_uid_uidx on users(firebase_uid);")
+
+        # pets
+        cur.execute("""
+        create table if not exists pets (
+          id uuid primary key,
+          firebase_uid text not null,
+          name text not null,
+          species text not null,
+          birthday date,
+          allergies text[] not null default '{}',
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now()
+        );
+        """)
+        cur.execute("alter table pets add column if not exists firebase_uid text;")
+        cur.execute("alter table pets add column if not exists name text;")
+        cur.execute("alter table pets add column if not exists species text;")
+        cur.execute("alter table pets add column if not exists birthday date;")
+        cur.execute("alter table pets add column if not exists allergies text[] not null default '{}';")
+        cur.execute("alter table pets add column if not exists created_at timestamptz not null default now();")
+        cur.execute("alter table pets add column if not exists updated_at timestamptz not null default now();")
+        cur.execute("create unique index if not exists pets_id_uidx on pets(id);")
+        cur.execute("create index if not exists pets_user_idx on pets(firebase_uid);")
+
+        # visits
+        cur.execute("""
+        create table if not exists visits (
+          id uuid primary key,
+          firebase_uid text not null,
+          pet_id uuid not null,
+          visited_at date not null,
+          hospital_name text,
+          total_cost integer not null default 0,
+          memo text,
+          tags text[] not null default '{}',
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now()
+        );
+        """)
+        cur.execute("alter table visits add column if not exists firebase_uid text;")
+        cur.execute("alter table visits add column if not exists pet_id uuid;")
+        cur.execute("alter table visits add column if not exists visited_at date;")
+        cur.execute("alter table visits add column if not exists hospital_name text;")
+        cur.execute("alter table visits add column if not exists total_cost integer not null default 0;")
+        cur.execute("alter table visits add column if not exists memo text;")
+        cur.execute("alter table visits add column if not exists tags text[] not null default '{}';")
+        cur.execute("alter table visits add column if not exists created_at timestamptz not null default now();")
+        cur.execute("alter table visits add column if not exists updated_at timestamptz not null default now();")
+        cur.execute("create unique index if not exists visits_id_uidx on visits(id);")
+        cur.execute("create index if not exists visits_user_idx on visits(firebase_uid);")
+        cur.execute("create index if not exists visits_pet_idx on visits(pet_id);")
+        cur.execute("create index if not exists visits_visited_at_idx on visits(visited_at);")
+
+
+def _ensure_user_row(conn, uid: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into users(firebase_uid, created_at, updated_at)
+            values (%s, now(), now())
+            on conflict (firebase_uid) do update
+              set updated_at = now()
+            """,
+            (uid,),
+        )
 
 
 # ------------------------------------------------
@@ -784,6 +976,17 @@ def _startup():
     else:
         print("[Startup] Auth not required or STUB_MODE. Skipping Firebase init.")
 
+    # ✅ DB init
+    try:
+        init_db_pool()
+    except Exception as e:
+        print("[Startup] DB init failed:", e)
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    close_db_pool()
+
 
 @app.get("/")
 def root():
@@ -802,12 +1005,240 @@ def health():
         "tag_inference_enabled": settings.TAG_INFERENCE_ENABLED,
         "tag_inference_allowed_groups": settings.TAG_INFERENCE_ALLOWED_GROUPS,
         "tag_inference_min_score": settings.TAG_INFERENCE_MIN_SCORE,
+        "db_configured": bool((settings.DATABASE_URL or "").strip()),
+        "db_auto_migrate": settings.DB_AUTO_MIGRATE,
     }
+
+
+@app.get("/health/db")
+@app.get("/api/health/db")
+def health_db(conn=Depends(get_db_conn)):
+    with conn.cursor() as cur:
+        cur.execute("select 1;")
+        return {"ok": True, "db": cur.fetchone()[0]}
 
 
 @app.get("/api/me")
 def me(user: Dict[str, Any] = Depends(get_current_user)):
     return {"uid": user.get("uid"), "email": user.get("email")}
+
+
+# ------------------------------------------------
+# ✅ 7.1 DB 기반 최소 API 5개 + Admin Summary
+# ------------------------------------------------
+class PetUpsertBody(BaseModel):
+    id: uuid.UUID
+    name: str
+    species: str                # "dog" | "cat" | "other"
+    birthday: Optional[date] = None
+    allergies: List[str] = []
+
+
+class VisitUpsertBody(BaseModel):
+    id: uuid.UUID
+    pet_id: uuid.UUID
+    visited_at: date
+    hospital_name: Optional[str] = None
+    total_cost: int = 0
+    memo: Optional[str] = None
+    tags: List[str] = []
+
+
+@app.post("/api/v1/me/ensure")
+def ensure_me(user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
+    uid = user.get("uid") or "unknown"
+    _ensure_user_row(conn, uid)
+    return {"ok": True, "uid": uid}
+
+
+@app.get("/api/v1/pets")
+def list_pets(user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
+    uid = user.get("uid") or "unknown"
+    _ensure_user_row(conn, uid)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select id::text, name, species, birthday, allergies, created_at, updated_at
+            from pets
+            where firebase_uid = %s
+            order by updated_at desc, created_at desc
+            """,
+            (uid,),
+        )
+        rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r[0],
+            "name": r[1],
+            "species": r[2],
+            "birthday": r[3].isoformat() if r[3] else None,
+            "allergies": r[4] or [],
+            "created_at": r[5].isoformat() if r[5] else None,
+            "updated_at": r[6].isoformat() if r[6] else None,
+        })
+    return {"items": items}
+
+
+@app.post("/api/v1/pets/upsert")
+def upsert_pet(body: PetUpsertBody, user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
+    uid = user.get("uid") or "unknown"
+    _ensure_user_row(conn, uid)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into pets(id, firebase_uid, name, species, birthday, allergies, updated_at)
+            values (%s, %s, %s, %s, %s, %s, now())
+            on conflict (id) do update
+              set name = excluded.name,
+                  species = excluded.species,
+                  birthday = excluded.birthday,
+                  allergies = excluded.allergies,
+                  updated_at = now()
+            where pets.firebase_uid = excluded.firebase_uid
+            returning id::text
+            """,
+            (str(body.id), uid, body.name, body.species, body.birthday, body.allergies),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=403, detail="Forbidden: pet id belongs to another user")
+
+    return {"ok": True, "id": row[0]}
+
+
+@app.get("/api/v1/visits")
+def list_visits(
+    petId: Optional[str] = Query(None),
+    user: Dict[str, Any] = Depends(get_current_user),
+    conn=Depends(get_db_conn),
+):
+    uid = user.get("uid") or "unknown"
+    _ensure_user_row(conn, uid)
+
+    with conn.cursor() as cur:
+        if petId:
+            cur.execute(
+                """
+                select id::text, pet_id::text, visited_at, hospital_name, total_cost, memo, tags, created_at, updated_at
+                from visits
+                where firebase_uid = %s and pet_id = %s
+                order by visited_at desc, created_at desc
+                """,
+                (uid, petId),
+            )
+        else:
+            cur.execute(
+                """
+                select id::text, pet_id::text, visited_at, hospital_name, total_cost, memo, tags, created_at, updated_at
+                from visits
+                where firebase_uid = %s
+                order by visited_at desc, created_at desc
+                """,
+                (uid,),
+            )
+        rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r[0],
+            "pet_id": r[1],
+            "visited_at": r[2].isoformat() if r[2] else None,
+            "hospital_name": r[3],
+            "total_cost": r[4],
+            "memo": r[5],
+            "tags": r[6] or [],
+            "created_at": r[7].isoformat() if r[7] else None,
+            "updated_at": r[8].isoformat() if r[8] else None,
+        })
+    return {"items": items}
+
+
+@app.post("/api/v1/visits/upsert")
+def upsert_visit(body: VisitUpsertBody, user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
+    uid = user.get("uid") or "unknown"
+    _ensure_user_row(conn, uid)
+
+    with conn.cursor() as cur:
+        # ✅ 내 펫인지 확인
+        cur.execute("select 1 from pets where id = %s and firebase_uid = %s", (str(body.pet_id), uid))
+        ok = cur.fetchone()
+        if not ok:
+            raise HTTPException(status_code=404, detail="Pet not found for this user")
+
+        cur.execute(
+            """
+            insert into visits(id, firebase_uid, pet_id, visited_at, hospital_name, total_cost, memo, tags, updated_at)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, now())
+            on conflict (id) do update
+              set visited_at = excluded.visited_at,
+                  hospital_name = excluded.hospital_name,
+                  total_cost = excluded.total_cost,
+                  memo = excluded.memo,
+                  tags = excluded.tags,
+                  updated_at = now()
+            where visits.firebase_uid = excluded.firebase_uid
+            returning id::text
+            """,
+            (
+                str(body.id),
+                uid,
+                str(body.pet_id),
+                body.visited_at,
+                body.hospital_name,
+                body.total_cost,
+                body.memo,
+                body.tags,
+            ),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=403, detail="Forbidden: visit id belongs to another user")
+
+    return {"ok": True, "id": row[0]}
+
+
+@app.get("/api/v1/admin/summary")
+def admin_summary(user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
+    uid = user.get("uid") or "unknown"
+    admins = _admin_uid_set()
+    if not admins:
+        raise HTTPException(status_code=501, detail="ADMIN_UIDS env var not set")
+    if uid not in admins:
+        raise HTTPException(status_code=403, detail="Not an admin")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select
+              v.firebase_uid,
+              count(distinct v.pet_id) as pet_count,
+              count(*) as visit_count,
+              coalesce(sum(v.total_cost), 0) as total_spent
+            from visits v
+            group by v.firebase_uid
+            order by total_spent desc
+            """
+        )
+        rows = cur.fetchall()
+
+    return {
+        "items": [
+            {
+                "user_uid": r[0],
+                "pet_count": r[1],
+                "visit_count": r[2],
+                "total_spent": r[3],
+            }
+            for r in rows
+        ]
+    }
 
 
 # ------------------------------------------------
@@ -1503,7 +1934,6 @@ def _build_tag_stats(
         resolved = _resolve_record_tags(raw_tags)
 
         # ✅ tags가 없거나, 전부 unknown(=CONDITION_TAGS resolve 안 된 것들)인 경우 텍스트에서 보강
-        # 여기서 "unknown" 판단 기준: resolve된 코드가 CONDITION_TAGS에 실제로 존재하는 canonical로 변환되는지
         has_known = False
         for code in resolved:
             cfg = _resolve_tag_config(code)
@@ -1513,7 +1943,6 @@ def _build_tag_stats(
 
         if not has_known:
             inferred = _infer_tags_from_text(mh, species=species, limit=settings.TAG_INFERENCE_MAX_TAGS)
-            # inferred는 canonical code들
             if inferred:
                 resolved = inferred
 
@@ -1525,7 +1954,6 @@ def _build_tag_stats(
         for code in resolved:
             cfg = _resolve_tag_config(code)
             if not cfg:
-                # unknown이면 건너뜀 (통계/가이드에 쓰기 애매)
                 continue
 
             canonical_code = getattr(cfg, "code", code)
