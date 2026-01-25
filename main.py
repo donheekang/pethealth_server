@@ -5,36 +5,36 @@ import uuid
 import tempfile
 import re
 import base64
+from contextlib import contextmanager
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any, Tuple, Set
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.encoders import jsonable_encoder
 
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 
 from google.cloud import vision
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from pydantic import ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# ✅ Postgres (Render)
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
-from psycopg2.extras import register_uuid
 
 # Firebase Admin (Auth only)
 import firebase_admin
 from firebase_admin import credentials as fb_credentials
 from firebase_admin import auth as fb_auth
 
-# ------------------------------------------------
-# 1. 설정 / 외부 모듈
-# ------------------------------------------------
+# PostgreSQL
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import RealDictCursor
+import psycopg2.extras
+
 try:
-    # condition_tags.py (확장판) 기준
     from condition_tags import CONDITION_TAGS, ConditionTagConfig
 except ImportError:
     CONDITION_TAGS = {}
@@ -50,10 +50,10 @@ except ImportError:
 
 class Settings(BaseSettings):
     # --- AWS / S3 ---
-    AWS_ACCESS_KEY_ID: str
-    AWS_SECRET_ACCESS_KEY: str
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "ap-northeast-2"
-    S3_BUCKET_NAME: str
+    S3_BUCKET_NAME: str = ""
 
     # --- Google Vision ---
     GOOGLE_APPLICATION_CREDENTIALS: str = ""  # JSON string or file path
@@ -71,52 +71,37 @@ class Settings(BaseSettings):
     # --- 디버그용 스텁 모드 ---
     STUB_MODE: str = "false"  # "true"면 인증/외부 호출 일부를 우회 가능
 
-    # ✅ -----------------------------
-    # ✅ Render Postgres (DB)
-    # ✅ -----------------------------
-    DATABASE_URL: str = ""        # Render Internal Database URL
-    DB_AUTO_MIGRATE: str = "true" # 서버 시작 시 테이블/컬럼 보정
+    # --- ✅ 태그 매칭 강화 옵션 ---
+    TAG_INFERENCE_ENABLED: str = "true"
+    TAG_INFERENCE_ALLOWED_GROUPS: str = "exam,medication,procedure,preventive,wellness"
+    TAG_INFERENCE_MIN_SCORE: int = 170
+    TAG_INFERENCE_MAX_TAGS: int = 6
+
+    # --- ✅ Postgres (Render) ---
+    DB_ENABLED: str = "true"
+    DATABASE_URL: str = ""  # Render Internal Database URL
     DB_POOL_MIN: int = 1
     DB_POOL_MAX: int = 5
+    DB_AUTO_UPSERT_USER: str = "true"  # 인증 성공 시 users 테이블 upsert
 
-    # ✅ 관리자 통계 API 접근 가능한 Firebase UID들(쉼표로 구분)
-    ADMIN_UIDS: str = ""
-
-    # --- ✅ 태그 매칭 강화 옵션 ---
-    # tags가 없거나(혹은 전부 unknown)일 때, record 텍스트에서 키워드 기반 태그 추론(비진단 그룹만 기본)
-    TAG_INFERENCE_ENABLED: str = "true"
-    # 기본은 진단(orthopedics/dermatology/cardiology 등) 제외하고 안전한 그룹만
-    TAG_INFERENCE_ALLOWED_GROUPS: str = "exam,medication,procedure,preventive,wellness"
-    # 점수 임계값(높을수록 오탐 감소)
-    TAG_INFERENCE_MIN_SCORE: int = 170
-    # 한 레코드에서 최대 몇 개까지 자동 부여
-    TAG_INFERENCE_MAX_TAGS: int = 6
+    # --- ✅ Admin ---
+    ADMIN_UIDS: str = ""  # comma-separated firebase uids
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
 
-
 # ------------------------------------------------
-# ✅ 1.0 Render Postgres 연결 (DB Pool + Schema)
+# DB (PostgreSQL) helpers
 # ------------------------------------------------
-_db_pool: Optional[SimpleConnectionPool] = None
+_db_pool: Optional[ThreadedConnectionPool] = None
 
 
-def _admin_uid_set() -> Set[str]:
-    return {u.strip() for u in (settings.ADMIN_UIDS or "").split(",") if u.strip()}
-
-
-def _normalize_database_url(url: str) -> str:
-    """
-    Render에서 DATABASE_URL이 postgres:// 로 오는 경우가 있는데,
-    일부 환경에서 postgresql:// 을 기대하는 경우가 있어 안전하게 변환.
-    psycopg2는 대부분 postgres:// 도 되지만, 그냥 안전하게 처리.
-    """
+def _normalize_db_url(url: str) -> str:
     u = (url or "").strip()
     if u.startswith("postgres://"):
-        return "postgresql://" + u[len("postgres://"):]
+        u = "postgresql://" + u[len("postgres://") :]
     return u
 
 
@@ -124,59 +109,44 @@ def init_db_pool() -> None:
     global _db_pool
     if _db_pool is not None:
         return
-
-    if not (settings.DATABASE_URL or "").strip():
-        print("[DB] DATABASE_URL empty -> DB features disabled.")
+    if (settings.DB_ENABLED or "").lower() != "true":
+        print("[DB] DB_ENABLED=false. Skipping DB init.")
+        return
+    if not settings.DATABASE_URL:
+        print("[DB] DATABASE_URL is empty. Skipping DB init.")
         return
 
-    dsn = _normalize_database_url(settings.DATABASE_URL)
+    dsn = _normalize_db_url(settings.DATABASE_URL)
 
     try:
-        register_uuid()
-        _db_pool = SimpleConnectionPool(
+        psycopg2.extras.register_uuid()
+        _db_pool = ThreadedConnectionPool(
             minconn=int(settings.DB_POOL_MIN),
             maxconn=int(settings.DB_POOL_MAX),
             dsn=dsn,
         )
-        print("[DB] Pool initialized.")
-
-        if (settings.DB_AUTO_MIGRATE or "").lower() == "true":
-            conn = _db_pool.getconn()
-            try:
-                _init_db_schema(conn)
-                conn.commit()
-                print("[DB] Schema ensured.")
-            finally:
-                _db_pool.putconn(conn)
-
+        print("[DB] Postgres pool initialized.")
     except Exception as e:
-        print("[DB] init failed:", e)
         _db_pool = None
-        raise
+        print("[DB] Postgres pool init failed:", e)
 
 
-def close_db_pool() -> None:
-    global _db_pool
+def _require_db() -> None:
+    if (settings.DB_ENABLED or "").lower() != "true":
+        raise HTTPException(status_code=503, detail="DB is disabled (DB_ENABLED=false)")
+    if not settings.DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not set")
     if _db_pool is None:
-        return
-    try:
-        _db_pool.closeall()
-        print("[DB] Pool closed.")
-    except Exception as e:
-        print("[DB] close failed:", e)
-    finally:
-        _db_pool = None
-
-
-def get_db_conn():
-    """
-    FastAPI dependency:
-    - conn 빌려주고
-    - 정상 commit / 에러 rollback
-    """
+        # try lazy init
+        init_db_pool()
     if _db_pool is None:
-        raise HTTPException(status_code=503, detail="DB not configured (DATABASE_URL missing)")
+        raise HTTPException(status_code=503, detail="DB connection pool is not ready")
 
+
+@contextmanager
+def db_conn():
+    _require_db()
+    assert _db_pool is not None
     conn = _db_pool.getconn()
     try:
         yield conn
@@ -188,90 +158,57 @@ def get_db_conn():
         _db_pool.putconn(conn)
 
 
-def _init_db_schema(conn) -> None:
+def db_fetchone(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def db_fetchall(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+            return [dict(r) for r in rows]
+
+
+def db_execute(sql: str, params: Tuple[Any, ...] = ()) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.rowcount
+
+
+def db_upsert_user(firebase_uid: str) -> Dict[str, Any]:
     """
-    ✅ 이미 테이블이 있어도 안전하게:
-    - create table if not exists
-    - alter table add column if not exists
-    - index 생성
+    users(firebase_uid PK/UNIQUE) 존재 보장.
     """
-    with conn.cursor() as cur:
-        # users
-        cur.execute("""
-        create table if not exists users (
-          firebase_uid text primary key,
-          created_at timestamptz not null default now(),
-          updated_at timestamptz not null default now()
-        );
-        """)
-        cur.execute("alter table users add column if not exists created_at timestamptz not null default now();")
-        cur.execute("alter table users add column if not exists updated_at timestamptz not null default now();")
-        cur.execute("create unique index if not exists users_firebase_uid_uidx on users(firebase_uid);")
+    uid = (firebase_uid or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="firebase_uid is empty")
 
-        # pets
-        cur.execute("""
-        create table if not exists pets (
-          id uuid primary key,
-          firebase_uid text not null,
-          name text not null,
-          species text not null,
-          birthday date,
-          allergies text[] not null default '{}',
-          created_at timestamptz not null default now(),
-          updated_at timestamptz not null default now()
-        );
-        """)
-        cur.execute("alter table pets add column if not exists firebase_uid text;")
-        cur.execute("alter table pets add column if not exists name text;")
-        cur.execute("alter table pets add column if not exists species text;")
-        cur.execute("alter table pets add column if not exists birthday date;")
-        cur.execute("alter table pets add column if not exists allergies text[] not null default '{}';")
-        cur.execute("alter table pets add column if not exists created_at timestamptz not null default now();")
-        cur.execute("alter table pets add column if not exists updated_at timestamptz not null default now();")
-        cur.execute("create unique index if not exists pets_id_uidx on pets(id);")
-        cur.execute("create index if not exists pets_user_idx on pets(firebase_uid);")
+    row = db_fetchone(
+        """
+        INSERT INTO users(firebase_uid)
+        VALUES (%s)
+        ON CONFLICT (firebase_uid) DO NOTHING
+        RETURNING firebase_uid, created_at
+        """,
+        (uid,),
+    )
+    if row:
+        return row
 
-        # visits
-        cur.execute("""
-        create table if not exists visits (
-          id uuid primary key,
-          firebase_uid text not null,
-          pet_id uuid not null,
-          visited_at date not null,
-          hospital_name text,
-          total_cost integer not null default 0,
-          memo text,
-          tags text[] not null default '{}',
-          created_at timestamptz not null default now(),
-          updated_at timestamptz not null default now()
-        );
-        """)
-        cur.execute("alter table visits add column if not exists firebase_uid text;")
-        cur.execute("alter table visits add column if not exists pet_id uuid;")
-        cur.execute("alter table visits add column if not exists visited_at date;")
-        cur.execute("alter table visits add column if not exists hospital_name text;")
-        cur.execute("alter table visits add column if not exists total_cost integer not null default 0;")
-        cur.execute("alter table visits add column if not exists memo text;")
-        cur.execute("alter table visits add column if not exists tags text[] not null default '{}';")
-        cur.execute("alter table visits add column if not exists created_at timestamptz not null default now();")
-        cur.execute("alter table visits add column if not exists updated_at timestamptz not null default now();")
-        cur.execute("create unique index if not exists visits_id_uidx on visits(id);")
-        cur.execute("create index if not exists visits_user_idx on visits(firebase_uid);")
-        cur.execute("create index if not exists visits_pet_idx on visits(pet_id);")
-        cur.execute("create index if not exists visits_visited_at_idx on visits(visited_at);")
-
-
-def _ensure_user_row(conn, uid: str) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into users(firebase_uid, created_at, updated_at)
-            values (%s, now(), now())
-            on conflict (firebase_uid) do update
-              set updated_at = now()
-            """,
-            (uid,),
-        )
+    existing = db_fetchone(
+        "SELECT firebase_uid, created_at FROM users WHERE firebase_uid=%s",
+        (uid,),
+    )
+    if not existing:
+        # unexpected
+        raise HTTPException(status_code=500, detail="Failed to upsert user")
+    return existing
 
 
 # ------------------------------------------------
@@ -286,17 +223,11 @@ def _is_single_latin_character(s: str) -> bool:
 
 
 def _normalize_text(s: str) -> str:
-    """
-    소문자 + 알파뉴메릭만 남김 (한글도 isalnum=True로 포함됨)
-    """
     s = (s or "").lower()
     return "".join(ch for ch in s if ch.isalnum())
 
 
 def _tokenize_text(s: str) -> List[str]:
-    """
-    알파뉴메릭 덩어리로 토큰화 (공백/특수문자 기준)
-    """
     out: List[str] = []
     cur: List[str] = []
     for ch in (s or ""):
@@ -312,23 +243,19 @@ def _tokenize_text(s: str) -> List[str]:
 
 
 def _is_short_ascii_token(norm: str) -> bool:
-    """
-    us/ua/pi/l2 같은 짧은 ASCII 토큰은 포함검색 오탐이 많아서 "토큰 일치"만 허용
-    """
     if not norm:
         return False
     if len(norm) > 2:
         return False
     for ch in norm:
         o = ord(ch)
-        ok = (48 <= o <= 57) or (97 <= o <= 122)  # 0-9, a-z
+        ok = (48 <= o <= 57) or (97 <= o <= 122)
         if not ok:
             return False
     return True
 
 
 _WEAK_KEYWORDS_NORM: Set[str] = set(map(_normalize_text, [
-    # 너무 광범위해서 오탐 위험 큰 단어(약하게 취급)
     "검사", "진료", "기본진료", "상담", "진찰",
     "약", "약값", "처방", "처방약",
     "예방", "예방접종", "백신", "접종",
@@ -338,13 +265,9 @@ _WEAK_KEYWORDS_NORM: Set[str] = set(map(_normalize_text, [
 
 
 def _match_score(query_raw: str, keywords: List[str], strong_fields: Optional[List[str]] = None) -> int:
-    """
-    iOS에서 했던 방식 그대로: normalize + tokenize + (contains 양방향) + 짧은 약어는 token match
-    """
     q_raw = (query_raw or "").strip()
     if not q_raw:
         return 0
-
     if _is_single_latin_character(q_raw):
         return 0
 
@@ -368,22 +291,18 @@ def _match_score(query_raw: str, keywords: List[str], strong_fields: Optional[Li
             strong_hit = True
         best = max(best, score)
 
-    # 1) strong_fields (code/label 같은 “정체성 필드”)가 문장 안에 포함되면 크게
     if strong_fields:
         for sf in strong_fields:
             sf_norm = _normalize_text(sf)
             if sf_norm and sf_norm in q_norm:
                 bump(200 + min(30, len(sf_norm)), is_strong=True)
 
-    # 2) keywords 매칭
     for k in (keywords or []):
         k_norm = _normalize_text(k)
         if not k_norm:
             continue
-
         is_weak = (k_norm in _WEAK_KEYWORDS_NORM)
 
-        # 짧은 토큰은 토큰 일치만
         if _is_short_ascii_token(k_norm):
             if k_norm in token_set:
                 bump(70 if is_weak else 135, is_strong=not is_weak)
@@ -401,7 +320,6 @@ def _match_score(query_raw: str, keywords: List[str], strong_fields: Optional[Li
             base = 35 if is_weak else 90
             bump(base + min(40, len(q_norm) * 2), is_strong=not is_weak)
 
-    # 3) 여러 히트 보너스
     if hit_count >= 2:
         best += min(35, hit_count * (8 if strong_hit else 5))
 
@@ -409,21 +327,12 @@ def _match_score(query_raw: str, keywords: List[str], strong_fields: Optional[Li
 
 
 def _normalize_tag_code(code: str) -> str:
-    """
-    tag code 입력이 제멋대로 들어와도 snake_case로 최대한 정리
-    - examXray / exam-xray / EXAM_XRAY → exam_xray
-    """
     s = (code or "").strip()
     if not s:
         return ""
-
-    # 공백/하이픈 → _
     s = re.sub(r"[\s\-]+", "_", s)
-
-    # camelCase → snake_case
     s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", s)
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
-
     s = s.lower()
     s = re.sub(r"[^a-z0-9_]", "", s)
     s = re.sub(r"_+", "_", s).strip("_")
@@ -431,32 +340,21 @@ def _normalize_tag_code(code: str) -> str:
 
 
 def _resolve_tag_config(code: str) -> Optional[Any]:
-    """
-    들어온 tag code를 CONDITION_TAGS에서 최대한 찾아서 config로 반환
-    """
     if not code:
         return None
-
     raw = code.strip()
     if raw in CONDITION_TAGS:
         return CONDITION_TAGS[raw]
-
     norm = _normalize_tag_code(raw)
     if norm in CONDITION_TAGS:
         return CONDITION_TAGS[norm]
-
-    # 마지막 fallback: 대소문자/공백 제거 키도 시도
     norm2 = _normalize_text(raw)
     if norm2 and norm2 in CONDITION_TAGS:
         return CONDITION_TAGS[norm2]
-
     return None
 
 
 def _build_canonical_tag_map() -> Dict[str, Any]:
-    """
-    CONDITION_TAGS에는 alias key들도 들어있으니, canonical(code) 기준으로 1개씩만 남김
-    """
     out: Dict[str, Any] = {}
     for cfg in (CONDITION_TAGS or {}).values():
         try:
@@ -485,12 +383,7 @@ _ALLOWED_GROUPS = _allowed_inference_groups()
 
 
 def _collect_record_text(mh: Dict[str, Any]) -> str:
-    """
-    레코드 텍스트를 최대한 합쳐서(문장형 입력에서도) 태그 매칭에 사용
-    """
     fields: List[str] = []
-
-    # 흔히 들어오는 필드들
     for key in [
         "clinicName", "clinic_name",
         "diseaseName", "disease_name",
@@ -503,7 +396,6 @@ def _collect_record_text(mh: Dict[str, Any]) -> str:
         if isinstance(v, str) and v.strip():
             fields.append(v.strip())
 
-    # items(name)
     items = mh.get("items")
     if isinstance(items, list):
         for it in items:
@@ -514,7 +406,6 @@ def _collect_record_text(mh: Dict[str, Any]) -> str:
             elif isinstance(it, str) and it.strip():
                 fields.append(it.strip())
 
-    # 혹시 tags도 텍스트로 섞어두는 케이스 방어
     tags = mh.get("tags")
     if isinstance(tags, list):
         fields.extend([str(t) for t in tags if t])
@@ -527,10 +418,6 @@ def _infer_tags_from_text(
     species: str = "both",
     limit: Optional[int] = None,
 ) -> List[str]:
-    """
-    tags가 비어있을 때, record 텍스트에서 키워드 매칭으로 태그 보강.
-    기본은 "진단 추정" 위험 줄이기 위해 allowed group만 대상으로 함.
-    """
     if (settings.TAG_INFERENCE_ENABLED or "").lower() != "true":
         return []
 
@@ -542,23 +429,17 @@ def _infer_tags_from_text(
     min_score = int(settings.TAG_INFERENCE_MIN_SCORE)
 
     scored: List[Tuple[str, int]] = []
-
     for code, cfg in _CANONICAL_TAGS.items():
         try:
             group = (getattr(cfg, "group", "") or "").lower()
             if _ALLOWED_GROUPS and group not in _ALLOWED_GROUPS:
                 continue
-
             cfg_species = (getattr(cfg, "species", "both") or "both").lower()
-            # species 필터(고양이/강아지)
-            if species in ("dog", "cat"):
-                if cfg_species not in ("both", species):
-                    continue
+            if species in ("dog", "cat") and cfg_species not in ("both", species):
+                continue
 
-            kw_list = []
-            # strong fields: code/label
             strong_fields = [getattr(cfg, "code", ""), getattr(cfg, "label", "")]
-            # keywords: code/label + cfg.keywords
+            kw_list: List[str] = []
             kw_list.extend(strong_fields)
             kw_list.extend(getattr(cfg, "keywords", []) or [])
 
@@ -633,13 +514,20 @@ def init_firebase_admin() -> None:
         raise RuntimeError(f"Firebase Admin initialize 실패: {e}")
 
 
+def _maybe_auto_upsert_user(uid: str) -> None:
+    if (settings.DB_AUTO_UPSERT_USER or "").lower() != "true":
+        return
+    try:
+        if uid:
+            db_upsert_user(uid)
+    except Exception as e:
+        # DB가 죽었다고 앱 전체가 죽으면 안 되니, 로그만 남김
+        print("[DB] auto upsert user failed:", e)
+
+
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
 ) -> Dict[str, Any]:
-    """
-    Authorization: Bearer <Firebase ID Token>
-    을 검증하고, decoded token dict를 반환.
-    """
     if settings.STUB_MODE.lower() == "true" or settings.AUTH_REQUIRED.lower() != "true":
         return {"uid": "dev", "email": "dev@example.com"}
 
@@ -651,22 +539,66 @@ def get_current_user(
     token = credentials.credentials
     try:
         decoded = fb_auth.verify_id_token(token)
+        uid = decoded.get("uid") or ""
+        _maybe_auto_upsert_user(uid)
         return decoded
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
 
 
+def _parse_admin_uids() -> Set[str]:
+    raw = (settings.ADMIN_UIDS or "").strip()
+    if not raw:
+        return set()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return set(parts)
+
+
+_ADMIN_UID_SET: Set[str] = _parse_admin_uids()
+
+
+def get_admin_user(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    uid = user.get("uid") or ""
+    if not _ADMIN_UID_SET:
+        raise HTTPException(status_code=403, detail="ADMIN_UIDS is not configured")
+    if uid not in _ADMIN_UID_SET:
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
 # ------------------------------------------------
-# 3. S3 클라이언트 & 경로 헬퍼
+# 3. S3 클라이언트 & 경로 헬퍼 (lazy init)
 # ------------------------------------------------
+_s3_client = None
+
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+
+    kwargs: Dict[str, Any] = {"region_name": settings.AWS_REGION}
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+        kwargs.update(
+            {
+                "aws_access_key_id": settings.AWS_ACCESS_KEY_ID,
+                "aws_secret_access_key": settings.AWS_SECRET_ACCESS_KEY,
+            }
+        )
+    _s3_client = boto3.client("s3", **kwargs)
+    return _s3_client
+
+
+def _require_s3() -> None:
+    if not settings.S3_BUCKET_NAME:
+        raise HTTPException(status_code=503, detail="S3_BUCKET_NAME is not set")
+
+
 def _safe_segment(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", s or "unknown")
 
 
 def _user_prefix(user_uid: str, pet_id: str) -> str:
-    """
-    ✅ S3 키를 사용자(uid) 단위로 네임스페이스 분리.
-    """
     safe_uid = _safe_segment(user_uid)
     safe_pet = _safe_segment(pet_id)
     return f"users/{safe_uid}/pets/{safe_pet}"
@@ -677,16 +609,10 @@ def _backup_prefix(user_uid: str) -> str:
     return f"users/{safe_uid}/backups"
 
 
-s3_client = boto3.client(
-    "s3",
-    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-    region_name=settings.AWS_REGION,
-)
-
-
 def _presign_get_url(key: str, expires_seconds: int = 7 * 24 * 3600) -> str:
-    return s3_client.generate_presigned_url(
+    _require_s3()
+    s3 = get_s3_client()
+    return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": settings.S3_BUCKET_NAME, "Key": key},
         ExpiresIn=expires_seconds,
@@ -694,17 +620,16 @@ def _presign_get_url(key: str, expires_seconds: int = 7 * 24 * 3600) -> str:
 
 
 def _list_all_objects(prefix: str) -> List[Dict[str, Any]]:
-    """
-    ✅ list_objects_v2는 1000개 제한이 있으니 pagination 처리.
-    """
+    _require_s3()
+    s3 = get_s3_client()
     out: List[Dict[str, Any]] = []
     token = None
     while True:
-        kwargs = {"Bucket": settings.S3_BUCKET_NAME, "Prefix": prefix, "MaxKeys": 1000}
+        kwargs: Dict[str, Any] = {"Bucket": settings.S3_BUCKET_NAME, "Prefix": prefix, "MaxKeys": 1000}
         if token:
             kwargs["ContinuationToken"] = token
 
-        resp = s3_client.list_objects_v2(**kwargs)
+        resp = s3.list_objects_v2(**kwargs)
         out.extend(resp.get("Contents") or [])
 
         if resp.get("IsTruncated"):
@@ -715,17 +640,15 @@ def _list_all_objects(prefix: str) -> List[Dict[str, Any]]:
 
 
 def upload_to_s3(file_obj, key: str, content_type: str) -> str:
-    """
-    파일을 S3에 업로드하고 7일 presigned URL을 반환.
-    ⚠️ S3 object Metadata는 ASCII만 허용이라, title/memo 같은 한글은 절대 Metadata로 넣지 않음.
-    """
+    _require_s3()
+    s3 = get_s3_client()
     try:
         try:
             file_obj.seek(0)
         except Exception:
             pass
 
-        s3_client.upload_fileobj(
+        s3.upload_fileobj(
             file_obj,
             settings.S3_BUCKET_NAME,
             key,
@@ -750,9 +673,11 @@ def upload_json_to_s3(obj: Any, key: str) -> str:
 
 
 def delete_from_s3(key: str) -> None:
+    _require_s3()
+    s3 = get_s3_client()
     try:
-        s3_client.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
-        s3_client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        s3.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        s3.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
     except ClientError as e:
         err = e.response.get("Error") or {}
         code = err.get("Code", "")
@@ -766,20 +691,24 @@ def delete_from_s3(key: str) -> None:
 
 
 def delete_from_s3_if_exists(key: str) -> None:
+    _require_s3()
+    s3 = get_s3_client()
     try:
-        s3_client.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        s3.head_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
     except ClientError as e:
         err = e.response.get("Error") or {}
         code = err.get("Code", "")
         if code in ("404", "NoSuchKey", "NotFound"):
             return
         raise HTTPException(status_code=500, detail=f"S3 head_object 실패: {e}")
-    s3_client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+    s3.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
 
 
 def get_json_from_s3(key: str) -> Dict[str, Any]:
+    _require_s3()
+    s3 = get_s3_client()
     try:
-        obj = s3_client.get_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
+        obj = s3.get_object(Bucket=settings.S3_BUCKET_NAME, Key=key)
         raw = obj["Body"].read()
         return json.loads(raw.decode("utf-8"))
     except ClientError as e:
@@ -836,20 +765,15 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
 
 def run_vision_ocr(image_path: str) -> str:
     client = get_vision_client()
-
     with open(image_path, "rb") as f:
         content = f.read()
-
     image = vision.Image(content=content)
     response = client.text_detection(image=image)
-
     if response.error.message:
         raise Exception(f"OCR 에러: {response.error.message}")
-
     texts = response.text_annotations
     if not texts:
         return ""
-
     return texts[0].description
 
 
@@ -870,7 +794,6 @@ def guess_hospital_name(lines: List[str]) -> str:
     for idx, line in enumerate(lines):
         score = 0
         text = line.replace(" ", "")
-
         if any(k in text for k in keywords):
             score += 5
         if idx <= 4:
@@ -953,13 +876,34 @@ class BackupDocument(BaseModel):
 
 
 # ------------------------------------------------
+# ✅ DB API DTOs
+# ------------------------------------------------
+class PetUpsertRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: Optional[str] = None
+    name: str
+    species: str
+    birthday: Optional[date] = None
+
+
+class VisitUpsertRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: Optional[str] = None
+    pet_id: str = Field(alias="petId")
+    visited_at: date = Field(alias="visitedAt")
+    hospital_name: Optional[str] = Field(default=None, alias="hospitalName")
+    total_cost: int = Field(default=0, alias="totalCost")
+    memo: Optional[str] = None
+
+
+# ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.7.0")
+app = FastAPI(title="PetHealth+ Server", version="1.8.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 운영에서는 도메인 제한 권장
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -968,6 +912,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
+    # Firebase init
     if settings.AUTH_REQUIRED.lower() == "true" and settings.STUB_MODE.lower() != "true":
         try:
             init_firebase_admin()
@@ -976,16 +921,20 @@ def _startup():
     else:
         print("[Startup] Auth not required or STUB_MODE. Skipping Firebase init.")
 
-    # ✅ DB init
-    try:
-        init_db_pool()
-    except Exception as e:
-        print("[Startup] DB init failed:", e)
+    # DB init
+    init_db_pool()
 
 
 @app.on_event("shutdown")
 def _shutdown():
-    close_db_pool()
+    global _db_pool
+    if _db_pool is not None:
+        try:
+            _db_pool.closeall()
+            print("[DB] Pool closed.")
+        except Exception as e:
+            print("[DB] Pool close error:", e)
+        _db_pool = None
 
 
 @app.get("/")
@@ -1005,17 +954,9 @@ def health():
         "tag_inference_enabled": settings.TAG_INFERENCE_ENABLED,
         "tag_inference_allowed_groups": settings.TAG_INFERENCE_ALLOWED_GROUPS,
         "tag_inference_min_score": settings.TAG_INFERENCE_MIN_SCORE,
-        "db_configured": bool((settings.DATABASE_URL or "").strip()),
-        "db_auto_migrate": settings.DB_AUTO_MIGRATE,
+        "db_enabled": settings.DB_ENABLED,
+        "db_configured": bool(settings.DATABASE_URL),
     }
-
-
-@app.get("/health/db")
-@app.get("/api/health/db")
-def health_db(conn=Depends(get_db_conn)):
-    with conn.cursor() as cur:
-        cur.execute("select 1;")
-        return {"ok": True, "db": cur.fetchone()[0]}
 
 
 @app.get("/api/me")
@@ -1024,221 +965,198 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # ------------------------------------------------
-# ✅ 7.1 DB 기반 최소 API 5개 + Admin Summary
+# ✅ 7.1 DB APIs (Render Postgres)
 # ------------------------------------------------
-class PetUpsertBody(BaseModel):
-    id: uuid.UUID
-    name: str
-    species: str                # "dog" | "cat" | "other"
-    birthday: Optional[date] = None
-    allergies: List[str] = []
+@app.post("/api/db/user/upsert")
+def api_user_upsert(user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    row = db_upsert_user(uid)
+    return jsonable_encoder(row)
 
 
-class VisitUpsertBody(BaseModel):
-    id: uuid.UUID
-    pet_id: uuid.UUID
-    visited_at: date
-    hospital_name: Optional[str] = None
-    total_cost: int = 0
-    memo: Optional[str] = None
-    tags: List[str] = []
+@app.post("/api/db/pets/upsert")
+def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    db_upsert_user(uid)
+
+    pet_id = (req.id or "").strip() or str(uuid.uuid4())
+    name = req.name.strip()
+    species = req.species.strip().lower()
+    birthday = req.birthday  # date or None
+
+    row = db_fetchone(
+        """
+        INSERT INTO pets (id, user_uid, name, species, birthday)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            species = EXCLUDED.species,
+            birthday = EXCLUDED.birthday
+        WHERE pets.user_uid = EXCLUDED.user_uid
+        RETURNING id, user_uid, name, species, birthday, created_at
+        """,
+        (pet_id, uid, name, species, birthday),
+    )
+
+    if row:
+        return jsonable_encoder(row)
+
+    # conflict but not updated -> likely another user's pet id
+    exists = db_fetchone("SELECT id, user_uid FROM pets WHERE id=%s", (pet_id,))
+    if exists and exists.get("user_uid") != uid:
+        raise HTTPException(status_code=403, detail="You do not own this pet id")
+    raise HTTPException(status_code=500, detail="Failed to upsert pet")
 
 
-@app.post("/api/v1/me/ensure")
-def ensure_me(user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
-    uid = user.get("uid") or "unknown"
-    _ensure_user_row(conn, uid)
-    return {"ok": True, "uid": uid}
+@app.get("/api/db/pets/list")
+def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    rows = db_fetchall(
+        "SELECT id, user_uid, name, species, birthday, created_at FROM pets WHERE user_uid=%s ORDER BY created_at DESC",
+        (uid,),
+    )
+    return jsonable_encoder(rows)
 
 
-@app.get("/api/v1/pets")
-def list_pets(user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
-    uid = user.get("uid") or "unknown"
-    _ensure_user_row(conn, uid)
+@app.post("/api/db/visits/upsert")
+def api_visit_upsert(req: VisitUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    db_upsert_user(uid)
 
-    with conn.cursor() as cur:
-        cur.execute(
+    visit_id = (req.id or "").strip() or str(uuid.uuid4())
+    pet_id = req.pet_id
+    visited_at = req.visited_at
+    hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) else None
+    total_cost = int(req.total_cost or 0)
+    memo = req.memo.strip() if isinstance(req.memo, str) else None
+
+    # pet 소유권 체크
+    pet = db_fetchone("SELECT id FROM pets WHERE id=%s AND user_uid=%s", (pet_id, uid))
+    if not pet:
+        raise HTTPException(status_code=404, detail="pet not found")
+
+    row = db_fetchone(
+        """
+        INSERT INTO visits (id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            visited_at = EXCLUDED.visited_at,
+            hospital_name = EXCLUDED.hospital_name,
+            total_cost = EXCLUDED.total_cost,
+            memo = EXCLUDED.memo
+        WHERE visits.user_uid = EXCLUDED.user_uid
+        RETURNING id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
+        """,
+        (visit_id, uid, pet_id, visited_at, hospital_name, total_cost, memo),
+    )
+
+    if row:
+        return jsonable_encoder(row)
+
+    exists = db_fetchone("SELECT id, user_uid FROM visits WHERE id=%s", (visit_id,))
+    if exists and exists.get("user_uid") != uid:
+        raise HTTPException(status_code=403, detail="You do not own this visit id")
+    raise HTTPException(status_code=500, detail="Failed to upsert visit")
+
+
+@app.get("/api/db/visits/list")
+def api_visits_list(
+    petId: Optional[str] = Query(None),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    if petId:
+        rows = db_fetchall(
             """
-            select id::text, name, species, birthday, allergies, created_at, updated_at
-            from pets
-            where firebase_uid = %s
-            order by updated_at desc, created_at desc
+            SELECT id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
+            FROM visits
+            WHERE user_uid=%s AND pet_id=%s
+            ORDER BY visited_at DESC, created_at DESC
+            """,
+            (uid, petId),
+        )
+    else:
+        rows = db_fetchall(
+            """
+            SELECT id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
+            FROM visits
+            WHERE user_uid=%s
+            ORDER BY visited_at DESC, created_at DESC
             """,
             (uid,),
         )
-        rows = cur.fetchall()
-
-    items = []
-    for r in rows:
-        items.append({
-            "id": r[0],
-            "name": r[1],
-            "species": r[2],
-            "birthday": r[3].isoformat() if r[3] else None,
-            "allergies": r[4] or [],
-            "created_at": r[5].isoformat() if r[5] else None,
-            "updated_at": r[6].isoformat() if r[6] else None,
-        })
-    return {"items": items}
+    return jsonable_encoder(rows)
 
 
-@app.post("/api/v1/pets/upsert")
-def upsert_pet(body: PetUpsertBody, user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
-    uid = user.get("uid") or "unknown"
-    _ensure_user_row(conn, uid)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into pets(id, firebase_uid, name, species, birthday, allergies, updated_at)
-            values (%s, %s, %s, %s, %s, %s, now())
-            on conflict (id) do update
-              set name = excluded.name,
-                  species = excluded.species,
-                  birthday = excluded.birthday,
-                  allergies = excluded.allergies,
-                  updated_at = now()
-            where pets.firebase_uid = excluded.firebase_uid
-            returning id::text
-            """,
-            (str(body.id), uid, body.name, body.species, body.birthday, body.allergies),
-        )
-        row = cur.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=403, detail="Forbidden: pet id belongs to another user")
-
-    return {"ok": True, "id": row[0]}
-
-
-@app.get("/api/v1/visits")
-def list_visits(
-    petId: Optional[str] = Query(None),
-    user: Dict[str, Any] = Depends(get_current_user),
-    conn=Depends(get_db_conn),
-):
-    uid = user.get("uid") or "unknown"
-    _ensure_user_row(conn, uid)
-
-    with conn.cursor() as cur:
-        if petId:
-            cur.execute(
-                """
-                select id::text, pet_id::text, visited_at, hospital_name, total_cost, memo, tags, created_at, updated_at
-                from visits
-                where firebase_uid = %s and pet_id = %s
-                order by visited_at desc, created_at desc
-                """,
-                (uid, petId),
-            )
-        else:
-            cur.execute(
-                """
-                select id::text, pet_id::text, visited_at, hospital_name, total_cost, memo, tags, created_at, updated_at
-                from visits
-                where firebase_uid = %s
-                order by visited_at desc, created_at desc
-                """,
-                (uid,),
-            )
-        rows = cur.fetchall()
-
-    items = []
-    for r in rows:
-        items.append({
-            "id": r[0],
-            "pet_id": r[1],
-            "visited_at": r[2].isoformat() if r[2] else None,
-            "hospital_name": r[3],
-            "total_cost": r[4],
-            "memo": r[5],
-            "tags": r[6] or [],
-            "created_at": r[7].isoformat() if r[7] else None,
-            "updated_at": r[8].isoformat() if r[8] else None,
-        })
-    return {"items": items}
-
-
-@app.post("/api/v1/visits/upsert")
-def upsert_visit(body: VisitUpsertBody, user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
-    uid = user.get("uid") or "unknown"
-    _ensure_user_row(conn, uid)
-
-    with conn.cursor() as cur:
-        # ✅ 내 펫인지 확인
-        cur.execute("select 1 from pets where id = %s and firebase_uid = %s", (str(body.pet_id), uid))
-        ok = cur.fetchone()
-        if not ok:
-            raise HTTPException(status_code=404, detail="Pet not found for this user")
-
-        cur.execute(
-            """
-            insert into visits(id, firebase_uid, pet_id, visited_at, hospital_name, total_cost, memo, tags, updated_at)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, now())
-            on conflict (id) do update
-              set visited_at = excluded.visited_at,
-                  hospital_name = excluded.hospital_name,
-                  total_cost = excluded.total_cost,
-                  memo = excluded.memo,
-                  tags = excluded.tags,
-                  updated_at = now()
-            where visits.firebase_uid = excluded.firebase_uid
-            returning id::text
-            """,
-            (
-                str(body.id),
-                uid,
-                str(body.pet_id),
-                body.visited_at,
-                body.hospital_name,
-                body.total_cost,
-                body.memo,
-                body.tags,
-            ),
-        )
-        row = cur.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=403, detail="Forbidden: visit id belongs to another user")
-
-    return {"ok": True, "id": row[0]}
-
-
-@app.get("/api/v1/admin/summary")
-def admin_summary(user: Dict[str, Any] = Depends(get_current_user), conn=Depends(get_db_conn)):
-    uid = user.get("uid") or "unknown"
-    admins = _admin_uid_set()
-    if not admins:
-        raise HTTPException(status_code=501, detail="ADMIN_UIDS env var not set")
-    if uid not in admins:
-        raise HTTPException(status_code=403, detail="Not an admin")
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select
-              v.firebase_uid,
-              count(distinct v.pet_id) as pet_count,
-              count(*) as visit_count,
-              coalesce(sum(v.total_cost), 0) as total_spent
-            from visits v
-            group by v.firebase_uid
-            order by total_spent desc
-            """
-        )
-        rows = cur.fetchall()
+# ------------------------------------------------
+# ✅ 7.2 Admin APIs
+# ------------------------------------------------
+@app.get("/api/admin/overview")
+def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
+    users_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM users") or {"c": 0}
+    pets_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM pets") or {"c": 0}
+    visits_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM visits") or {"c": 0}
+    total_cost = db_fetchone("SELECT COALESCE(SUM(total_cost),0)::bigint AS s FROM visits") or {"s": 0}
 
     return {
-        "items": [
-            {
-                "user_uid": r[0],
-                "pet_count": r[1],
-                "visit_count": r[2],
-                "total_spent": r[3],
-            }
-            for r in rows
-        ]
+        "users": int(users_cnt["c"]),
+        "pets": int(pets_cnt["c"]),
+        "visits": int(visits_cnt["c"]),
+        "totalCostSum": int(total_cost["s"]),
+        "updatedAt": datetime.utcnow().isoformat(),
     }
+
+
+@app.get("/api/admin/users")
+def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
+    rows = db_fetchall(
+        """
+        SELECT
+            u.firebase_uid,
+            u.created_at,
+            COALESCE(p.cnt, 0)::int AS pets_count,
+            COALESCE(v.cnt, 0)::int AS visits_count,
+            COALESCE(v.sum_cost, 0)::bigint AS total_cost_sum,
+            v.last_visited_at
+        FROM users u
+        LEFT JOIN (
+            SELECT user_uid, COUNT(*) AS cnt
+            FROM pets
+            GROUP BY user_uid
+        ) p ON p.user_uid = u.firebase_uid
+        LEFT JOIN (
+            SELECT user_uid, COUNT(*) AS cnt, SUM(total_cost) AS sum_cost, MAX(visited_at) AS last_visited_at
+            FROM visits
+            GROUP BY user_uid
+        ) v ON v.user_uid = u.firebase_uid
+        ORDER BY u.created_at DESC
+        """
+    )
+    return jsonable_encoder(rows)
+
+
+@app.get("/api/admin/user/{firebase_uid}")
+def admin_user_detail(firebase_uid: str, admin: Dict[str, Any] = Depends(get_admin_user)):
+    uid = firebase_uid.strip()
+    user_row = db_fetchone("SELECT firebase_uid, created_at FROM users WHERE firebase_uid=%s", (uid,))
+    if not user_row:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    pets = db_fetchall(
+        "SELECT id, user_uid, name, species, birthday, created_at FROM pets WHERE user_uid=%s ORDER BY created_at DESC",
+        (uid,),
+    )
+    visits = db_fetchall(
+        """
+        SELECT id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
+        FROM visits
+        WHERE user_uid=%s
+        ORDER BY visited_at DESC, created_at DESC
+        """,
+        (uid,),
+    )
+
+    return jsonable_encoder({"user": user_row, "pets": pets, "visits": visits})
 
 
 # ------------------------------------------------
@@ -1364,7 +1282,6 @@ def _build_receipt_item(
     img_key = meta.get("imageObjectKey") or meta.get("objectKey") or ""
     parsed = meta.get("parsed") or {}
     notes = meta.get("notes") if include_notes else None
-
     created_at = meta.get("createdAt") or meta.get("created_at") or None
 
     return {
@@ -1408,14 +1325,12 @@ async def upload_receipt(
 
     img_key, meta_key = _receipt_keys(uid, petId, rec_id, ext)
 
-    # 1) 이미지 업로드
     file_url = upload_bytes_to_s3(
         data,
         img_key,
         content_type=upload.content_type or "image/jpeg",
     )
 
-    # 2) OCR
     ocr_text = ""
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
@@ -1441,7 +1356,6 @@ async def upload_receipt(
     clinic_name = re.sub(r"^원\s*명[:：]?\s*", "", clinic_name)
     parsed_for_dto["clinicName"] = clinic_name
 
-    # ✅ 3) meta.json 저장
     created_at = datetime.utcnow().isoformat()
     receipt_meta = {
         "schemaVersion": 1,
@@ -1565,9 +1479,10 @@ def delete_receipt(
     if not objects:
         raise HTTPException(status_code=404, detail="삭제할 영수증을 찾을 수 없습니다.")
 
+    s3 = get_s3_client()
     for obj in objects:
         k = obj["Key"]
-        s3_client.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=k)
+        s3.delete_object(Bucket=settings.S3_BUCKET_NAME, Key=k)
         deleted_keys.append(k)
 
     return {"ok": True, "deleted": deleted_keys}
@@ -1874,12 +1789,6 @@ def _parse_visit_date(s: Optional[str]) -> Optional[date]:
 
 
 def _resolve_record_tags(raw_tags: Any) -> List[str]:
-    """
-    record.tags 배열을 받아서:
-    - code 정규화
-    - alias/camel/hyphen 등 최대한 CONDITION_TAGS로 resolve
-    - 최종 canonical code list 반환
-    """
     if not raw_tags:
         return []
     if not isinstance(raw_tags, list):
@@ -1898,10 +1807,8 @@ def _resolve_record_tags(raw_tags: Any) -> List[str]:
             out.append(getattr(cfg, "code", t_str))
             continue
 
-        # 그래도 못 찾으면, snake로 정규화된 코드 자체를 넣어두되(후속 분석/로그용)
         out.append(_normalize_tag_code(t_str))
 
-    # 빈값 제거 + 중복 제거(순서 유지)
     seen: Set[str] = set()
     cleaned: List[str] = []
     for c in out:
@@ -1933,7 +1840,6 @@ def _build_tag_stats(
         raw_tags = mh.get("tags") or []
         resolved = _resolve_record_tags(raw_tags)
 
-        # ✅ tags가 없거나, 전부 unknown(=CONDITION_TAGS resolve 안 된 것들)인 경우 텍스트에서 보강
         has_known = False
         for code in resolved:
             cfg = _resolve_tag_config(code)
@@ -2138,5 +2044,3 @@ async def analyze_pet_health(
         "periodStats": period_stats,
         "careGuide": care_guide,
     }
-
-
