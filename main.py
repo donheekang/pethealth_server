@@ -93,6 +93,23 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # ------------------------------------------------
+# ✅ 공통 유틸: UUID 검증 (운영에서 500 대신 400으로 떨어지게)
+# ------------------------------------------------
+def _uuid_or_400(value: Any, field_name: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid UUID")
+
+
+def _uuid_or_new(value: Optional[str], field_name: str) -> uuid.UUID:
+    v = (value or "").strip()
+    if not v:
+        return uuid.uuid4()
+    return _uuid_or_400(v, field_name)
+
+
+# ------------------------------------------------
 # DB (PostgreSQL) helpers
 # ------------------------------------------------
 _db_pool: Optional[ThreadedConnectionPool] = None
@@ -910,17 +927,20 @@ class BackupDocument(BaseModel):
 
 
 # ------------------------------------------------
-# ✅ DB API DTOs (NEW SCHEMA)
+# ✅ DB API DTOs (NEW SCHEMA, v2.1.1 기준 정합성 반영)
 # ------------------------------------------------
 class PetUpsertRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: Optional[str] = None
     name: str
-    species: str = "dog"
+    species: str = "dog"  # dog/cat/etc (서버에서 검증)
     breed: Optional[str] = None
     birthday: Optional[date] = None
     weight_kg: Optional[float] = Field(default=None, alias="weightKg")
-    gender: str = Field(..., description="M or F")
+
+    # ✅ gender: NULL(미입력) 허용 + 'U' 허용 (사용자 선택)
+    gender: Optional[str] = Field(default=None, description="M/F/U or null")
+
     has_no_allergy: bool = Field(default=False, alias="hasNoAllergy")
     allergy_tags: List[str] = Field(default_factory=list, alias="allergyTags")
 
@@ -928,7 +948,10 @@ class PetUpsertRequest(BaseModel):
 class HealthItemInput(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     item_name: str = Field(alias="itemName")
-    price: int
+
+    # ✅ OCR 현실 반영: 가격 못 읽으면 NULL 저장
+    price: Optional[int] = None
+
     category_tag: Optional[str] = Field(default=None, alias="categoryTag")
 
 
@@ -939,7 +962,10 @@ class HealthRecordUpsertRequest(BaseModel):
     visit_date: date = Field(alias="visitDate")
     hospital_name: Optional[str] = Field(default=None, alias="hospitalName")
     hospital_mgmt_no: Optional[str] = Field(default=None, alias="hospitalMgmtNo")
-    total_amount: int = Field(default=0, alias="totalAmount")
+
+    # ✅ 클라에서 null 보내도 받게(Optional). DB에는 0으로 저장(스키마 정책)
+    total_amount: Optional[int] = Field(default=0, alias="totalAmount")
+
     pet_weight_at_visit: Optional[float] = Field(default=None, alias="petWeightAtVisit")
     tags: List[str] = Field(default_factory=list)
     raw_ocr_text: Optional[str] = Field(default=None, alias="rawOcrText")
@@ -949,7 +975,7 @@ class HealthRecordUpsertRequest(BaseModel):
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.9.0")
+app = FastAPI(title="PetHealth+ Server", version="1.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1013,7 +1039,7 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # ------------------------------------------------
-# ✅ 7.1 DB APIs (NEW: pets / health_records / health_items)
+# ✅ 7.1 DB APIs (pets / health_records / health_items)
 # ------------------------------------------------
 @app.post("/api/db/user/upsert")
 def api_user_upsert(user: Dict[str, Any] = Depends(get_current_user)):
@@ -1028,16 +1054,29 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
 
-    pet_id = (req.id or "").strip() or str(uuid.uuid4())
-    name = req.name.strip()
+    pet_uuid = _uuid_or_new(req.id, "id")
+
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+
     species = (req.species or "dog").strip().lower()
-    breed = req.breed.strip() if isinstance(req.breed, str) else None
+    # ✅ DB CHECK에 맞게 서버에서도 선제 차단
+    if species not in ("dog", "cat", "etc"):
+        raise HTTPException(status_code=400, detail="species must be one of 'dog','cat','etc'")
+
+    breed = req.breed.strip() if isinstance(req.breed, str) and req.breed.strip() else None
     birthday = req.birthday
     weight_kg = float(req.weight_kg) if req.weight_kg is not None else None
 
-    gender = (req.gender or "").strip().upper()
-    if gender not in ("M", "F"):
-        raise HTTPException(status_code=400, detail="gender must be 'M' or 'F'")
+    gender_raw = (req.gender or "").strip().upper()
+    gender: Optional[str]
+    if not gender_raw:
+        gender = None  # ✅ 미입력 허용
+    else:
+        if gender_raw not in ("M", "F", "U"):
+            raise HTTPException(status_code=400, detail="gender must be one of 'M','F','U' or null")
+        gender = gender_raw
 
     has_no_allergy = bool(req.has_no_allergy)
     allergy_tags = [str(x).strip() for x in (req.allergy_tags or []) if str(x).strip()]
@@ -1067,13 +1106,13 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
             id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags,
             created_at, updated_at
         """,
-        (pet_id, uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags),
+        (pet_uuid, uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags),
     )
 
     if row:
         return jsonable_encoder(row)
 
-    exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_id,))
+    exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_uuid,))
     if exists and exists.get("user_uid") != uid:
         raise HTTPException(status_code=403, detail="You do not own this pet id")
     raise HTTPException(status_code=500, detail="Failed to upsert pet")
@@ -1106,13 +1145,17 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
     # 유저 보장(외래키) + DAU
     db_touch_user(uid)
 
-    record_id = (req.id or "").strip() or str(uuid.uuid4())
+    record_uuid = _uuid_or_new(req.id, "id")
+    pet_uuid = _uuid_or_400(req.pet_id, "petId")
 
-    pet_id = req.pet_id
     visit_date = req.visit_date
-    hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) else None
-    hospital_mgmt_no = req.hospital_mgmt_no.strip() if isinstance(req.hospital_mgmt_no, str) else None
+    hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) and req.hospital_name.strip() else None
+    hospital_mgmt_no = req.hospital_mgmt_no.strip() if isinstance(req.hospital_mgmt_no, str) and req.hospital_mgmt_no.strip() else None
+
     total_amount = int(req.total_amount or 0)
+    if total_amount < 0:
+        raise HTTPException(status_code=400, detail="total_amount must be >= 0")
+
     pet_weight_at_visit = float(req.pet_weight_at_visit) if req.pet_weight_at_visit is not None else None
     tags = _clean_tags(req.tags)
     raw_ocr_text = req.raw_ocr_text
@@ -1120,7 +1163,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
     # 소유권 체크 + upsert + items 반영은 트랜잭션으로 묶음
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_id, uid))
+            cur.execute("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
             pet = cur.fetchone()
             if not pet:
                 raise HTTPException(status_code=404, detail="pet not found")
@@ -1151,7 +1194,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     created_at, updated_at
                 """,
                 (
-                    record_id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount,
+                    record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount,
                     pet_weight_at_visit, tags, raw_ocr_text,
                     uid,
                 ),
@@ -1166,7 +1209,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     JOIN public.pets p ON p.id = r.pet_id
                     WHERE r.id = %s
                     """,
-                    (record_id,),
+                    (record_uuid,),
                 )
                 ex = cur.fetchone()
                 if ex and ex.get("user_uid") != uid:
@@ -1175,19 +1218,25 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
 
             # items가 들어오면: 기존 items 전체 교체(가장 단순 + 안전)
             if req.items is not None:
-                cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_id,))
+                cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
                 for it in req.items:
-                    item_name = it.item_name.strip()
-                    price = int(it.price or 0)
-                    if price < 0:
-                        raise HTTPException(status_code=400, detail="item price must be >= 0")
-                    category_tag = it.category_tag.strip() if isinstance(it.category_tag, str) else None
+                    item_name = (it.item_name or "").strip()
+                    if not item_name:
+                        raise HTTPException(status_code=400, detail="itemName is required")
+
+                    price = it.price
+                    if price is not None:
+                        price = int(price)
+                        if price < 0:
+                            raise HTTPException(status_code=400, detail="item price must be >= 0")
+
+                    category_tag = it.category_tag.strip() if isinstance(it.category_tag, str) and it.category_tag.strip() else None
                     cur.execute(
                         """
                         INSERT INTO public.health_items (record_id, item_name, price, category_tag)
                         VALUES (%s, %s, %s, %s)
                         """,
-                        (record_id, item_name, price, category_tag),
+                        (record_uuid, item_name, price, category_tag),
                     )
 
             # include items in response
@@ -1198,7 +1247,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 WHERE record_id=%s
                 ORDER BY created_at ASC
                 """,
-                (record_id,),
+                (record_uuid,),
             )
             items_rows = cur.fetchall() or []
 
@@ -1218,6 +1267,7 @@ def api_records_list(
         raise HTTPException(status_code=401, detail="missing uid")
 
     if petId:
+        pet_uuid = _uuid_or_400(petId, "petId")
         rows = db_fetchall(
             """
             SELECT
@@ -1228,7 +1278,7 @@ def api_records_list(
             WHERE p.user_uid=%s AND p.id=%s
             ORDER BY r.visit_date DESC, r.created_at DESC
             """,
-            (uid, petId),
+            (uid, pet_uuid),
         )
     else:
         rows = db_fetchall(
@@ -1248,7 +1298,7 @@ def api_records_list(
         return jsonable_encoder(rows)
 
     # include items: record_id IN (...)
-    record_ids = [r["id"] for r in rows if r.get("id")]
+    record_ids = [str(r["id"]) for r in rows if r.get("id")]
     if not record_ids:
         return jsonable_encoder(rows)
 
@@ -1256,7 +1306,7 @@ def api_records_list(
         """
         SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
         FROM public.health_items
-        WHERE record_id = ANY(%s)
+        WHERE record_id = ANY(%s::uuid[])
         ORDER BY created_at ASC
         """,
         (record_ids,),
@@ -1286,6 +1336,8 @@ def api_record_get(
     if not rid:
         raise HTTPException(status_code=400, detail="recordId is required")
 
+    record_uuid = _uuid_or_400(rid, "recordId")
+
     row = db_fetchone(
         """
         SELECT
@@ -1295,7 +1347,7 @@ def api_record_get(
         JOIN public.pets p ON p.id = r.pet_id
         WHERE p.user_uid=%s AND r.id=%s
         """,
-        (uid, rid),
+        (uid, record_uuid),
     )
     if not row:
         raise HTTPException(status_code=404, detail="record not found")
@@ -1307,7 +1359,7 @@ def api_record_get(
         WHERE record_id=%s
         ORDER BY created_at ASC
         """,
-        (rid,),
+        (record_uuid,),
     )
     row["items"] = items
     return jsonable_encoder(row)
@@ -1419,14 +1471,14 @@ def admin_user_detail(firebase_uid: str, admin: Dict[str, Any] = Depends(get_adm
         (uid,),
     )
 
-    record_ids = [r["id"] for r in records if r.get("id")]
+    record_ids = [str(r["id"]) for r in records if r.get("id")]
     items: List[Dict[str, Any]] = []
     if record_ids:
         items = db_fetchall(
             """
             SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
             FROM public.health_items
-            WHERE record_id = ANY(%s)
+            WHERE record_id = ANY(%s::uuid[])
             ORDER BY created_at ASC
             """,
             (record_ids,),
