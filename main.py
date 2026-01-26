@@ -137,7 +137,6 @@ def _require_db() -> None:
     if not settings.DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL is not set")
     if _db_pool is None:
-        # try lazy init
         init_db_pool()
     if _db_pool is None:
         raise HTTPException(status_code=503, detail="DB connection pool is not ready")
@@ -181,34 +180,69 @@ def db_execute(sql: str, params: Tuple[Any, ...] = ()) -> int:
             return cur.rowcount
 
 
-def db_upsert_user(firebase_uid: str) -> Dict[str, Any]:
+def db_touch_user(firebase_uid: str) -> Dict[str, Any]:
     """
-    users(firebase_uid PK/UNIQUE) 존재 보장.
+    users(firebase_uid) 존재 보장 + last_seen_at 갱신 + user_daily_active(DAU) 기록.
+    - users 테이블: firebase_uid, last_seen_at, updated_at, created_at, pet_count
+    - user_daily_active(day, firebase_uid) : (day, uid) PK
     """
     uid = (firebase_uid or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="firebase_uid is empty")
 
-    row = db_fetchone(
-        """
-        INSERT INTO users(firebase_uid)
-        VALUES (%s)
-        ON CONFLICT (firebase_uid) DO NOTHING
-        RETURNING firebase_uid, created_at
-        """,
-        (uid,),
-    )
-    if row:
-        return row
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO public.users (firebase_uid)
+                VALUES (%s)
+                ON CONFLICT (firebase_uid) DO UPDATE SET
+                    last_seen_at = now()
+                RETURNING firebase_uid, pet_count, created_at, updated_at, last_seen_at
+                """,
+                (uid,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=500, detail="Failed to upsert user")
 
-    existing = db_fetchone(
-        "SELECT firebase_uid, created_at FROM users WHERE firebase_uid=%s",
-        (uid,),
-    )
-    if not existing:
-        # unexpected
-        raise HTTPException(status_code=500, detail="Failed to upsert user")
-    return existing
+            # DAU 기록 (하루 1번만 쌓임)
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO public.user_daily_active (day, firebase_uid)
+                    VALUES (CURRENT_DATE, %s)
+                    ON CONFLICT (day, firebase_uid) DO NOTHING
+                    """,
+                    (uid,),
+                )
+            except Exception as e:
+                # 테이블이 아직 없을 수도 있으니(초기) 앱이 죽지 않게 처리
+                print("[DB] user_daily_active insert failed (ignored):", e)
+
+            return dict(row)
+
+
+def _clean_tags(tags: Any) -> List[str]:
+    """
+    한국어/해시태그도 그대로 저장할 수 있게 '정규화'는 최소화:
+    - strip + 빈값 제거 + 중복 제거
+    """
+    if not tags:
+        return []
+    if not isinstance(tags, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for t in tags:
+        s = str(t).strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
 # ------------------------------------------------
@@ -519,7 +553,7 @@ def _maybe_auto_upsert_user(uid: str) -> None:
         return
     try:
         if uid:
-            db_upsert_user(uid)
+            db_touch_user(uid)
     except Exception as e:
         # DB가 죽었다고 앱 전체가 죽으면 안 되니, 로그만 남김
         print("[DB] auto upsert user failed:", e)
@@ -876,30 +910,46 @@ class BackupDocument(BaseModel):
 
 
 # ------------------------------------------------
-# ✅ DB API DTOs
+# ✅ DB API DTOs (NEW SCHEMA)
 # ------------------------------------------------
 class PetUpsertRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: Optional[str] = None
     name: str
-    species: str
+    species: str = "dog"
+    breed: Optional[str] = None
     birthday: Optional[date] = None
+    weight_kg: Optional[float] = Field(default=None, alias="weightKg")
+    gender: str = Field(..., description="M or F")
+    has_no_allergy: bool = Field(default=False, alias="hasNoAllergy")
+    allergy_tags: List[str] = Field(default_factory=list, alias="allergyTags")
 
 
-class VisitUpsertRequest(BaseModel):
+class HealthItemInput(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    item_name: str = Field(alias="itemName")
+    price: int
+    category_tag: Optional[str] = Field(default=None, alias="categoryTag")
+
+
+class HealthRecordUpsertRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: Optional[str] = None
     pet_id: str = Field(alias="petId")
-    visited_at: date = Field(alias="visitedAt")
+    visit_date: date = Field(alias="visitDate")
     hospital_name: Optional[str] = Field(default=None, alias="hospitalName")
-    total_cost: int = Field(default=0, alias="totalCost")
-    memo: Optional[str] = None
+    hospital_mgmt_no: Optional[str] = Field(default=None, alias="hospitalMgmtNo")
+    total_amount: int = Field(default=0, alias="totalAmount")
+    pet_weight_at_visit: Optional[float] = Field(default=None, alias="petWeightAtVisit")
+    tags: List[str] = Field(default_factory=list)
+    raw_ocr_text: Optional[str] = Field(default=None, alias="rawOcrText")
+    items: Optional[List[HealthItemInput]] = None
 
 
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.8.0")
+app = FastAPI(title="PetHealth+ Server", version="1.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -912,7 +962,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
-    # Firebase init
     if settings.AUTH_REQUIRED.lower() == "true" and settings.STUB_MODE.lower() != "true":
         try:
             init_firebase_admin()
@@ -921,7 +970,6 @@ def _startup():
     else:
         print("[Startup] Auth not required or STUB_MODE. Skipping Firebase init.")
 
-    # DB init
     init_db_pool()
 
 
@@ -965,75 +1013,67 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # ------------------------------------------------
-# ✅ 7.1 DB APIs (Render Postgres)
+# ✅ 7.1 DB APIs (NEW: pets / health_records / health_items)
 # ------------------------------------------------
-# ※ 아래 함수/라우터들은 네 main.py의 기존 DB/인증 헬퍼들(아래 이름들)을 그대로 사용한다는 전제:
-# - get_current_user, get_admin_user
-# - db_fetchone, db_fetchall
-# - PetUpsertRequest, VisitUpsertRequest
-# - app, uuid, datetime, Dict, Any, Optional, Query, Depends, HTTPException, jsonable_encoder
-
-from datetime import datetime
-
-# ✅ IMPORTANT: users 테이블에 last_seen_at 컬럼이 이미 추가되어 있어야 함
-# ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
-
-def db_upsert_user(uid: str):
-    uid = (uid or "").strip()
-    if not uid:
-        raise HTTPException(status_code=401, detail="missing uid")
-
-    # ✅ last_seen_at / updated_at은 요청마다 갱신
-    row = db_fetchone(
-        """
-        INSERT INTO users (firebase_uid, created_at, updated_at, last_seen_at)
-        VALUES (%s, now(), now(), now())
-        ON CONFLICT (firebase_uid) DO UPDATE SET
-            updated_at = now(),
-            last_seen_at = now()
-        RETURNING firebase_uid, created_at, updated_at, last_seen_at
-        """,
-        (uid,),
-    )
-    return row
-
-
 @app.post("/api/db/user/upsert")
 def api_user_upsert(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
-    row = db_upsert_user(uid)
+    row = db_touch_user(uid)
     return jsonable_encoder(row)
 
 
 @app.post("/api/db/pets/upsert")
 def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
-    db_upsert_user(uid)  # ✅ 여기서 last_seen_at 갱신됨
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
 
     pet_id = (req.id or "").strip() or str(uuid.uuid4())
     name = req.name.strip()
-    species = req.species.strip().lower()
-    birthday = req.birthday  # date or None
+    species = (req.species or "dog").strip().lower()
+    breed = req.breed.strip() if isinstance(req.breed, str) else None
+    birthday = req.birthday
+    weight_kg = float(req.weight_kg) if req.weight_kg is not None else None
+
+    gender = (req.gender or "").strip().upper()
+    if gender not in ("M", "F"):
+        raise HTTPException(status_code=400, detail="gender must be 'M' or 'F'")
+
+    has_no_allergy = bool(req.has_no_allergy)
+    allergy_tags = [str(x).strip() for x in (req.allergy_tags or []) if str(x).strip()]
+    if has_no_allergy:
+        allergy_tags = []
+
+    # 유저 row 보장(외래키)
+    db_touch_user(uid)
 
     row = db_fetchone(
         """
-        INSERT INTO pets (id, user_uid, name, species, birthday)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO public.pets
+            (id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags)
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             species = EXCLUDED.species,
-            birthday = EXCLUDED.birthday
-        WHERE pets.user_uid = EXCLUDED.user_uid
-        RETURNING id, user_uid, name, species, birthday, created_at
+            breed = EXCLUDED.breed,
+            birthday = EXCLUDED.birthday,
+            weight_kg = EXCLUDED.weight_kg,
+            gender = EXCLUDED.gender,
+            has_no_allergy = EXCLUDED.has_no_allergy,
+            allergy_tags = EXCLUDED.allergy_tags
+        WHERE public.pets.user_uid = EXCLUDED.user_uid
+        RETURNING
+            id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags,
+            created_at, updated_at
         """,
-        (pet_id, uid, name, species, birthday),
+        (pet_id, uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags),
     )
 
     if row:
         return jsonable_encoder(row)
 
-    # conflict but not updated -> likely another user's pet id
-    exists = db_fetchone("SELECT id, user_uid FROM pets WHERE id=%s", (pet_id,))
+    exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_id,))
     if exists and exists.get("user_uid") != uid:
         raise HTTPException(status_code=403, detail="You do not own this pet id")
     raise HTTPException(status_code=500, detail="Failed to upsert pet")
@@ -1043,114 +1083,266 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
 def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
     rows = db_fetchall(
-        "SELECT id, user_uid, name, species, birthday, created_at FROM pets WHERE user_uid=%s ORDER BY created_at DESC",
+        """
+        SELECT
+            id, user_uid, name, species, breed, birthday, weight_kg, gender,
+            has_no_allergy, allergy_tags,
+            created_at, updated_at
+        FROM public.pets
+        WHERE user_uid=%s
+        ORDER BY created_at DESC
+        """,
         (uid,),
     )
     return jsonable_encoder(rows)
 
 
-@app.post("/api/db/visits/upsert")
-def api_visit_upsert(req: VisitUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
+@app.post("/api/db/records/upsert")
+def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
-    db_upsert_user(uid)  # ✅ 여기서 last_seen_at 갱신됨
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
 
-    visit_id = (req.id or "").strip() or str(uuid.uuid4())
+    # 유저 보장(외래키) + DAU
+    db_touch_user(uid)
 
-    # ✅ 여기 부분은 네 VisitUpsertRequest 필드명에 맞춰야 함
-    # 네가 올린 코드 기준: req.pet_id, req.visited_at, req.hospital_name ...
+    record_id = (req.id or "").strip() or str(uuid.uuid4())
+
     pet_id = req.pet_id
-    visited_at = req.visited_at
+    visit_date = req.visit_date
     hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) else None
-    total_cost = int(req.total_cost or 0)
-    memo = req.memo.strip() if isinstance(req.memo, str) else None
+    hospital_mgmt_no = req.hospital_mgmt_no.strip() if isinstance(req.hospital_mgmt_no, str) else None
+    total_amount = int(req.total_amount or 0)
+    pet_weight_at_visit = float(req.pet_weight_at_visit) if req.pet_weight_at_visit is not None else None
+    tags = _clean_tags(req.tags)
+    raw_ocr_text = req.raw_ocr_text
 
-    # pet 소유권 체크
-    pet = db_fetchone("SELECT id FROM pets WHERE id=%s AND user_uid=%s", (pet_id, uid))
-    if not pet:
-        raise HTTPException(status_code=404, detail="pet not found")
+    # 소유권 체크 + upsert + items 반영은 트랜잭션으로 묶음
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_id, uid))
+            pet = cur.fetchone()
+            if not pet:
+                raise HTTPException(status_code=404, detail="pet not found")
 
-    row = db_fetchone(
-        """
-        INSERT INTO visits (id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
-            visited_at = EXCLUDED.visited_at,
-            hospital_name = EXCLUDED.hospital_name,
-            total_cost = EXCLUDED.total_cost,
-            memo = EXCLUDED.memo
-        WHERE visits.user_uid = EXCLUDED.user_uid
-        RETURNING id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
-        """,
-        (visit_id, uid, pet_id, visited_at, hospital_name, total_cost, memo),
-    )
+            cur.execute(
+                """
+                INSERT INTO public.health_records
+                    (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, raw_ocr_text)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    pet_id = EXCLUDED.pet_id,
+                    hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
+                    hospital_name = EXCLUDED.hospital_name,
+                    visit_date = EXCLUDED.visit_date,
+                    total_amount = EXCLUDED.total_amount,
+                    pet_weight_at_visit = EXCLUDED.pet_weight_at_visit,
+                    tags = EXCLUDED.tags,
+                    raw_ocr_text = EXCLUDED.raw_ocr_text
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM public.pets p
+                    WHERE p.id = public.health_records.pet_id
+                      AND p.user_uid = %s
+                )
+                RETURNING
+                    id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                    created_at, updated_at
+                """,
+                (
+                    record_id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount,
+                    pet_weight_at_visit, tags, raw_ocr_text,
+                    uid,
+                ),
+            )
+            row = cur.fetchone()
 
-    if row:
-        return jsonable_encoder(row)
+            if not row:
+                cur.execute(
+                    """
+                    SELECT r.id, p.user_uid
+                    FROM public.health_records r
+                    JOIN public.pets p ON p.id = r.pet_id
+                    WHERE r.id = %s
+                    """,
+                    (record_id,),
+                )
+                ex = cur.fetchone()
+                if ex and ex.get("user_uid") != uid:
+                    raise HTTPException(status_code=403, detail="You do not own this record id")
+                raise HTTPException(status_code=500, detail="Failed to upsert record")
 
-    exists = db_fetchone("SELECT id, user_uid FROM visits WHERE id=%s", (visit_id,))
-    if exists and exists.get("user_uid") != uid:
-        raise HTTPException(status_code=403, detail="You do not own this visit id")
-    raise HTTPException(status_code=500, detail="Failed to upsert visit")
+            # items가 들어오면: 기존 items 전체 교체(가장 단순 + 안전)
+            if req.items is not None:
+                cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_id,))
+                for it in req.items:
+                    item_name = it.item_name.strip()
+                    price = int(it.price or 0)
+                    if price < 0:
+                        raise HTTPException(status_code=400, detail="item price must be >= 0")
+                    category_tag = it.category_tag.strip() if isinstance(it.category_tag, str) else None
+                    cur.execute(
+                        """
+                        INSERT INTO public.health_items (record_id, item_name, price, category_tag)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (record_id, item_name, price, category_tag),
+                    )
+
+            # include items in response
+            cur.execute(
+                """
+                SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+                FROM public.health_items
+                WHERE record_id=%s
+                ORDER BY created_at ASC
+                """,
+                (record_id,),
+            )
+            items_rows = cur.fetchall() or []
+
+            payload = dict(row)
+            payload["items"] = [dict(x) for x in items_rows]
+            return jsonable_encoder(payload)
 
 
-@app.get("/api/db/visits/list")
-def api_visits_list(
+@app.get("/api/db/records/list")
+def api_records_list(
     petId: Optional[str] = Query(None),
+    includeItems: bool = Query(False),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
     if petId:
         rows = db_fetchall(
             """
-            SELECT id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
-            FROM visits
-            WHERE user_uid=%s AND pet_id=%s
-            ORDER BY visited_at DESC, created_at DESC
+            SELECT
+                r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+                r.pet_weight_at_visit, r.tags, r.created_at, r.updated_at
+            FROM public.health_records r
+            JOIN public.pets p ON p.id = r.pet_id
+            WHERE p.user_uid=%s AND p.id=%s
+            ORDER BY r.visit_date DESC, r.created_at DESC
             """,
             (uid, petId),
         )
     else:
         rows = db_fetchall(
             """
-            SELECT id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
-            FROM visits
-            WHERE user_uid=%s
-            ORDER BY visited_at DESC, created_at DESC
+            SELECT
+                r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+                r.pet_weight_at_visit, r.tags, r.created_at, r.updated_at
+            FROM public.health_records r
+            JOIN public.pets p ON p.id = r.pet_id
+            WHERE p.user_uid=%s
+            ORDER BY r.visit_date DESC, r.created_at DESC
             """,
             (uid,),
         )
-    return jsonable_encoder(rows)
+
+    if not includeItems:
+        return jsonable_encoder(rows)
+
+    # include items: record_id IN (...)
+    record_ids = [r["id"] for r in rows if r.get("id")]
+    if not record_ids:
+        return jsonable_encoder(rows)
+
+    items = db_fetchall(
+        """
+        SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+        FROM public.health_items
+        WHERE record_id = ANY(%s)
+        ORDER BY created_at ASC
+        """,
+        (record_ids,),
+    )
+
+    by_record: Dict[str, List[Dict[str, Any]]] = {}
+    for it in items:
+        rid = str(it.get("record_id"))
+        by_record.setdefault(rid, []).append(it)
+
+    out = []
+    for r in rows:
+        rr = dict(r)
+        rr["items"] = by_record.get(str(r.get("id")), [])
+        out.append(rr)
+
+    return jsonable_encoder(out)
+
+
+@app.get("/api/db/records/get")
+def api_record_get(
+    recordId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    rid = (recordId or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="recordId is required")
+
+    row = db_fetchone(
+        """
+        SELECT
+            r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+            r.pet_weight_at_visit, r.tags, r.raw_ocr_text, r.created_at, r.updated_at
+        FROM public.health_records r
+        JOIN public.pets p ON p.id = r.pet_id
+        WHERE p.user_uid=%s AND r.id=%s
+        """,
+        (uid, rid),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="record not found")
+
+    items = db_fetchall(
+        """
+        SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+        FROM public.health_items
+        WHERE record_id=%s
+        ORDER BY created_at ASC
+        """,
+        (rid,),
+    )
+    row["items"] = items
+    return jsonable_encoder(row)
 
 
 # ------------------------------------------------
-# ✅ 7.2 Admin APIs
+# ✅ 7.2 Admin APIs (health_records 기준)
 # ------------------------------------------------
 @app.get("/api/admin/overview")
 def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
-    users_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM users") or {"c": 0}
-    pets_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM pets") or {"c": 0}
-    visits_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM visits") or {"c": 0}
-    total_cost = db_fetchone("SELECT COALESCE(SUM(total_cost),0)::bigint AS s FROM visits") or {"s": 0}
+    users_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.users") or {"c": 0}
+    pets_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.pets") or {"c": 0}
+    records_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.health_records") or {"c": 0}
+    items_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.health_items") or {"c": 0}
+    total_amount = db_fetchone("SELECT COALESCE(SUM(total_amount),0)::bigint AS s FROM public.health_records") or {"s": 0}
 
     return {
         "users": int(users_cnt["c"]),
         "pets": int(pets_cnt["c"]),
-        "visits": int(visits_cnt["c"]),
-        "totalCostSum": int(total_cost["s"]),
+        "records": int(records_cnt["c"]),
+        "items": int(items_cnt["c"]),
+        "totalAmountSum": int(total_amount["s"]),
         "updatedAt": datetime.utcnow().isoformat(),
     }
 
 
-# ✅ NEW: 날짜별 DAU (last_seen_at 기반)
 @app.get("/api/admin/dau")
 def admin_dau(admin: Dict[str, Any] = Depends(get_admin_user)):
+    # user_daily_active가 있으면 이걸 쓰는 게 정확함
     rows = db_fetchall(
         """
         SELECT
-            DATE(last_seen_at) AS day,
+            day,
             COUNT(*)::int AS dau
-        FROM users
-        WHERE last_seen_at IS NOT NULL
+        FROM public.user_daily_active
         GROUP BY day
         ORDER BY day DESC
         """
@@ -1164,24 +1356,30 @@ def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
         """
         SELECT
             u.firebase_uid,
+            u.pet_count,
             u.created_at,
             u.updated_at,
             u.last_seen_at,
             COALESCE(p.cnt, 0)::int AS pets_count,
-            COALESCE(v.cnt, 0)::int AS visits_count,
-            COALESCE(v.sum_cost, 0)::bigint AS total_cost_sum,
-            v.last_visited_at
-        FROM users u
+            COALESCE(r.cnt, 0)::int AS records_count,
+            COALESCE(r.sum_amount, 0)::bigint AS total_amount_sum,
+            r.last_visit_date
+        FROM public.users u
         LEFT JOIN (
             SELECT user_uid, COUNT(*) AS cnt
-            FROM pets
+            FROM public.pets
             GROUP BY user_uid
         ) p ON p.user_uid = u.firebase_uid
         LEFT JOIN (
-            SELECT user_uid, COUNT(*) AS cnt, SUM(total_cost) AS sum_cost, MAX(visited_at) AS last_visited_at
-            FROM visits
-            GROUP BY user_uid
-        ) v ON v.user_uid = u.firebase_uid
+            SELECT
+                p.user_uid,
+                COUNT(*) AS cnt,
+                SUM(r.total_amount) AS sum_amount,
+                MAX(r.visit_date) AS last_visit_date
+            FROM public.health_records r
+            JOIN public.pets p ON p.id = r.pet_id
+            GROUP BY p.user_uid
+        ) r ON r.user_uid = u.firebase_uid
         ORDER BY u.last_seen_at DESC NULLS LAST, u.created_at DESC
         """
     )
@@ -1192,29 +1390,49 @@ def admin_users(admin: Dict[str, Any] = Depends(get_admin_user)):
 def admin_user_detail(firebase_uid: str, admin: Dict[str, Any] = Depends(get_admin_user)):
     uid = firebase_uid.strip()
     user_row = db_fetchone(
-        "SELECT firebase_uid, created_at, updated_at, last_seen_at FROM users WHERE firebase_uid=%s",
+        "SELECT firebase_uid, pet_count, created_at, updated_at, last_seen_at FROM public.users WHERE firebase_uid=%s",
         (uid,),
     )
     if not user_row:
         raise HTTPException(status_code=404, detail="user not found")
 
     pets = db_fetchall(
-        "SELECT id, user_uid, name, species, birthday, created_at FROM pets WHERE user_uid=%s ORDER BY created_at DESC",
-        (uid,),
-    )
-    visits = db_fetchall(
         """
-        SELECT id, user_uid, pet_id, visited_at, hospital_name, total_cost, memo, created_at
-        FROM visits
+        SELECT id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags, created_at, updated_at
+        FROM public.pets
         WHERE user_uid=%s
-        ORDER BY visited_at DESC, created_at DESC
+        ORDER BY created_at DESC
         """,
         (uid,),
     )
 
-    return jsonable_encoder({"user": user_row, "pets": pets, "visits": visits})
+    records = db_fetchall(
+        """
+        SELECT
+            r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+            r.pet_weight_at_visit, r.tags, r.created_at, r.updated_at
+        FROM public.health_records r
+        JOIN public.pets p ON p.id = r.pet_id
+        WHERE p.user_uid=%s
+        ORDER BY r.visit_date DESC, r.created_at DESC
+        """,
+        (uid,),
+    )
 
+    record_ids = [r["id"] for r in records if r.get("id")]
+    items: List[Dict[str, Any]] = []
+    if record_ids:
+        items = db_fetchall(
+            """
+            SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+            FROM public.health_items
+            WHERE record_id = ANY(%s)
+            ORDER BY created_at ASC
+            """,
+            (record_ids,),
+        )
 
+    return jsonable_encoder({"user": user_row, "pets": pets, "records": records, "items": items})
 
 
 # ------------------------------------------------
@@ -1865,7 +2083,8 @@ def _resolve_record_tags(raw_tags: Any) -> List[str]:
             out.append(getattr(cfg, "code", t_str))
             continue
 
-        out.append(_normalize_tag_code(t_str))
+        # (주의) 한국어 태그를 지워버리지 않게: normalize_tag_code는 AI 통계에서만 활용
+        out.append(t_str)
 
     seen: Set[str] = set()
     cleaned: List[str] = []
@@ -2102,4 +2321,5 @@ async def analyze_pet_health(
         "periodStats": period_stats,
         "careGuide": care_guide,
     }
+
 
