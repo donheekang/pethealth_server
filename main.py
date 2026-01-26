@@ -109,6 +109,29 @@ def _uuid_or_new(value: Optional[str], field_name: str) -> uuid.UUID:
     return _uuid_or_400(v, field_name)
 
 
+def _norm_optional_char(
+    value: Optional[str],
+    allowed: Set[str],
+    field_name: str,
+) -> Optional[str]:
+    raw = (value or "").strip().upper()
+    if not raw:
+        return None
+    if raw not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be one of {sorted(list(allowed))} or null",
+        )
+    return raw
+
+
+def _norm_species_or_400(species: Optional[str]) -> str:
+    s = (species or "dog").strip().lower()
+    if s not in ("dog", "cat", "etc"):
+        raise HTTPException(status_code=400, detail="species must be one of 'dog','cat','etc'")
+    return s
+
+
 # ------------------------------------------------
 # DB (PostgreSQL) helpers
 # ------------------------------------------------
@@ -927,10 +950,19 @@ class BackupDocument(BaseModel):
 
 
 # ------------------------------------------------
-# ✅ DB API DTOs (NEW SCHEMA, v2.1.1 기준 정합성 반영)
+# ✅ DB API DTOs (NEW SCHEMA, v2.1.4 기준 정합성 반영)
 # ------------------------------------------------
 class PetUpsertRequest(BaseModel):
+    """
+    v2.1.4 pets 테이블 정합성:
+    - gender: NULL 또는 M/F/U
+    - neutered: NULL 또는 Y/N/U
+    - has_no_allergy: NULL/TRUE/FALSE
+      - NULL/TRUE => allergy_tags는 반드시 비어야 함
+      - FALSE     => allergy_tags는 비어도 허용(=있는데 상세 미입력)
+    """
     model_config = ConfigDict(populate_by_name=True)
+
     id: Optional[str] = None
     name: str
     species: str = "dog"  # dog/cat/etc (서버에서 검증)
@@ -938,10 +970,11 @@ class PetUpsertRequest(BaseModel):
     birthday: Optional[date] = None
     weight_kg: Optional[float] = Field(default=None, alias="weightKg")
 
-    # ✅ gender: NULL(미입력) 허용 + 'U' 허용 (사용자 선택)
     gender: Optional[str] = Field(default=None, description="M/F/U or null")
+    neutered: Optional[str] = Field(default=None, description="Y/N/U or null")
 
-    has_no_allergy: bool = Field(default=False, alias="hasNoAllergy")
+    # ✅ v2.1.4: NULL 허용 (미입력)
+    has_no_allergy: Optional[bool] = Field(default=None, alias="hasNoAllergy")
     allergy_tags: List[str] = Field(default_factory=list, alias="allergyTags")
 
 
@@ -949,7 +982,7 @@ class HealthItemInput(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     item_name: str = Field(alias="itemName")
 
-    # ✅ OCR 현실 반영: 가격 못 읽으면 NULL 저장
+    # ✅ OCR 현실 반영: 가격 못 읽으면 NULL 저장 (DB: bigint nullable)
     price: Optional[int] = None
 
     category_tag: Optional[str] = Field(default=None, alias="categoryTag")
@@ -963,7 +996,7 @@ class HealthRecordUpsertRequest(BaseModel):
     hospital_name: Optional[str] = Field(default=None, alias="hospitalName")
     hospital_mgmt_no: Optional[str] = Field(default=None, alias="hospitalMgmtNo")
 
-    # ✅ 클라에서 null 보내도 받게(Optional). DB에는 0으로 저장(스키마 정책)
+    # ✅ DB: bigint NOT NULL DEFAULT 0
     total_amount: Optional[int] = Field(default=0, alias="totalAmount")
 
     pet_weight_at_visit: Optional[float] = Field(default=None, alias="petWeightAtVisit")
@@ -975,7 +1008,7 @@ class HealthRecordUpsertRequest(BaseModel):
 # ------------------------------------------------
 # 7. FASTAPI APP
 # ------------------------------------------------
-app = FastAPI(title="PetHealth+ Server", version="1.9.1")
+app = FastAPI(title="PetHealth+ Server", version="1.9.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1030,6 +1063,7 @@ def health():
         "tag_inference_min_score": settings.TAG_INFERENCE_MIN_SCORE,
         "db_enabled": settings.DB_ENABLED,
         "db_configured": bool(settings.DATABASE_URL),
+        "schema_target": "v2.1.4",
     }
 
 
@@ -1060,27 +1094,32 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
 
-    species = (req.species or "dog").strip().lower()
-    # ✅ DB CHECK에 맞게 서버에서도 선제 차단
-    if species not in ("dog", "cat", "etc"):
-        raise HTTPException(status_code=400, detail="species must be one of 'dog','cat','etc'")
+    species = _norm_species_or_400(req.species)
 
     breed = req.breed.strip() if isinstance(req.breed, str) and req.breed.strip() else None
     birthday = req.birthday
     weight_kg = float(req.weight_kg) if req.weight_kg is not None else None
 
-    gender_raw = (req.gender or "").strip().upper()
-    gender: Optional[str]
-    if not gender_raw:
-        gender = None  # ✅ 미입력 허용
-    else:
-        if gender_raw not in ("M", "F", "U"):
-            raise HTTPException(status_code=400, detail="gender must be one of 'M','F','U' or null")
-        gender = gender_raw
+    gender = _norm_optional_char(req.gender, {"M", "F", "U"}, "gender")
+    neutered = _norm_optional_char(req.neutered, {"Y", "N", "U"}, "neutered")
 
-    has_no_allergy = bool(req.has_no_allergy)
+    # v2.1.4: NULL/TRUE/FALSE 그대로 저장
+    has_no_allergy: Optional[bool] = req.has_no_allergy
+
+    # 알러지 태그 정리
     allergy_tags = [str(x).strip() for x in (req.allergy_tags or []) if str(x).strip()]
-    if has_no_allergy:
+
+    # ✅ chk_allergy_consistency (스키마와 동일 의도) 서버 선제 검증
+    # - has_no_allergy가 TRUE 또는 NULL => tags는 반드시 빈 배열
+    # - has_no_allergy가 FALSE => tags는 빈 배열도 허용
+    if has_no_allergy is not False and allergy_tags:
+        raise HTTPException(
+            status_code=400,
+            detail="allergyTags must be empty unless hasNoAllergy is false",
+        )
+
+    if has_no_allergy is not False:
+        # TRUE/NULL => tags는 무조건 빈 배열로 저장(명시적으로 강제)
         allergy_tags = []
 
     # 유저 row 보장(외래키)
@@ -1089,9 +1128,9 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
     row = db_fetchone(
         """
         INSERT INTO public.pets
-            (id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags)
+            (id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags)
         VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             species = EXCLUDED.species,
@@ -1099,14 +1138,19 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
             birthday = EXCLUDED.birthday,
             weight_kg = EXCLUDED.weight_kg,
             gender = EXCLUDED.gender,
+            neutered = EXCLUDED.neutered,
             has_no_allergy = EXCLUDED.has_no_allergy,
             allergy_tags = EXCLUDED.allergy_tags
         WHERE public.pets.user_uid = EXCLUDED.user_uid
         RETURNING
-            id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags,
+            id, user_uid, name, species, breed, birthday, weight_kg,
+            gender, neutered, has_no_allergy, allergy_tags,
             created_at, updated_at
         """,
-        (pet_uuid, uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags),
+        (
+            pet_uuid, uid, name, species, breed, birthday, weight_kg,
+            gender, neutered, has_no_allergy, allergy_tags,
+        ),
     )
 
     if row:
@@ -1124,8 +1168,8 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
     rows = db_fetchall(
         """
         SELECT
-            id, user_uid, name, species, breed, birthday, weight_kg, gender,
-            has_no_allergy, allergy_tags,
+            id, user_uid, name, species, breed, birthday, weight_kg,
+            gender, neutered, has_no_allergy, allergy_tags,
             created_at, updated_at
         FROM public.pets
         WHERE user_uid=%s
@@ -1134,6 +1178,14 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
         (uid,),
     )
     return jsonable_encoder(rows)
+
+
+def _hospital_exists(hospital_mgmt_no: str) -> bool:
+    row = db_fetchone(
+        "SELECT hospital_mgmt_no FROM public.hospitals WHERE hospital_mgmt_no=%s",
+        (hospital_mgmt_no,),
+    )
+    return bool(row)
 
 
 @app.post("/api/db/records/upsert")
@@ -1151,6 +1203,14 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
     visit_date = req.visit_date
     hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) and req.hospital_name.strip() else None
     hospital_mgmt_no = req.hospital_mgmt_no.strip() if isinstance(req.hospital_mgmt_no, str) and req.hospital_mgmt_no.strip() else None
+
+    # ✅ FK가 있으므로, 500 대신 400으로 친절하게 떨어뜨리기
+    if hospital_mgmt_no:
+        if not _hospital_exists(hospital_mgmt_no):
+            raise HTTPException(
+                status_code=400,
+                detail="hospitalMgmtNo not found in hospitals master table",
+            )
 
     total_amount = int(req.total_amount or 0)
     if total_amount < 0:
@@ -1297,7 +1357,6 @@ def api_records_list(
     if not includeItems:
         return jsonable_encoder(rows)
 
-    # include items: record_id IN (...)
     record_ids = [str(r["id"]) for r in rows if r.get("id")]
     if not record_ids:
         return jsonable_encoder(rows)
@@ -1388,7 +1447,6 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
 
 @app.get("/api/admin/dau")
 def admin_dau(admin: Dict[str, Any] = Depends(get_admin_user)):
-    # user_daily_active가 있으면 이걸 쓰는 게 정확함
     rows = db_fetchall(
         """
         SELECT
@@ -1450,7 +1508,10 @@ def admin_user_detail(firebase_uid: str, admin: Dict[str, Any] = Depends(get_adm
 
     pets = db_fetchall(
         """
-        SELECT id, user_uid, name, species, breed, birthday, weight_kg, gender, has_no_allergy, allergy_tags, created_at, updated_at
+        SELECT
+            id, user_uid, name, species, breed, birthday, weight_kg,
+            gender, neutered, has_no_allergy, allergy_tags,
+            created_at, updated_at
         FROM public.pets
         WHERE user_uid=%s
         ORDER BY created_at DESC
@@ -2135,7 +2196,6 @@ def _resolve_record_tags(raw_tags: Any) -> List[str]:
             out.append(getattr(cfg, "code", t_str))
             continue
 
-        # (주의) 한국어 태그를 지워버리지 않게: normalize_tag_code는 AI 통계에서만 활용
         out.append(t_str)
 
     seen: Set[str] = set()
