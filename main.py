@@ -1,4 +1,5 @@
-# main.py (PetHealth+ Server) - Firebase Storage + Receipt Redaction + Migration (MVP)
+# main.py (PetHealth+ Server) - Firebase Storage + Receipt Redaction + Migration + Hospitals + PDF Vault
+# Schema: v2.1.20-final (users/pets/hospitals/health_records/health_items/pet_documents/user_daily_active/migration_tokens)
 import os
 import io
 import json
@@ -7,7 +8,6 @@ import re
 import base64
 import hashlib
 import secrets
-import tempfile
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Tuple, Set
@@ -39,19 +39,6 @@ from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
 import psycopg2.extras
 
-try:
-    from condition_tags import CONDITION_TAGS, ConditionTagConfig
-except ImportError:
-    CONDITION_TAGS = {}
-    ConditionTagConfig = Any  # type: ignore
-    print("Warning: condition_tags.py not found. AI tagging will be limited.")
-
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
-    print("Warning: google.generativeai not installed. Gemini features disabled.")
-
 
 # =========================================================
 # Settings
@@ -68,24 +55,22 @@ class Settings(BaseSettings):
     FIREBASE_ADMIN_SA_B64: str = ""   # base64-encoded JSON string (optional)
     FIREBASE_STORAGE_BUCKET: str = "" # e.g. "<project-id>.appspot.com"
 
+    # (dev) local stub storage dir when STUB_MODE=true
+    STUB_STORAGE_DIR: str = "./_stub_storage"
+
     # --- Receipt image pipeline ---
     RECEIPT_MAX_WIDTH: int = 1024
-    RECEIPT_WEBP_QUALITY: int = 85
+    RECEIPT_WEBP_QUALITY: int = 85  # fixed
 
     # Migration token TTL / processing
     MIGRATION_TOKEN_TTL_SECONDS: int = 10 * 60
     MIGRATION_PROCESSING_STALE_SECONDS: int = 5 * 60
 
-    # --- Tag inference ---
-    TAG_INFERENCE_ENABLED: str = "true"
-    TAG_INFERENCE_ALLOWED_GROUPS: str = "exam,medication,procedure,preventive,wellness"
-    TAG_INFERENCE_MIN_SCORE: int = 170
-    TAG_INFERENCE_MAX_TAGS: int = 6
-
-    # --- Gemini ---
-    GEMINI_ENABLED: str = "false"
-    GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+    # --- Tier feature gating (business) ---
+    # (표 기반) Guest: 영수증 3개까지 / PDF 불가
+    # Member: PDF 3개까지 (맛보기) / Premium: 무제한
+    GUEST_MAX_RECORDS: int = 3
+    MEMBER_MAX_DOCS: int = 3
 
     # --- Postgres ---
     DB_ENABLED: str = "true"
@@ -101,6 +86,7 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
 
 # =========================================================
 # Common UUID helpers
@@ -207,6 +193,12 @@ def db_execute(sql: str, params: Tuple[Any, ...] = ()) -> int:
 
 
 def db_touch_user(firebase_uid: str) -> Dict[str, Any]:
+    """
+    v2.1.20-final users upsert:
+    - create row if not exists
+    - bump last_seen_at
+    - insert DAU row (optional)
+    """
     uid = (firebase_uid or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="firebase_uid is empty")
@@ -219,7 +211,10 @@ def db_touch_user(firebase_uid: str) -> Dict[str, Any]:
                 VALUES (%s)
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     last_seen_at = now()
-                RETURNING firebase_uid, pet_count, created_at, updated_at, last_seen_at
+                RETURNING
+                    firebase_uid, membership_tier, premium_until,
+                    pet_count, record_count, doc_count, total_storage_bytes,
+                    created_at, updated_at, last_seen_at
                 """,
                 (uid,),
             )
@@ -241,6 +236,51 @@ def db_touch_user(firebase_uid: str) -> Dict[str, Any]:
                 print("[DB] user_daily_active insert failed (ignored):", e)
 
             return dict(row)
+
+
+def db_get_user_quota_usage(uid: str) -> Dict[str, Any]:
+    """
+    Returns membership_tier, premium_until, record_count, doc_count, total_storage_bytes, quota_limit
+    """
+    row = db_fetchone(
+        """
+        SELECT
+            firebase_uid,
+            membership_tier,
+            premium_until,
+            pet_count,
+            record_count,
+            doc_count,
+            total_storage_bytes,
+            public.get_tier_quota(membership_tier) AS quota_limit
+        FROM public.users
+        WHERE firebase_uid=%s
+        """,
+        (uid,),
+    )
+    if not row:
+        # ensure row exists
+        row = db_touch_user(uid)
+        # re-fetch quota using db function
+        row = db_fetchone(
+            """
+            SELECT
+                firebase_uid,
+                membership_tier,
+                premium_until,
+                pet_count,
+                record_count,
+                doc_count,
+                total_storage_bytes,
+                public.get_tier_quota(membership_tier) AS quota_limit
+            FROM public.users
+            WHERE firebase_uid=%s
+            """,
+            (uid,),
+        )
+        if not row:
+            raise HTTPException(status_code=500, detail="Failed to load user profile")
+    return row
 
 
 def _clean_tags(tags: Any) -> List[str]:
@@ -372,17 +412,55 @@ def get_admin_user(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str
 
 
 # =========================================================
-# Firebase Storage helpers
+# Storage helpers (Firebase or local stub)
 # =========================================================
+def _stub_rel_to_abs(rel_path: str) -> str:
+    # prevent path traversal
+    safe = rel_path.strip().lstrip("/").replace("..", "__")
+    return os.path.join(settings.STUB_STORAGE_DIR, safe)
+
+
+def _stub_ensure_dir(abs_path: str) -> None:
+    d = os.path.dirname(abs_path)
+    os.makedirs(d, exist_ok=True)
+
+
+def _stub_list(prefix: str) -> List[Dict[str, Any]]:
+    base = settings.STUB_STORAGE_DIR
+    if not os.path.exists(base):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    prefix_norm = prefix.strip().lstrip("/")
+    for root, _, files in os.walk(base):
+        for f in files:
+            abs_path = os.path.join(root, f)
+            rel = os.path.relpath(abs_path, base).replace("\\", "/")
+            if not rel.startswith(prefix_norm):
+                continue
+            st = os.stat(abs_path)
+            out.append(
+                {
+                    "name": rel,
+                    "updated": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z",
+                    "size": int(st.st_size),
+                    "contentType": None,
+                }
+            )
+    return out
+
+
 def _require_storage() -> None:
     if settings.STUB_MODE.lower() == "true":
-        # dev stub
+        os.makedirs(settings.STUB_STORAGE_DIR, exist_ok=True)
         return
     if not settings.FIREBASE_STORAGE_BUCKET:
         raise HTTPException(status_code=503, detail="FIREBASE_STORAGE_BUCKET is not set")
 
 
 def get_bucket():
+    if settings.STUB_MODE.lower() == "true":
+        return None
     init_firebase_admin()
     _require_storage()
     return fb_storage.bucket()
@@ -393,14 +471,35 @@ def upload_bytes_to_storage(path: str, data: bytes, content_type: str) -> str:
     Upload bytes to Firebase Storage at 'path'.
     Returns the same relative path (no URL).
     """
+    _require_storage()
+
+    if settings.STUB_MODE.lower() == "true":
+        abs_path = _stub_rel_to_abs(path)
+        _stub_ensure_dir(abs_path)
+        with open(abs_path, "wb") as f:
+            f.write(data)
+        return path
+
     b = get_bucket()
+    assert b is not None
     blob = b.blob(path)
     blob.upload_from_string(data, content_type=content_type)
     return path
 
 
 def download_json_from_storage(path: str) -> Dict[str, Any]:
+    _require_storage()
+
+    if settings.STUB_MODE.lower() == "true":
+        abs_path = _stub_rel_to_abs(path)
+        if not os.path.exists(abs_path):
+            raise HTTPException(status_code=404, detail="object not found")
+        with open(abs_path, "rb") as f:
+            raw = f.read()
+        return json.loads(raw.decode("utf-8"))
+
     b = get_bucket()
+    assert b is not None
     blob = b.blob(path)
     if not blob.exists():
         raise HTTPException(status_code=404, detail="object not found")
@@ -414,7 +513,17 @@ def upload_json_to_storage(path: str, obj: Any) -> str:
 
 
 def delete_storage_object_if_exists(path: str) -> bool:
+    _require_storage()
+
+    if settings.STUB_MODE.lower() == "true":
+        abs_path = _stub_rel_to_abs(path)
+        if not os.path.exists(abs_path):
+            return False
+        os.remove(abs_path)
+        return True
+
     b = get_bucket()
+    assert b is not None
     blob = b.blob(path)
     if not blob.exists():
         return False
@@ -423,7 +532,13 @@ def delete_storage_object_if_exists(path: str) -> bool:
 
 
 def list_storage_objects(prefix: str) -> List[Dict[str, Any]]:
+    _require_storage()
+
+    if settings.STUB_MODE.lower() == "true":
+        return _stub_list(prefix)
+
     b = get_bucket()
+    assert b is not None
     out: List[Dict[str, Any]] = []
     for blob in b.list_blobs(prefix=prefix):
         out.append(
@@ -452,20 +567,9 @@ def _receipt_path(uid: str, pet_id: str, record_id: str) -> str:
     return f"{_user_prefix(uid, pet_id)}/receipts/{record_id}.webp"
 
 
-def _lab_pdf_path(uid: str, pet_id: str, doc_id: str) -> str:
-    return f"{_user_prefix(uid, pet_id)}/lab/{doc_id}.pdf"
-
-
-def _lab_meta_path(uid: str, pet_id: str, doc_id: str) -> str:
-    return f"{_user_prefix(uid, pet_id)}/lab/{doc_id}.json"
-
-
-def _cert_pdf_path(uid: str, pet_id: str, doc_id: str) -> str:
-    return f"{_user_prefix(uid, pet_id)}/cert/{doc_id}.pdf"
-
-
-def _cert_meta_path(uid: str, pet_id: str, doc_id: str) -> str:
-    return f"{_user_prefix(uid, pet_id)}/cert/{doc_id}.json"
+def _doc_pdf_path(uid: str, pet_id: str, doc_type: str, doc_id: str) -> str:
+    # doc_type: lab | cert
+    return f"{_user_prefix(uid, pet_id)}/{doc_type}/{doc_id}.pdf"
 
 
 # =========================================================
@@ -549,9 +653,6 @@ _MONEY_NUM = re.compile(r"\b\d{1,3}(?:,\d{3})+\b|\b\d{3,}\b")
 
 
 def _group_words_into_lines(words: List[Dict[str, Any]], img_h: int) -> List[Dict[str, Any]]:
-    """
-    Cluster by y center. Returns lines with words sorted by x.
-    """
     if not words:
         return []
 
@@ -571,14 +672,12 @@ def _group_words_into_lines(words: List[Dict[str, Any]], img_h: int) -> List[Dic
         for ln in lines:
             if abs(it["cy"] - ln["cy"]) <= threshold:
                 ln["words"].append(it)
-                # update avg cy
                 ln["cy"] = (ln["cy"] * (len(ln["words"]) - 1) + it["cy"]) / len(ln["words"])
                 placed = True
                 break
         if not placed:
             lines.append({"cy": it["cy"], "words": [it]})
 
-    # finalize
     out = []
     for ln in lines:
         ws = ln["words"]
@@ -597,11 +696,9 @@ def _looks_like_address_line(line_text: str) -> bool:
     t = (line_text or "").strip()
     if not t:
         return False
-    # keyword + digit heuristic
     has_kw = any(k in t for k in _ADDR_KEYWORDS)
     if has_kw and re.search(r"\d", t):
         return True
-    # postal + kw
     if _RE_ZIP.search(t) and has_kw:
         return True
     return False
@@ -629,13 +726,10 @@ def _line_contains_pii_trigger(line_text: str) -> bool:
     if _looks_like_address_line(t):
         return True
 
-    # suspicious long digit blobs, excluding money-ish lines
     digit_runs = re.findall(r"\d{6,}", re.sub(r"[,\s\-]", "", t))
     if digit_runs:
-        # allow if clearly money line
         if _MONEY_HINT.search(t):
             return False
-        # if it has big numbers but no currency hint, treat as suspicious
         return True
 
     return False
@@ -645,27 +739,18 @@ def _line_is_money_item_candidate(line_text: str) -> bool:
     t = (line_text or "").strip()
     if not t:
         return False
-    # must have a number candidate
     if not _MONEY_NUM.search(t):
         return False
-    # prefer money hint, but allow if trailing number looks like amount
     if _MONEY_HINT.search(t):
         return True
-    # fallback: last token is 3+ digits
     m = re.search(r"(\d{3,})(?!.*\d)", re.sub(r"[,\s]", "", t))
     return bool(m)
 
 
 def _compute_redaction_boxes(lines: List[Dict[str, Any]], img_w: int, img_h: int) -> List[Tuple[int, int, int, int]]:
-    """
-    Aggressive:
-    - if a line triggers PII -> mask the entire line bbox with padding
-    - footer padding: if address/phone triggers appear near bottom -> mask from that line upward padding to bottom
-    """
     boxes: List[Tuple[int, int, int, int]] = []
     footer_trigger_y: Optional[int] = None
 
-    # padding values (pixels)
     pad_x = max(12, int(img_w * 0.01))
     pad_y = max(8, int(img_h * 0.008))
 
@@ -680,17 +765,14 @@ def _compute_redaction_boxes(lines: List[Dict[str, Any]], img_w: int, img_h: int
             ry2 = min(img_h, y2 + pad_y)
             boxes.append((rx1, ry1, rx2, ry2))
 
-            # footer detection: if trigger line is in bottom 35% OR looks like address/phone
             if (y1 > img_h * 0.65) or _looks_like_address_line(text) or _RE_PHONE.search(text):
                 footer_trigger_y = y1 if footer_trigger_y is None else min(footer_trigger_y, y1)
 
-    # footer padding mask: from (footer_trigger_y - extra_pad) to bottom
     if footer_trigger_y is not None:
         extra = max(40, int(img_h * 0.03))
         y = max(0, footer_trigger_y - extra)
         boxes.append((0, y, img_w, img_h))
 
-    # merge-ish (simple): return as is (overlaps ok)
     return boxes
 
 
@@ -715,7 +797,6 @@ def _resize_to_width(img: Image.Image, max_w: int) -> Image.Image:
 
 def _encode_webp(img: Image.Image, quality: int) -> bytes:
     buf = io.BytesIO()
-    # method=6 gives better compression (slower, but MVP ok)
     img.save(buf, format="WEBP", quality=int(quality), method=6)
     return buf.getvalue()
 
@@ -727,7 +808,6 @@ def _parse_visit_date_from_text(text: str) -> Optional[date]:
     t = (text or "").strip()
     if not t:
         return None
-    # 2026-01-26 / 2026.01.26 / 2026년 1월 26일
     m = re.search(r"(20\d{2})[.\-\/년 ]+(\d{1,2})[.\-\/월 ]+(\d{1,2})", t)
     if not m:
         return None
@@ -775,7 +855,6 @@ def _extract_total_amount(lines: List[str]) -> Optional[int]:
     for ln in lines:
         t = ln.upper()
         if any(k.upper() in t for k in keys):
-            # find last number
             nums = re.findall(r"\d{1,3}(?:,\d{3})+|\d{3,}", t)
             if nums:
                 n = nums[-1].replace(",", "")
@@ -787,17 +866,10 @@ def _extract_total_amount(lines: List[str]) -> Optional[int]:
 
 
 def _extract_items_from_lines(lines: List[str], max_items: int = 60) -> List[Dict[str, Any]]:
-    """
-    Very heuristic:
-    - pick lines that look like money item candidates
-    - extract last amount as price
-    - remaining text -> item_name
-    """
     out: List[Dict[str, Any]] = []
     for ln in lines:
         if not _line_is_money_item_candidate(ln):
             continue
-        # extract amount
         nums = re.findall(r"\d{1,3}(?:,\d{3})+|\d{3,}", ln)
         if not nums:
             continue
@@ -807,12 +879,9 @@ def _extract_items_from_lines(lines: List[str], max_items: int = 60) -> List[Dic
         except Exception:
             price = None
 
-        # remove that last number occurrence
-        item_name = ln
-        item_name = re.sub(re.escape(nums[-1]), "", item_name, count=1).strip()
+        item_name = re.sub(re.escape(nums[-1]), "", ln, count=1).strip()
         item_name = re.sub(r"(₩|원|KRW)", "", item_name, flags=re.IGNORECASE).strip()
 
-        # avoid empty / too short
         if len(item_name) < 1:
             continue
 
@@ -833,29 +902,21 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
     Returns (redacted_webp_bytes, parsed_structured_dict)
     - parsed_structured contains only non-PII: hospitalName, visitDate, totalAmount, items[]
     """
-    # load image
     img = Image.open(io.BytesIO(raw_image_bytes))
     img = img.convert("RGB")  # strip alpha/exif
 
     w, h = img.size
 
-    # OCR on original (for bbox accuracy), but never store raw OCR text
     words = run_vision_ocr_words(raw_image_bytes)
     lines = _group_words_into_lines(words, img_h=h)
     line_texts = [ln["text"] for ln in lines if ln.get("text")]
 
-    # compute redaction boxes
     boxes = _compute_redaction_boxes(lines, img_w=w, img_h=h)
     redacted = _apply_redaction(img, boxes)
 
-    # resize to 1024 width (no upscale)
     redacted_small = _resize_to_width(redacted, int(settings.RECEIPT_MAX_WIDTH))
-
-    # encode webp quality 85 fixed
     webp = _encode_webp(redacted_small, int(settings.RECEIPT_WEBP_QUALITY))
 
-    # Parse structured data from NON-PII candidate lines:
-    # We exclude lines that triggered PII (conservatively)
     safe_lines: List[str] = []
     for ln in line_texts:
         if _line_contains_pii_trigger(ln):
@@ -877,7 +938,7 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
         "hospitalName": hospital_name or None,
         "visitDate": visit_date.isoformat() if visit_date else None,
         "totalAmount": total_amount,
-        "items": items,  # itemName/price/categoryTag only
+        "items": items,
     }
     return webp, parsed
 
@@ -937,6 +998,14 @@ class HealthRecordUpsertRequest(BaseModel):
     items: Optional[List[HealthItemInput]] = None
 
 
+class HospitalCustomCreateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    name: str
+    road_address: str = Field(alias="roadAddress")
+    lng: Optional[float] = None
+    lat: Optional[float] = None
+
+
 class MigrationPrepareResponse(BaseModel):
     oldUid: str
     migrationCode: str
@@ -950,7 +1019,7 @@ class MigrationExecuteRequest(BaseModel):
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.1.0-fbstorage")
+app = FastAPI(title="PetHealth+ Server", version="2.1.20-final")
 
 app.add_middleware(
     CORSMiddleware,
@@ -972,6 +1041,8 @@ def _startup():
         print("[Startup] Auth not required or STUB_MODE. Skipping Firebase init.")
 
     init_db_pool()
+    if settings.STUB_MODE.lower() == "true":
+        os.makedirs(settings.STUB_STORAGE_DIR, exist_ok=True)
 
 
 @app.on_event("shutdown")
@@ -988,14 +1059,14 @@ def _shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (Firebase Storage)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (Firebase Storage, v2.1.20-final)"}
 
 
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
-        "storage": "firebase",
+        "storage": "firebase" if settings.STUB_MODE.lower() != "true" else "stub",
         "storage_bucket": settings.FIREBASE_STORAGE_BUCKET,
         "receipt_webp_quality": settings.RECEIPT_WEBP_QUALITY,
         "receipt_max_width": settings.RECEIPT_MAX_WIDTH,
@@ -1008,7 +1079,203 @@ def health():
 
 @app.get("/api/me")
 def me(user: Dict[str, Any] = Depends(get_current_user)):
-    return {"uid": user.get("uid"), "email": user.get("email")}
+    uid = user.get("uid") or ""
+    prof = db_touch_user(uid) if uid else None
+    if not uid:
+        return {"uid": None}
+    quota = db_get_user_quota_usage(uid)
+    return {
+        "uid": uid,
+        "email": user.get("email"),
+        "membershipTier": quota.get("membership_tier"),
+        "premiumUntil": quota.get("premium_until"),
+        "petCount": quota.get("pet_count"),
+        "recordCount": quota.get("record_count"),
+        "docCount": quota.get("doc_count"),
+        "totalStorageBytes": quota.get("total_storage_bytes"),
+        "quotaLimitBytes": quota.get("quota_limit"),
+        "updatedAt": (prof or {}).get("updated_at"),
+    }
+
+
+# =========================================================
+# Tier/Quota helper (server-side precheck)
+# =========================================================
+def _raise_quota_exceeded(uid: str, current: int, delta: int, limit: int):
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "message": "Quota exceeded",
+            "uid": uid,
+            "currentBytes": current,
+            "deltaBytes": delta,
+            "limitBytes": limit,
+        },
+    )
+
+
+def _precheck_quota(uid: str, delta_bytes: int) -> Dict[str, Any]:
+    """
+    Pre-check to avoid wasting upload/OCR cost.
+    DB trigger is still final authority.
+    """
+    info = db_get_user_quota_usage(uid)
+    current = int(info.get("total_storage_bytes") or 0)
+    limit = int(info.get("quota_limit") or 0)
+    if delta_bytes > 0 and (current + int(delta_bytes)) > limit:
+        _raise_quota_exceeded(uid, current, int(delta_bytes), limit)
+    return info
+
+
+def _enforce_business_gating_for_receipt(user_info: Dict[str, Any], is_new_record: bool):
+    tier = (user_info.get("membership_tier") or "guest").lower()
+    if tier == "guest" and is_new_record:
+        max_records = int(settings.GUEST_MAX_RECORDS)
+        if max_records > 0:
+            rc = int(user_info.get("record_count") or 0)
+            if rc >= max_records:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "message": "Guest receipt limit reached",
+                        "tier": tier,
+                        "recordCount": rc,
+                        "maxRecords": max_records,
+                    },
+                )
+
+
+def _enforce_business_gating_for_pdf(user_info: Dict[str, Any]):
+    tier = (user_info.get("membership_tier") or "guest").lower()
+    if tier == "guest":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "PDF vault is not available for Guest tier",
+                "tier": tier,
+            },
+        )
+    if tier == "member":
+        max_docs = int(settings.MEMBER_MAX_DOCS)
+        if max_docs > 0:
+            dc = int(user_info.get("doc_count") or 0)
+            if dc >= max_docs:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "message": "Member PDF limit reached (upgrade required)",
+                        "tier": tier,
+                        "docCount": dc,
+                        "maxDocs": max_docs,
+                    },
+                )
+
+
+# =========================================================
+# Hospitals APIs (gov master + private custom)
+# =========================================================
+def _hospital_accessible_to_user(uid: str, hospital_mgmt_no: str) -> Optional[Dict[str, Any]]:
+    return db_fetchone(
+        """
+        SELECT hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry, created_by_uid
+        FROM public.hospitals
+        WHERE hospital_mgmt_no=%s
+          AND (
+            is_custom_entry = false
+            OR created_by_uid = %s
+          )
+        """,
+        (hospital_mgmt_no, uid),
+    )
+
+
+@app.get("/api/hospitals/search")
+def hospitals_search(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=50),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    db_touch_user(uid)
+
+    query = (q or "").strip()
+    if not query:
+        return []
+
+    # pg_trgm: use similarity operator (%) + fallback ILIKE
+    rows = db_fetchall(
+        """
+        SELECT
+          hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry
+        FROM public.hospitals
+        WHERE
+          (is_custom_entry = false OR created_by_uid = %s)
+          AND (
+            search_vector ILIKE ('%%' || %s || '%%')
+            OR search_vector %% %s
+          )
+        ORDER BY
+          (CASE WHEN search_vector ILIKE ('%%' || %s || '%%') THEN 0 ELSE 1 END) ASC,
+          similarity(search_vector, %s) DESC
+        LIMIT %s
+        """,
+        (uid, query, query, query, query, limit),
+    )
+    return jsonable_encoder(rows)
+
+
+@app.post("/api/hospitals/custom/create")
+def hospitals_custom_create(
+    req: HospitalCustomCreateRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    db_touch_user(uid)
+
+    name = (req.name or "").strip()
+    road_address = (req.road_address or "").strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if not road_address:
+        raise HTTPException(status_code=400, detail="roadAddress is required")
+
+    # (optional) dedupe within user's custom entries
+    existing = db_fetchone(
+        """
+        SELECT hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry
+        FROM public.hospitals
+        WHERE is_custom_entry = true
+          AND created_by_uid = %s
+          AND name = %s
+          AND road_address = %s
+        """,
+        (uid, name, road_address),
+    )
+    if existing:
+        return jsonable_encoder(existing)
+
+    custom_no = "CUSTOM_" + uuid.uuid4().hex
+
+    row = db_fetchone(
+        """
+        INSERT INTO public.hospitals
+          (hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry, created_by_uid)
+        VALUES
+          (%s, %s, %s, %s, %s, true, %s)
+        RETURNING hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry
+        """,
+        (custom_no, name, road_address, req.lng, req.lat, uid),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="failed to create custom hospital")
+    return jsonable_encoder(row)
 
 
 # =========================================================
@@ -1018,6 +1285,8 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
 def api_user_upsert(user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or ""
     row = db_touch_user(uid)
+    quota = db_get_user_quota_usage(uid)
+    row.update({"quota_limit": quota.get("quota_limit")})
     return jsonable_encoder(row)
 
 
@@ -1054,12 +1323,8 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
     has_no_allergy: Optional[bool] = req.has_no_allergy
     allergy_tags = [str(x).strip() for x in (req.allergy_tags or []) if str(x).strip()]
 
-    # if tags exist but has_no_allergy is None => infer "FALSE"
-    if allergy_tags and has_no_allergy is None:
-        has_no_allergy = False
-
-    # if has_no_allergy is True OR None => tags must be empty (force empty to satisfy constraint)
-    if has_no_allergy is True or has_no_allergy is None:
+    # if has_no_allergy is TRUE => tags must be empty
+    if has_no_allergy is True:
         allergy_tags = []
 
     db_touch_user(uid)
@@ -1115,8 +1380,68 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
     return jsonable_encoder(rows)
 
 
+@app.delete("/api/db/pets/delete")
+def api_pets_delete(
+    petId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Deletes pet row (cascade deletes records/docs/items),
+    AND server tries to delete storage objects under users/{uid}/pets/{petId}/...
+    """
+    uid = user.get("uid") or ""
+    pet_uuid = _uuid_or_400(petId, "petId")
+
+    # ensure ownership
+    pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+    if not pet:
+        raise HTTPException(status_code=404, detail="pet not found")
+
+    # collect storage paths BEFORE delete (because cascade will remove rows)
+    rec_paths = db_fetchall(
+        """
+        SELECT receipt_image_path AS path
+        FROM public.health_records r
+        WHERE r.pet_id=%s AND receipt_image_path IS NOT NULL
+        """,
+        (pet_uuid,),
+    )
+    doc_paths = db_fetchall(
+        """
+        SELECT file_path AS path
+        FROM public.pet_documents d
+        WHERE d.pet_id=%s
+        """,
+        (pet_uuid,),
+    )
+    paths = [r["path"] for r in rec_paths if r.get("path")] + [d["path"] for d in doc_paths if d.get("path")]
+
+    # delete DB pet (cascade)
+    db_execute("DELETE FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+
+    # delete storage objects best-effort
+    deleted: List[str] = []
+    failed: List[str] = []
+    for p in paths:
+        try:
+            ok = delete_storage_object_if_exists(p)
+            if ok:
+                deleted.append(p)
+            else:
+                # not found = ignore
+                pass
+        except Exception:
+            failed.append(p)
+
+    return {"ok": True, "petId": str(pet_uuid), "deletedStorage": deleted, "failedStorage": failed}
+
+
 @app.post("/api/db/records/upsert")
 def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Manual record upsert:
+    - Does NOT allow client to set receipt_image_path/file_size_bytes (server-only)
+    """
     uid = user.get("uid") or ""
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
@@ -1139,9 +1464,16 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
 
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # ownership check
             cur.execute("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="pet not found")
+
+            # optional: validate hospital scope (better error than FK)
+            if hospital_mgmt_no:
+                hosp = _hospital_accessible_to_user(uid, hospital_mgmt_no)
+                if not hosp:
+                    raise HTTPException(status_code=404, detail="hospital not found or not accessible")
 
             cur.execute(
                 """
@@ -1165,7 +1497,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 )
                 RETURNING
                     id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
-                    receipt_image_path, receipt_meta_path,
+                    receipt_image_path, file_size_bytes,
                     created_at, updated_at
                 """,
                 (record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, uid),
@@ -1228,7 +1560,7 @@ def api_records_list(
             SELECT
                 r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
                 r.pet_weight_at_visit, r.tags,
-                r.receipt_image_path, r.receipt_meta_path,
+                r.receipt_image_path, r.file_size_bytes,
                 r.created_at, r.updated_at
             FROM public.health_records r
             JOIN public.pets p ON p.id = r.pet_id
@@ -1243,7 +1575,7 @@ def api_records_list(
             SELECT
                 r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
                 r.pet_weight_at_visit, r.tags,
-                r.receipt_image_path, r.receipt_meta_path,
+                r.receipt_image_path, r.file_size_bytes,
                 r.created_at, r.updated_at
             FROM public.health_records r
             JOIN public.pets p ON p.id = r.pet_id
@@ -1289,18 +1621,14 @@ def api_record_get(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or ""
-    rid = (recordId or "").strip()
-    if not rid:
-        raise HTTPException(status_code=400, detail="recordId is required")
-
-    record_uuid = _uuid_or_400(rid, "recordId")
+    record_uuid = _uuid_or_400(recordId, "recordId")
 
     row = db_fetchone(
         """
         SELECT
             r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
             r.pet_weight_at_visit, r.tags,
-            r.receipt_image_path, r.receipt_meta_path,
+            r.receipt_image_path, r.file_size_bytes,
             r.created_at, r.updated_at
         FROM public.health_records r
         JOIN public.pets p ON p.id = r.pet_id
@@ -1324,6 +1652,56 @@ def api_record_get(
     return jsonable_encoder(row)
 
 
+@app.delete("/api/db/records/delete")
+def api_record_delete(
+    recordId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Delete record row AND delete receipt file if exists.
+    """
+    uid = user.get("uid") or ""
+    record_uuid = _uuid_or_400(recordId, "recordId")
+
+    rec = db_fetchone(
+        """
+        SELECT r.id, r.receipt_image_path
+        FROM public.health_records r
+        JOIN public.pets p ON p.id = r.pet_id
+        WHERE p.user_uid=%s AND r.id=%s
+        """,
+        (uid, record_uuid),
+    )
+    if not rec:
+        raise HTTPException(status_code=404, detail="record not found")
+
+    path = rec.get("receipt_image_path")
+
+    # delete storage first (best effort)
+    warnings: List[str] = []
+    if path:
+        try:
+            ok = delete_storage_object_if_exists(path)
+            if not ok:
+                warnings.append("receipt file not found in storage (already deleted?)")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"storage delete failed: {e}")
+
+    db_execute(
+        """
+        DELETE FROM public.health_records
+        WHERE id=%s AND EXISTS (
+          SELECT 1
+          FROM public.pets p
+          WHERE p.id = public.health_records.pet_id AND p.user_uid=%s
+        )
+        """,
+        (record_uuid, uid),
+    )
+
+    return {"ok": True, "recordId": str(record_uuid), "deletedReceiptPath": path, "warnings": warnings}
+
+
 # =========================================================
 # Receipt endpoint (server-only upload)
 # =========================================================
@@ -1332,10 +1710,21 @@ async def api_receipts_process(
     petId: str = Form(...),
     recordId: Optional[str] = Form(None),
     replaceItems: bool = Form(True),
+    hospitalMgmtNo: Optional[str] = Form(None),  # optional (user selected)
+    visitDateOverride: Optional[str] = Form(None),  # optional YYYY-MM-DD
+    totalAmountOverride: Optional[int] = Form(None),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
+    """
+    Pipeline:
+      1) OCR (in-memory) -> aggressive redaction -> resize -> webp (quality 85 fixed)
+      2) quota precheck (reduce wasted cost)
+      3) upload redacted image to Firebase Storage (relative path only)
+      4) upsert health_records.receipt_image_path + file_size_bytes
+      5) upsert extracted health_items (optional replace)
+    """
     upload = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail="file/image is required")
@@ -1344,6 +1733,8 @@ async def api_receipts_process(
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
 
+    db_touch_user(uid)
+
     pet_uuid = _uuid_or_400(petId, "petId")
     record_uuid = _uuid_or_new(recordId, "recordId")
 
@@ -1351,6 +1742,18 @@ async def api_receipts_process(
     pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
+
+    # record exists?
+    existing = db_fetchone(
+        """
+        SELECT r.id
+        FROM public.health_records r
+        JOIN public.pets p ON p.id = r.pet_id
+        WHERE r.id=%s AND p.user_uid=%s
+        """,
+        (record_uuid, uid),
+    )
+    is_new_record = existing is None
 
     raw = await upload.read()
     if not raw:
@@ -1362,30 +1765,62 @@ async def api_receipts_process(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"receipt processing failed: {e}")
 
-    # 2) upload to Firebase Storage (relative path)
+    size_bytes = len(webp_bytes)
+
+    # load user usage/tier + business gating + quota precheck
+    user_info = db_get_user_quota_usage(uid)
+    _enforce_business_gating_for_receipt(user_info, is_new_record=is_new_record)
+    _precheck_quota(uid, size_bytes)
+
+    # optional hospital validate
+    hosp_no = (hospitalMgmtNo or "").strip() or None
+    if hosp_no:
+        hosp = _hospital_accessible_to_user(uid, hosp_no)
+        if not hosp:
+            raise HTTPException(status_code=404, detail="hospital not found or not accessible")
+
+    # 2) upload to Storage (relative path)
     receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
         upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"storage upload failed: {e}")
 
-    # 3) upsert DB record + items (best-effort)
-    visit_date = parsed.get("visitDate")
-    hospital_name = parsed.get("hospitalName")
-    total_amount = parsed.get("totalAmount")
+    # 3) Build DB fields from parsed + overrides
+    parsed_visit = parsed.get("visitDate")
+    parsed_hname = parsed.get("hospitalName")
+    parsed_total = parsed.get("totalAmount")
 
+    # visit date
     vd: date = date.today()
-    if isinstance(visit_date, str) and visit_date:
+    if isinstance(visitDateOverride, str) and visitDateOverride.strip():
         try:
-            vd = datetime.strptime(visit_date, "%Y-%m-%d").date()
+            vd = datetime.strptime(visitDateOverride.strip(), "%Y-%m-%d").date()
         except Exception:
-            vd = date.today()
+            raise HTTPException(status_code=400, detail="visitDateOverride must be YYYY-MM-DD")
+    else:
+        if isinstance(parsed_visit, str) and parsed_visit:
+            try:
+                vd = datetime.strptime(parsed_visit, "%Y-%m-%d").date()
+            except Exception:
+                vd = date.today()
 
-    hn = hospital_name.strip() if isinstance(hospital_name, str) and hospital_name.strip() else None
-    ta = int(total_amount) if isinstance(total_amount, int) and total_amount >= 0 else 0
+    # hospital name
+    hn = parsed_hname.strip() if isinstance(parsed_hname, str) and parsed_hname.strip() else None
 
+    # total amount
+    if totalAmountOverride is not None:
+        try:
+            ta = int(totalAmountOverride)
+            if ta < 0:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(status_code=400, detail="totalAmountOverride must be >= 0")
+    else:
+        ta = int(parsed_total) if isinstance(parsed_total, int) and parsed_total >= 0 else 0
+
+    # items sanitize
     extracted_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
-    # sanitize extracted items
     safe_items: List[Dict[str, Any]] = []
     for it in extracted_items[:80]:
         if not isinstance(it, dict):
@@ -1403,32 +1838,37 @@ async def api_receipts_process(
                 pr = None
         safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": None})
 
+    # 4) upsert DB record + items (DB guard is final authority)
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # record upsert (receipt_image_path set by server only)
                 cur.execute(
                     """
                     INSERT INTO public.health_records
-                      (id, pet_id, hospital_name, visit_date, total_amount, tags, receipt_image_path)
+                      (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, tags,
+                       receipt_image_path, file_size_bytes)
                     VALUES
-                      (%s, %s, %s, %s, %s, %s, %s)
+                      (%s, %s, %s, %s, %s, %s, %s,
+                       %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                       pet_id = EXCLUDED.pet_id,
+                      hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
                       hospital_name = EXCLUDED.hospital_name,
                       visit_date = EXCLUDED.visit_date,
                       total_amount = EXCLUDED.total_amount,
-                      receipt_image_path = EXCLUDED.receipt_image_path
+                      tags = EXCLUDED.tags,
+                      receipt_image_path = EXCLUDED.receipt_image_path,
+                      file_size_bytes = EXCLUDED.file_size_bytes
                     WHERE EXISTS (
                       SELECT 1 FROM public.pets p
                       WHERE p.id = EXCLUDED.pet_id AND p.user_uid = %s
                     )
                     RETURNING
-                      id, pet_id, hospital_name, visit_date, total_amount,
-                      receipt_image_path, receipt_meta_path,
+                      id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount,
+                      receipt_image_path, file_size_bytes,
                       created_at, updated_at
                     """,
-                    (record_uuid, pet_uuid, hn, vd, ta, [], receipt_path, uid),
+                    (record_uuid, pet_uuid, hosp_no, hn, vd, ta, [], receipt_path, size_bytes, uid),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -1461,206 +1901,253 @@ async def api_receipts_process(
                 return jsonable_encoder(payload)
 
     except Exception as e:
-        # DB 실패 시 업로드한 파일 정리 시도(최대한)
+        # DB 실패 시 업로드한 파일 정리
         try:
             delete_storage_object_if_exists(receipt_path)
         except Exception:
             pass
+
+        # quota/guard 위반은 메시지를 더 친절히
+        msg = str(e)
+        if "Quota exceeded" in msg or "quota" in msg.lower():
+            raise HTTPException(status_code=403, detail={"message": "Quota exceeded (DB guard)", "raw": msg})
+        if "Ownership mismatch" in msg:
+            raise HTTPException(status_code=400, detail={"message": "ownership/path mismatch", "raw": msg})
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=f"db upsert failed: {e}")
 
 
 # =========================================================
-# Lab / Cert (server-only write, client read)
+# PDF Vault (lab/cert) -> pet_documents table
 # =========================================================
-@app.post("/api/lab/upload-pdf")
-async def upload_lab_pdf(
-    petId: str = Form(...),
-    title: str = Form("검사결과"),
-    memo: Optional[str] = Form(None),
-    file: UploadFile = File(...),
-    user: Dict[str, Any] = Depends(get_current_user),
+async def _upload_document_pdf(
+    doc_type: str,
+    petId: str,
+    file: UploadFile,
+    displayName: Optional[str],
+    title: Optional[str],
+    user: Dict[str, Any],
 ):
     uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    db_touch_user(uid)
+
     pet_uuid = _uuid_or_400(petId, "petId")
 
+    # ownership
     pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
 
+    dt = (doc_type or "").strip().lower()
+    if dt not in ("lab", "cert"):
+        raise HTTPException(status_code=400, detail="doc_type must be lab or cert")
+
+    # read
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty pdf")
 
-    doc_id = uuid.uuid4().hex
-    pdf_path = _lab_pdf_path(uid, str(pet_uuid), doc_id)
-    meta_path = _lab_meta_path(uid, str(pet_uuid), doc_id)
+    # basic pdf guard (content-type can be wrong in clients, so soft check)
+    if file.content_type and "pdf" not in file.content_type.lower():
+        # allow, but warn in response (no hard block)
+        pass
 
-    upload_bytes_to_storage(pdf_path, data, "application/pdf")
-    meta = {
-        "id": doc_id,
-        "uid": uid,
-        "petId": str(pet_uuid),
-        "kind": "lab",
-        "title": title,
-        "memo": memo,
-        "originalFilename": file.filename,
-        "createdAt": datetime.utcnow().isoformat(),
-        "objectPath": pdf_path,
-    }
-    upload_json_to_storage(meta_path, meta)
+    size_bytes = len(data)
 
-    return {"id": doc_id, "objectPath": pdf_path, "metaPath": meta_path, "createdAt": meta["createdAt"]}
+    # tier gating + quota precheck
+    user_info = db_get_user_quota_usage(uid)
+    _enforce_business_gating_for_pdf(user_info)
+    _precheck_quota(uid, size_bytes)
 
+    doc_uuid = uuid.uuid4()
+    doc_id = str(doc_uuid)
+    file_path = _doc_pdf_path(uid, str(pet_uuid), dt, doc_id)
 
-@app.get("/api/lab/list")
-def list_lab(petId: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
-    uid = user.get("uid") or ""
-    pet_uuid = _uuid_or_400(petId, "petId")
+    # upload first
+    try:
+        upload_bytes_to_storage(file_path, data, "application/pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"storage upload failed: {e}")
 
-    base = _user_prefix(uid, str(pet_uuid)) + "/lab/"
-    objects = list_storage_objects(base)
+    # insert DB (guard trigger will enforce ownership/quota final)
+    disp = (displayName or title or file.filename or "").strip()
+    if not disp:
+        disp = "document.pdf"
 
-    pdfs = [o for o in objects if o["name"].endswith(".pdf")]
-    out = []
-    for o in sorted(pdfs, key=lambda x: x.get("updated") or "", reverse=True):
-        name = o["name"]
-        doc_id = os.path.splitext(os.path.basename(name))[0]
-        mp = _lab_meta_path(uid, str(pet_uuid), doc_id)
-        meta = None
-        try:
-            meta = download_json_from_storage(mp)
-        except Exception:
-            meta = None
-        out.append(
-            {
-                "id": doc_id,
-                "title": (meta or {}).get("title") or "검사결과",
-                "memo": (meta or {}).get("memo"),
-                "objectPath": name,
-                "createdAt": (meta or {}).get("createdAt") or (o.get("updated")),
-            }
+    try:
+        row = db_fetchone(
+            """
+            INSERT INTO public.pet_documents
+              (id, pet_id, doc_type, display_name, file_path, file_size_bytes)
+            VALUES
+              (%s, %s, %s, %s, %s, %s)
+            RETURNING
+              id, pet_id, doc_type, display_name, file_path, file_size_bytes, created_at, updated_at
+            """,
+            (doc_uuid, pet_uuid, dt, disp[:200], file_path, size_bytes),
         )
-    return out
+        if not row:
+            raise HTTPException(status_code=500, detail="failed to insert pet_documents")
+        return jsonable_encoder(row)
+
+    except Exception as e:
+        # cleanup storage if db fails
+        try:
+            delete_storage_object_if_exists(file_path)
+        except Exception:
+            pass
+
+        msg = str(e)
+        if "Quota exceeded" in msg or "quota" in msg.lower():
+            raise HTTPException(status_code=403, detail={"message": "Quota exceeded (DB guard)", "raw": msg})
+        if "Ownership mismatch" in msg:
+            raise HTTPException(status_code=400, detail={"message": "ownership/path mismatch", "raw": msg})
+        raise HTTPException(status_code=500, detail=f"db insert failed: {e}")
 
 
-@app.delete("/api/lab/delete")
-def delete_lab(petId: str = Query(...), id: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
-    uid = user.get("uid") or ""
-    pet_uuid = _uuid_or_400(petId, "petId")
-    doc_id = (id or "").strip()
-    if not doc_id:
-        raise HTTPException(status_code=400, detail="id required")
-
-    pdf_path = _lab_pdf_path(uid, str(pet_uuid), doc_id)
-    meta_path = _lab_meta_path(uid, str(pet_uuid), doc_id)
-
-    deleted_pdf = delete_storage_object_if_exists(pdf_path)
-    delete_storage_object_if_exists(meta_path)
-
-    if not deleted_pdf:
-        raise HTTPException(status_code=404, detail="file not found")
-    return {"ok": True, "deleted": [pdf_path, meta_path]}
+@app.post("/api/lab/upload-pdf")
+async def upload_lab_pdf(
+    petId: str = Form(...),
+    displayName: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),  # backward compatible
+    file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    return await _upload_document_pdf("lab", petId, file, displayName, title, user)
 
 
 @app.post("/api/cert/upload-pdf")
 async def upload_cert_pdf(
     petId: str = Form(...),
-    title: str = Form("접종증명서"),
-    memo: Optional[str] = Form(None),
+    displayName: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),  # backward compatible
     file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    return await _upload_document_pdf("cert", petId, file, displayName, title, user)
+
+
+@app.get("/api/documents/list")
+def list_documents(
+    petId: str = Query(...),
+    docType: Optional[str] = Query(None),  # lab/cert
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or ""
     pet_uuid = _uuid_or_400(petId, "petId")
 
+    # ownership
     pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
 
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty pdf")
+    dt = (docType or "").strip().lower()
+    if dt and dt not in ("lab", "cert"):
+        raise HTTPException(status_code=400, detail="docType must be lab or cert")
 
-    doc_id = uuid.uuid4().hex
-    pdf_path = _cert_pdf_path(uid, str(pet_uuid), doc_id)
-    meta_path = _cert_meta_path(uid, str(pet_uuid), doc_id)
+    if dt:
+        rows = db_fetchall(
+            """
+            SELECT id, pet_id, doc_type, display_name, file_path, file_size_bytes, created_at, updated_at
+            FROM public.pet_documents
+            WHERE pet_id=%s AND doc_type=%s
+            ORDER BY created_at DESC
+            """,
+            (pet_uuid, dt),
+        )
+    else:
+        rows = db_fetchall(
+            """
+            SELECT id, pet_id, doc_type, display_name, file_path, file_size_bytes, created_at, updated_at
+            FROM public.pet_documents
+            WHERE pet_id=%s
+            ORDER BY created_at DESC
+            """,
+            (pet_uuid,),
+        )
+    return jsonable_encoder(rows)
 
-    upload_bytes_to_storage(pdf_path, data, "application/pdf")
-    meta = {
-        "id": doc_id,
-        "uid": uid,
-        "petId": str(pet_uuid),
-        "kind": "cert",
-        "title": title,
-        "memo": memo,
-        "originalFilename": file.filename,
-        "createdAt": datetime.utcnow().isoformat(),
-        "objectPath": pdf_path,
-    }
-    upload_json_to_storage(meta_path, meta)
-    return {"id": doc_id, "objectPath": pdf_path, "metaPath": meta_path, "createdAt": meta["createdAt"]}
+
+@app.get("/api/lab/list")
+def list_lab(petId: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
+    return list_documents(petId=petId, docType="lab", user=user)
 
 
 @app.get("/api/cert/list")
 def list_cert(petId: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
+    return list_documents(petId=petId, docType="cert", user=user)
+
+
+@app.delete("/api/documents/delete")
+def delete_document(
+    docId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
     uid = user.get("uid") or ""
-    pet_uuid = _uuid_or_400(petId, "petId")
+    doc_uuid = _uuid_or_400(docId, "docId")
 
-    base = _user_prefix(uid, str(pet_uuid)) + "/cert/"
-    objects = list_storage_objects(base)
-    pdfs = [o for o in objects if o["name"].endswith(".pdf")]
+    # load + ownership check via pet
+    row = db_fetchone(
+        """
+        SELECT d.id, d.file_path, d.pet_id
+        FROM public.pet_documents d
+        JOIN public.pets p ON p.id = d.pet_id
+        WHERE d.id=%s AND p.user_uid=%s
+        """,
+        (doc_uuid, uid),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="document not found")
 
-    out = []
-    for o in sorted(pdfs, key=lambda x: x.get("updated") or "", reverse=True):
-        name = o["name"]
-        doc_id = os.path.splitext(os.path.basename(name))[0]
-        mp = _cert_meta_path(uid, str(pet_uuid), doc_id)
-        meta = None
-        try:
-            meta = download_json_from_storage(mp)
-        except Exception:
-            meta = None
-        out.append(
-            {
-                "id": doc_id,
-                "title": (meta or {}).get("title") or "접종증명서",
-                "memo": (meta or {}).get("memo"),
-                "objectPath": name,
-                "createdAt": (meta or {}).get("createdAt") or (o.get("updated")),
-            }
+    path = row["file_path"]
+
+    # delete storage first
+    warnings: List[str] = []
+    try:
+        ok = delete_storage_object_if_exists(path)
+        if not ok:
+            warnings.append("file not found in storage (already deleted?)")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"storage delete failed: {e}")
+
+    # delete db row
+    db_execute(
+        """
+        DELETE FROM public.pet_documents
+        WHERE id=%s AND EXISTS (
+          SELECT 1
+          FROM public.pets p
+          WHERE p.id = public.pet_documents.pet_id AND p.user_uid=%s
         )
-    return out
+        """,
+        (doc_uuid, uid),
+    )
+
+    return {"ok": True, "docId": str(doc_uuid), "deletedPath": path, "warnings": warnings}
+
+
+@app.delete("/api/lab/delete")
+def delete_lab(id: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
+    return delete_document(docId=id, user=user)
 
 
 @app.delete("/api/cert/delete")
-def delete_cert(petId: str = Query(...), id: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
-    uid = user.get("uid") or ""
-    pet_uuid = _uuid_or_400(petId, "petId")
-    doc_id = (id or "").strip()
-    if not doc_id:
-        raise HTTPException(status_code=400, detail="id required")
-
-    pdf_path = _cert_pdf_path(uid, str(pet_uuid), doc_id)
-    meta_path = _cert_meta_path(uid, str(pet_uuid), doc_id)
-
-    deleted_pdf = delete_storage_object_if_exists(pdf_path)
-    delete_storage_object_if_exists(meta_path)
-
-    if not deleted_pdf:
-        raise HTTPException(status_code=404, detail="file not found")
-    return {"ok": True, "deleted": [pdf_path, meta_path]}
+def delete_cert(id: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
+    return delete_document(docId=id, user=user)
 
 
 # =========================================================
-# Backup endpoints (Firebase Storage)
+# Backup endpoints (Firebase Storage) - allowed client write in rules
 # =========================================================
 @app.post("/api/backup/upload", response_model=BackupUploadResponse)
 async def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     backup_id = uuid.uuid4().hex
-    created_at = datetime.utcnow().isoformat()
+    created_at = datetime.utcnow().isoformat() + "Z"
 
     doc = {
         "meta": {
@@ -1726,7 +2213,7 @@ def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # =========================================================
-# Migration tokens + migration execution
+# Migration tokens + migration execution (Storage Copy + DB migrate_user_data + Storage Delete)
 # =========================================================
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -1734,6 +2221,87 @@ def _hash_code(code: str) -> str:
 
 def _generate_migration_code() -> str:
     return secrets.token_urlsafe(32)
+
+
+def _copy_prefix(old_uid: str, new_uid: str) -> int:
+    """
+    Copy all objects under users/{old_uid}/ to users/{new_uid}/
+    Skip overwrite if destination exists.
+    """
+    src_prefix = f"users/{old_uid}/"
+    dst_prefix = f"users/{new_uid}/"
+
+    if settings.STUB_MODE.lower() == "true":
+        # local copy
+        base = settings.STUB_STORAGE_DIR
+        copied = 0
+        objs = _stub_list(src_prefix)
+        for o in objs:
+            src_name = o["name"]
+            dst_name = dst_prefix + src_name[len(src_prefix):]
+            src_abs = _stub_rel_to_abs(src_name)
+            dst_abs = _stub_rel_to_abs(dst_name)
+            if os.path.exists(dst_abs):
+                continue
+            _stub_ensure_dir(dst_abs)
+            with open(src_abs, "rb") as fsrc:
+                raw = fsrc.read()
+            with open(dst_abs, "wb") as fdst:
+                fdst.write(raw)
+            copied += 1
+        return copied
+
+    b = get_bucket()
+    assert b is not None
+
+    copied = 0
+    for blob in b.list_blobs(prefix=src_prefix):
+        src_name = blob.name
+        dst_name = dst_prefix + src_name[len(src_prefix):]
+
+        dst_blob = b.blob(dst_name)
+        if dst_blob.exists():
+            continue
+
+        b.copy_blob(blob, b, dst_name)
+        copied += 1
+    return copied
+
+
+def _delete_prefix(old_uid: str) -> int:
+    src_prefix = f"users/{old_uid}/"
+
+    if settings.STUB_MODE.lower() == "true":
+        objs = _stub_list(src_prefix)
+        deleted = 0
+        for o in objs:
+            abs_path = _stub_rel_to_abs(o["name"])
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+                deleted += 1
+        return deleted
+
+    b = get_bucket()
+    assert b is not None
+
+    deleted = 0
+    blobs = list(b.list_blobs(prefix=src_prefix))
+    for blob in blobs:
+        blob.delete()
+        deleted += 1
+    return deleted
+
+
+def _run_db_user_migration(old_uid: str, new_uid: str) -> List[Dict[str, Any]]:
+    """
+    Calls DB function public.migrate_user_data(old_uid, new_uid)
+    Returns rows: (step, value)
+    """
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT step, value FROM public.migrate_user_data(%s, %s)", (old_uid, new_uid))
+            rows = cur.fetchall() or []
+            return [dict(r) for r in rows]
 
 
 @app.post("/api/migration/prepare", response_model=MigrationPrepareResponse)
@@ -1748,7 +2316,6 @@ def migration_prepare(user: Dict[str, Any] = Depends(get_current_user)):
     code_hash = _hash_code(code)
     expires_at = datetime.utcnow() + timedelta(seconds=int(settings.MIGRATION_TOKEN_TTL_SECONDS))
 
-    # store token
     try:
         db_execute(
             """
@@ -1763,107 +2330,13 @@ def migration_prepare(user: Dict[str, Any] = Depends(get_current_user)):
     return {"oldUid": old_uid, "migrationCode": code, "expiresAt": expires_at.isoformat() + "Z"}
 
 
-def _copy_prefix(old_uid: str, new_uid: str) -> int:
-    """
-    Copy all objects under users/{old_uid}/ to users/{new_uid}/
-    Skip if destination already exists to avoid overwriting new data.
-    """
-    b = get_bucket()
-    src_prefix = f"users/{old_uid}/"
-    dst_prefix = f"users/{new_uid}/"
-
-    copied = 0
-    for blob in b.list_blobs(prefix=src_prefix):
-        src_name = blob.name
-        dst_name = dst_prefix + src_name[len(src_prefix):]
-
-        dst_blob = b.blob(dst_name)
-        # skip overwrite
-        if dst_blob.exists():
-            continue
-
-        b.copy_blob(blob, b, dst_name)
-        copied += 1
-    return copied
-
-
-def _delete_prefix(old_uid: str) -> int:
-    b = get_bucket()
-    src_prefix = f"users/{old_uid}/"
-    deleted = 0
-    # list then delete
-    blobs = list(b.list_blobs(prefix=src_prefix))
-    for blob in blobs:
-        blob.delete()
-        deleted += 1
-    return deleted
-
-
-def _run_db_user_migration(old_uid: str, new_uid: str) -> None:
-    # transactional DB move (see section 3)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.users(firebase_uid)
-                VALUES (%s)
-                ON CONFLICT (firebase_uid) DO UPDATE SET last_seen_at = now()
-                """,
-                (new_uid,),
-            )
-            cur.execute("UPDATE public.pets SET user_uid=%s WHERE user_uid=%s", (new_uid, old_uid))
-
-            cur.execute(
-                """
-                INSERT INTO public.user_daily_active(day, firebase_uid, first_seen_at, device_os, app_version)
-                SELECT day, %s, first_seen_at, device_os, app_version
-                FROM public.user_daily_active
-                WHERE firebase_uid = %s
-                ON CONFLICT (day, firebase_uid) DO UPDATE
-                SET
-                  first_seen_at = LEAST(public.user_daily_active.first_seen_at, EXCLUDED.first_seen_at),
-                  device_os = COALESCE(public.user_daily_active.device_os, EXCLUDED.device_os),
-                  app_version = COALESCE(public.user_daily_active.app_version, EXCLUDED.app_version)
-                """,
-                (new_uid, old_uid),
-            )
-            cur.execute("DELETE FROM public.user_daily_active WHERE firebase_uid=%s", (old_uid,))
-
-            cur.execute(
-                """
-                UPDATE public.health_records
-                SET
-                  receipt_image_path = CASE
-                    WHEN receipt_image_path IS NULL THEN NULL
-                    ELSE regexp_replace(receipt_image_path, '^users/' || %s || '/', 'users/' || %s || '/')
-                  END,
-                  receipt_meta_path = CASE
-                    WHEN receipt_meta_path IS NULL THEN NULL
-                    ELSE regexp_replace(receipt_meta_path, '^users/' || %s || '/', 'users/' || %s || '/')
-                  END
-                WHERE
-                  (receipt_image_path LIKE ('users/' || %s || '/%'))
-                  OR
-                  (receipt_meta_path  LIKE ('users/' || %s || '/%'))
-                """,
-                (old_uid, new_uid, old_uid, new_uid, old_uid, old_uid),
-            )
-
-            cur.execute(
-                """
-                DELETE FROM public.users u
-                WHERE u.firebase_uid = %s
-                  AND NOT EXISTS (SELECT 1 FROM public.pets p WHERE p.user_uid = %s)
-                """,
-                (old_uid, old_uid),
-            )
-
-
 @app.post("/api/migration/execute")
 def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depends(get_current_user)):
     new_uid = user.get("uid") or ""
     if not new_uid:
         raise HTTPException(status_code=401, detail="missing uid")
+
+    db_touch_user(new_uid)
 
     code = (req.migrationCode or "").strip()
     if not code:
@@ -1872,8 +2345,8 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
 
     now = datetime.utcnow()
 
-    # 1) lock token row (processing stale handling)
-    token_row = None
+    # 1) lock token row + mark processing
+    token_row: Optional[Dict[str, Any]] = None
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -1904,7 +2377,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
                 raise HTTPException(status_code=500, detail="invalid token row (old_uid)")
 
             if old_uid == new_uid:
-                # same uid: nothing to migrate
                 cur.execute(
                     """
                     UPDATE public.migration_tokens
@@ -1913,19 +2385,29 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
                     """,
                     (new_uid, code_hash),
                 )
-                return {"ok": True, "oldUid": old_uid, "newUid": new_uid, "copied": 0, "deleted": 0, "dbUpdated": False, "warnings": ["oldUid == newUid (no-op)"]}
+                return {
+                    "ok": True,
+                    "oldUid": old_uid,
+                    "newUid": new_uid,
+                    "copied": 0,
+                    "deleted": 0,
+                    "dbUpdated": False,
+                    "stats": [],
+                    "warnings": ["oldUid == newUid (no-op)"],
+                }
 
             # handle stale processing
             if status == "processing":
                 ps = token_row.get("processing_started_at")
                 if ps and (now - ps).total_seconds() < int(settings.MIGRATION_PROCESSING_STALE_SECONDS):
                     raise HTTPException(status_code=409, detail="migration is already processing")
-                # stale -> allow retry
 
             cur.execute(
                 """
                 UPDATE public.migration_tokens
-                SET status='processing', processing_started_at=now(), new_uid=%s,
+                SET status='processing',
+                    processing_started_at=now(),
+                    new_uid=%s,
                     attempt_count = attempt_count + 1,
                     last_error = NULL
                 WHERE code_hash=%s
@@ -1933,7 +2415,46 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
                 (new_uid, code_hash),
             )
 
+    assert token_row is not None
     old_uid = token_row["old_uid"]
+
+    # 1.5) Optional precheck: call recompute_user_stats to reduce wasted copy when target quota will fail
+    try:
+        db_execute("SELECT public.recompute_user_stats(%s)", (old_uid,))
+        db_execute("SELECT public.recompute_user_stats(%s)", (new_uid,))
+        chk = db_fetchone(
+            """
+            SELECT
+              (SELECT total_storage_bytes FROM public.users WHERE firebase_uid=%s) AS old_usage,
+              (SELECT total_storage_bytes FROM public.users WHERE firebase_uid=%s) AS new_usage,
+              (SELECT membership_tier FROM public.users WHERE firebase_uid=%s) AS new_tier,
+              (SELECT public.get_tier_quota(membership_tier) FROM public.users WHERE firebase_uid=%s) AS new_limit
+            """,
+            (old_uid, new_uid, new_uid, new_uid),
+        )
+        if chk:
+            old_usage = int(chk.get("old_usage") or 0)
+            new_usage = int(chk.get("new_usage") or 0)
+            new_limit = int(chk.get("new_limit") or 0)
+            if (new_usage + old_usage) > new_limit:
+                db_execute(
+                    "UPDATE public.migration_tokens SET status='failed', last_error=%s WHERE code_hash=%s",
+                    (f"quota precheck failed: new_usage({new_usage}) + moving({old_usage}) > limit({new_limit})", code_hash),
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "message": "Quota exceeded on target account (precheck)",
+                        "oldUsage": old_usage,
+                        "newUsage": new_usage,
+                        "limit": new_limit,
+                    },
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # precheck failure should not block migration; DB function still has authoritative check
+        print("[Migration] precheck warning:", e)
 
     # 2) Storage Copy
     copied = 0
@@ -1946,14 +2467,18 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         )
         raise HTTPException(status_code=500, detail=f"storage copy failed: {e}")
 
-    # 3) DB transactional update
+    # 3) DB migrate_user_data
+    stats_rows: List[Dict[str, Any]] = []
     try:
-        _run_db_user_migration(old_uid, new_uid)
+        stats_rows = _run_db_user_migration(old_uid, new_uid)
     except Exception as e:
         db_execute(
             "UPDATE public.migration_tokens SET status='failed', last_error=%s WHERE code_hash=%s",
-            (f"db migration failed: {e}", code_hash),
+            (f"db migrate_user_data failed: {e}", code_hash),
         )
+        msg = str(e)
+        if "Quota exceeded" in msg or "Quota exceeded on target" in msg or "quota" in msg.lower():
+            raise HTTPException(status_code=403, detail={"message": "Quota exceeded (DB migration)", "raw": msg})
         raise HTTPException(status_code=500, detail=f"db migration failed: {e}")
 
     # 4) Storage Delete old prefix
@@ -1974,34 +2499,40 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         (code_hash,),
     )
 
-    return {"ok": True, "oldUid": old_uid, "newUid": new_uid, "copied": copied, "deleted": deleted, "dbUpdated": True, "warnings": warnings}
+    return {
+        "ok": True,
+        "oldUid": old_uid,
+        "newUid": new_uid,
+        "copied": copied,
+        "deleted": deleted,
+        "dbUpdated": True,
+        "stats": stats_rows,
+        "warnings": warnings,
+    }
 
 
 # =========================================================
-# Admin overview (unchanged-ish)
+# Admin overview
 # =========================================================
 @app.get("/api/admin/overview")
 def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
     users_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.users") or {"c": 0}
     pets_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.pets") or {"c": 0}
     records_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.health_records") or {"c": 0}
+    docs_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.pet_documents") or {"c": 0}
     items_cnt = db_fetchone("SELECT COUNT(*)::int AS c FROM public.health_items") or {"c": 0}
     total_amount = db_fetchone("SELECT COALESCE(SUM(total_amount),0)::bigint AS s FROM public.health_records") or {"s": 0}
+    total_storage = db_fetchone("SELECT COALESCE(SUM(total_storage_bytes),0)::bigint AS s FROM public.users") or {"s": 0}
 
     return {
         "users": int(users_cnt["c"]),
         "pets": int(pets_cnt["c"]),
         "records": int(records_cnt["c"]),
+        "documents": int(docs_cnt["c"]),
         "items": int(items_cnt["c"]),
         "totalAmountSum": int(total_amount["s"]),
+        "totalStorageBytesSum": int(total_storage["s"]),
         "updatedAt": datetime.utcnow().isoformat() + "Z",
     }
-
-
-# =========================================================
-# AI analyze (기존 로직이 있으면 여기 아래에 그대로 두면 됨)
-# - 이 main.py는 스토리지/마이그레이션/영수증 파이프라인이 핵심이므로
-#   기존 AI 코드/태그 코드가 있다면 그대로 이어붙이세요.
-# =========================================================
 
 
