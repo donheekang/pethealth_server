@@ -8,6 +8,7 @@ import io
 import json
 import uuid
 import re
+import re as _re
 import base64
 import hashlib
 import secrets
@@ -40,7 +41,7 @@ from firebase_admin import storage as fb_storage
 
 # PostgreSQL
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.pool import ThreadedConnectionPool, PoolError
 from psycopg2.extras import RealDictCursor
 import psycopg2.extras
 
@@ -55,6 +56,7 @@ class Settings(BaseSettings):
     # Vision runtime hardening
     OCR_TIMEOUT_SECONDS: int = 12
     OCR_MAX_CONCURRENCY: int = 4
+    OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS: float = 1.0  # ✅ OCR 폭주 시 빠른 실패
 
     # --- Firebase Auth / Storage ---
     AUTH_REQUIRED: str = "true"
@@ -138,6 +140,15 @@ def _new_error_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _sanitize_for_log(s: str, max_len: int = 800) -> str:
+    # 줄바꿈/탭 등 로그 깨짐 방지 + 너무 긴 메시지 truncate
+    t = (s or "")
+    t = t.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    if len(t) > max_len:
+        t = t[:max_len] + "...(truncated)"
+    return t
+
+
 # =========================================================
 # DB (PostgreSQL) helpers
 # =========================================================
@@ -189,17 +200,43 @@ def _require_db() -> None:
 
 @contextmanager
 def db_conn():
+    """
+    ✅ ops-hardening:
+      - Pool exhausted / getconn() 실패는 500이 아니라 503로 (errorId 포함)
+      - getconn 실패 시 putconn/rollback 시도하지 않음 (conn=None)
+      - putconn 실패는 swallow (로그만)
+    """
     _require_db()
     assert _db_pool is not None
-    conn = _db_pool.getconn()
+
+    conn = None
     try:
+        try:
+            conn = _db_pool.getconn()
+        except PoolError as e:
+            raise HTTPException(
+                status_code=503,
+                detail=_internal_detail(str(e), kind="DB pool exhausted"),
+            )
+
         yield conn
         conn.commit()
+
     except Exception:
-        conn.rollback()
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
+
     finally:
-        _db_pool.putconn(conn)
+        if conn is not None:
+            try:
+                _db_pool.putconn(conn)
+            except Exception as e:
+                # putconn 실패는 서비스 응답에 영향 주면 더 큰 장애로 이어질 수 있어서 로그만
+                print("[DB] putconn failed:", _sanitize_for_log(repr(e)))
 
 
 def db_fetchone(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
@@ -242,7 +279,8 @@ def _pg_message(e: Exception) -> str:
 
 def _internal_detail(msg: str, *, kind: str = "Internal Server Error") -> str:
     eid = _new_error_id()
-    print(f"[ERR:{eid}] {kind}: {msg}")
+    safe = _sanitize_for_log(msg)
+    print(f"[ERR:{eid}] {kind}: {safe}")
     if (settings.EXPOSE_ERROR_DETAILS or "").lower() == "true":
         return f"{kind}: {msg} (errorId={eid})"
     return f"{kind} (errorId={eid})"
@@ -310,7 +348,6 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
       - 자동 업그레이드: desired_tier='member' 이고 현재 tier가 guest면 member로 올림
       - premium은 절대 자동으로 덮어쓰지 않음
       - write throttle: last_seen_at 갱신은 N초 간격으로만 (그 외는 DO NOTHING)
-        (users.updated_at trigger 폭탄 방지: WHERE로 update 자체를 피함)
     """
     uid = (firebase_uid or "").strip()
     if not uid:
@@ -383,8 +420,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                     (uid,),
                 )
             except Exception as e:
-                # 운영상 중요도 낮음: 로그만
-                print("[DB] user_daily_active insert failed (ignored):", _pg_message(e))
+                print("[DB] user_daily_active insert failed (ignored):", _sanitize_for_log(_pg_message(e)))
 
             return dict(row)
 
@@ -521,10 +557,9 @@ def _load_firebase_service_account() -> Optional[dict]:
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
     """
-    ⚠️ 중요 (ops-hardening):
+    ⚠️ ops-hardening:
     - _firebase_initialized는 "실제로 firebase_admin 앱이 존재할 때만" True.
-    - require_init=False 상태에서 SA/bucket 누락이면 그냥 return (플래그 세팅 X)
-      -> 나중에 require_init=True로 들어왔을 때 반드시 init 시도/검증됨.
+    - require_init=False 상태에서 SA/bucket 누락이면 return (플래그 세팅 X)
     """
     global _firebase_initialized
 
@@ -537,7 +572,7 @@ def init_firebase_admin(*, require_init: bool = False) -> None:
         _firebase_initialized = True
         return
 
-    # 이전 버전/경로에서 플래그만 True가 된 상태 방어
+    # 이전 경로에서 플래그만 True가 된 상태 방어
     if _firebase_initialized and not firebase_admin._apps:
         _firebase_initialized = False
 
@@ -560,8 +595,7 @@ def init_firebase_admin(*, require_init: bool = False) -> None:
     except Exception as e:
         if require_init:
             raise RuntimeError(f"Firebase Admin initialize failed: {e}")
-        # require_init=False면 플래그 세팅하지 않고 조용히 종료
-        print("[Firebase] init failed (ignored):", e)
+        print("[Firebase] init failed (ignored):", _sanitize_for_log(repr(e)))
         return
 
 
@@ -575,7 +609,7 @@ def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
         desired = _infer_membership_tier_from_token(decoded)
         db_touch_user(uid, desired_tier=desired)
     except Exception as e:
-        print("[DB] auto upsert user failed:", _pg_message(e))
+        print("[DB] auto upsert user failed:", _sanitize_for_log(_pg_message(e)))
 
 
 def get_current_user(
@@ -600,8 +634,10 @@ def get_current_user(
         _maybe_auto_upsert_user(decoded)
         return decoded
     except Exception as e:
-        # auth는 사용자 피드백이 필요해서 그대로(민감정보 없음)
-        raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
+        # ✅ prod에서는 내부 예외를 숨기고 errorId로 통일
+        if (settings.EXPOSE_ERROR_DETAILS or "").lower() == "true":
+            raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
+        raise HTTPException(status_code=401, detail=_internal_detail(str(e), kind="Invalid token"))
 
 
 def _parse_admin_uids() -> Set[str]:
@@ -738,9 +774,17 @@ def run_vision_ocr_words(image_bytes: bytes) -> List[Dict[str, Any]]:
     img = vision.Image(content=image_bytes)
 
     timeout_s = float(getattr(settings, "OCR_TIMEOUT_SECONDS", 12) or 12)
+    sema_timeout = float(getattr(settings, "OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS", 1.0) or 1.0)
+    sema_timeout = max(0.1, min(sema_timeout, 5.0))
 
-    # concurrency limit
-    _OCR_SEMA.acquire()
+    # ✅ concurrency limit + timeout (무한대기 방지)
+    acquired = _OCR_SEMA.acquire(timeout=sema_timeout)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail=_internal_detail("too many concurrent OCR requests", kind="OCR busy"),
+        )
+
     try:
         try:
             resp = client.text_detection(image=img, timeout=timeout_s)
@@ -751,6 +795,7 @@ def run_vision_ocr_words(image_bytes: bytes) -> List[Dict[str, Any]]:
         _OCR_SEMA.release()
 
     if resp.error.message:
+        # Vision 자체 오류는 502/500 느낌이지만, 일단 500으로 분류 (errorId로 추적)
         raise RuntimeError(f"OCR error: {resp.error.message}")
 
     anns = resp.text_annotations or []
@@ -1291,6 +1336,18 @@ class HospitalSearchResult(BaseModel):
     isCustomEntry: bool
 
 
+# ✅ (NEW) nearby DTO
+class HospitalNearbyResult(BaseModel):
+    hospitalMgmtNo: str
+    name: str
+    roadAddress: Optional[str] = None
+    jibunAddress: Optional[str] = None
+    lat: float
+    lng: float
+    distanceM: int
+    isCustomEntry: bool
+
+
 class HospitalCustomCreateRequest(BaseModel):
     name: str
     roadAddress: Optional[str] = None
@@ -1339,7 +1396,6 @@ app = FastAPI(title="PetHealth+ Server", version="2.1.20-final+qc+itemmap-ops")
 _origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
 _allow_credentials = (settings.CORS_ALLOW_CREDENTIALS or "").lower() == "true"
 if "*" in _origins and _allow_credentials:
-    # 브라우저에서 * + credentials 조합은 막힘 -> 안전하게 credentials 끔
     _allow_credentials = False
 
 app.add_middleware(
@@ -1350,7 +1406,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global psycopg2 error handler (일관된 500/메시지)
+# Global psycopg2 error handler
 @app.exception_handler(psycopg2.Error)
 async def _pg_error_handler(request: Request, exc: psycopg2.Error):
     try:
@@ -1360,27 +1416,25 @@ async def _pg_error_handler(request: Request, exc: psycopg2.Error):
     return JSONResponse(status_code=500, content={"detail": _internal_detail(_pg_message(exc), kind="DB error")})
 
 
-# Global fallback exception handler (DB 외 영역도 errorId 통일)
+# Global fallback exception handler (DB 외 영역도 errorId 통일 + 로그 정리)
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
-    # FastAPI 기본 HTTPException 처리보다 더 구체적인 핸들러가 있으면 그게 우선됨.
-    # 여기선 "진짜 미처리 예외"만 errorId 형태로 통일.
     if isinstance(exc, HTTPException):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    return JSONResponse(status_code=500, content={"detail": _internal_detail(str(exc), kind="Internal Server Error")})
+
+    # ✅ repr + truncate (긴 메시지/줄바꿈으로 로그 깨짐 방지)
+    msg = _sanitize_for_log(repr(exc), max_len=800)
+    return JSONResponse(status_code=500, content={"detail": _internal_detail(msg, kind="Internal Server Error")})
 
 
 @app.on_event("startup")
 def _startup():
-    # DB pool init first
     init_db_pool()
-
-    # Firebase init은 용도별로 런타임에서(require_init=True) 보장
     if settings.AUTH_REQUIRED.lower() == "true" and settings.STUB_MODE.lower() != "true":
         try:
             init_firebase_admin(require_init=True)
         except Exception as e:
-            print("[Startup] Firebase init failed:", e)
+            print("[Startup] Firebase init failed:", _sanitize_for_log(repr(e)))
 
 
 @app.on_event("shutdown")
@@ -1391,7 +1445,7 @@ def _shutdown():
             _db_pool.closeall()
             print("[DB] Pool closed.")
         except Exception as e:
-            print("[DB] Pool close error:", e)
+            print("[DB] Pool close error:", _sanitize_for_log(repr(e)))
         _db_pool = None
 
 
@@ -1426,6 +1480,14 @@ def health():
             db_checks["ok"] = False
             db_checks["error"] = _pg_message(e)
 
+    # ✅ Firebase readiness (환경 점검 수준)
+    fb_check: Dict[str, Any] = {
+        "stubMode": settings.STUB_MODE.lower() == "true",
+        "bucketProvided": bool((settings.FIREBASE_STORAGE_BUCKET or "").strip()),
+        "serviceAccountProvided": bool((settings.FIREBASE_ADMIN_SA_JSON or "").strip() or (settings.FIREBASE_ADMIN_SA_B64 or "").strip()),
+        "appInitialized": bool(firebase_admin._apps),
+    }
+
     return {
         "status": "ok",
         "version": "2.1.20-final+qc+itemmap-ops",
@@ -1443,9 +1505,11 @@ def health():
         "db_enabled": settings.DB_ENABLED,
         "db_configured": bool(settings.DATABASE_URL),
         "db_schema": db_checks,
+        "firebase": fb_check,
         "ocr_hospital_candidate_limit": int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT),
         "ocr_timeout_seconds": int(settings.OCR_TIMEOUT_SECONDS),
         "ocr_max_concurrency": int(settings.OCR_MAX_CONCURRENCY),
+        "ocr_sema_acquire_timeout_seconds": float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
         "expose_error_details": (settings.EXPOSE_ERROR_DETAILS or "").lower() == "true",
         "cors": {"origins": _origins, "allowCredentials": _allow_credentials},
     }
@@ -1591,6 +1655,20 @@ def _validate_lat_lng(lat: Optional[float], lng: Optional[float]) -> None:
             raise HTTPException(status_code=400, detail="lng must be between -180 and 180")
 
 
+# ✅ (NEW) distance helper
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    import math
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dlng / 2) ** 2
+    )
+    return 2 * R * math.asin(math.sqrt(a))
+
+
 @app.get("/api/hospitals/search", response_model=List[HospitalSearchResult])
 def hospitals_search(
     q: str = Query(..., min_length=1),
@@ -1600,6 +1678,8 @@ def hospitals_search(
     uid = user.get("uid") or ""
     desired = _infer_membership_tier_from_token(user)
     db_touch_user(uid, desired_tier=desired)
+
+    _ = _validate_lat_lng(None, None)
 
     query = (q or "").strip()
     like = f"%{query}%"
@@ -1638,6 +1718,67 @@ def hospitals_search(
             }
         )
     return out
+
+
+# ✅ (NEW) nearby endpoint
+@app.get("/api/hospitals/nearby", response_model=List[HospitalNearbyResult])
+def hospitals_nearby(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radiusM: int = Query(3000, ge=200, le=20000),
+    limit: int = Query(50, ge=1, le=200),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    desired = _infer_membership_tier_from_token(user)
+    db_touch_user(uid, desired_tier=desired)
+
+    _validate_lat_lng(lat, lng)
+
+    import math
+    lat_delta = radiusM / 111000.0
+    lng_delta = radiusM / (111000.0 * max(0.2, math.cos(math.radians(lat))))
+
+    min_lat, max_lat = lat - lat_delta, lat + lat_delta
+    min_lng, max_lng = lng - lng_delta, lng + lng_delta
+
+    rows = db_fetchall(
+        """
+        SELECT
+            hospital_mgmt_no, name,
+            road_address, jibun_address,
+            lat, lng,
+            is_custom_entry
+        FROM public.hospitals
+        WHERE
+            (is_custom_entry = false OR created_by_uid = %s)
+            AND lat IS NOT NULL AND lng IS NOT NULL
+            AND lat BETWEEN %s AND %s
+            AND lng BETWEEN %s AND %s
+        LIMIT %s
+        """,
+        (uid, min_lat, max_lat, min_lng, max_lng, limit * 8),
+    )
+
+    out = []
+    for r in rows:
+        d = _haversine_m(lat, lng, r["lat"], r["lng"])
+        if d <= radiusM:
+            out.append(
+                {
+                    "hospitalMgmtNo": r["hospital_mgmt_no"],
+                    "name": r["name"],
+                    "roadAddress": r.get("road_address"),
+                    "jibunAddress": r.get("jibun_address"),
+                    "lat": r["lat"],
+                    "lng": r["lng"],
+                    "distanceM": int(d),
+                    "isCustomEntry": bool(r.get("is_custom_entry")),
+                }
+            )
+
+    out.sort(key=lambda x: x["distanceM"])
+    return out[:limit]
 
 
 @app.post("/api/hospitals/custom/create", response_model=HospitalCustomCreateResponse)
@@ -1685,6 +1826,8 @@ def hospitals_custom_create(
             "lat": row.get("lat"),
             "isCustomEntry": True,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
@@ -1719,6 +1862,8 @@ def hospitals_custom_delete(
         if n <= 0:
             raise HTTPException(status_code=404, detail="not found")
         return {"ok": True, "deleted": mg}
+    except HTTPException:
+        raise
     except Exception as e:
         msg = _pg_message(e)
         if "violates foreign key constraint" in msg:
@@ -2097,6 +2242,8 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
         row["items"] = _enrich_items_with_canonical(uid, items)
         row["hospitalCandidatesCleared"] = True
         return jsonable_encoder(row)
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
@@ -2140,6 +2287,9 @@ def api_receipts_process(
     # 1) OCR -> redact -> resize -> webp
     try:
         webp_bytes, parsed, hints = process_receipt_image_and_parse(raw)
+    except HTTPException:
+        # ✅ OCR busy(503) 같은 의도된 예외는 그대로 전달
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
 
@@ -2147,6 +2297,8 @@ def api_receipts_process(
     receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
         upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
@@ -2397,6 +2549,8 @@ def upload_pdf_document(
 
     try:
         upload_bytes_to_storage(file_path, data, "application/pdf")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
@@ -2427,6 +2581,12 @@ def upload_pdf_document(
             "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else datetime.utcnow().isoformat() + "Z",
         }
 
+    except HTTPException:
+        try:
+            delete_storage_object_if_exists(file_path)
+        except Exception:
+            pass
+        raise
     except Exception as e:
         try:
             delete_storage_object_if_exists(file_path)
@@ -2524,11 +2684,15 @@ def delete_pdf_document(
 
     try:
         delete_storage_object_if_exists(file_path)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     try:
         db_execute("DELETE FROM public.pet_documents WHERE id=%s", (doc_uuid,))
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
@@ -2674,7 +2838,6 @@ def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = D
         except Exception:
             pass
 
-    # size hardening (rough)
     payload_bytes = json.dumps(req.snapshot, ensure_ascii=False).encode("utf-8")
     if len(payload_bytes) > int(settings.MAX_BACKUP_BYTES):
         raise HTTPException(status_code=413, detail="backup too large")
@@ -2791,6 +2954,8 @@ def migration_prepare(user: Dict[str, Any] = Depends(get_current_user)):
             """,
             (old_uid, code_hash, expires_at),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
@@ -2901,6 +3066,9 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM public.migrate_user_data(%s, %s)", (old_uid, new_uid))
                 steps = cur.fetchall() or []
+    except HTTPException:
+        db_execute("UPDATE public.migration_tokens SET status='failed' WHERE code_hash=%s", (code_hash,))
+        raise
     except Exception as e:
         db_execute(
             "UPDATE public.migration_tokens SET status='failed' WHERE code_hash=%s",
@@ -2914,7 +3082,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
     try:
         deleted = _delete_prefix(old_uid)
     except Exception as e:
-        # 사용자에게 내부 메시지 노출하지 않고 errorId 형태로 경고
         warnings.append(_internal_detail(str(e), kind="Cleanup error"))
 
     db_execute(
@@ -3099,6 +3266,8 @@ def upsert_custom_item_map(req: OCRItemMapUpsertRequest, user: Dict[str, Any] = 
                     "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
                 }
 
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
@@ -3138,6 +3307,8 @@ def deactivate_custom_item_map(req: OCRItemMapDeactivateRequest, user: Dict[str,
             "isActive": bool(row["is_active"]),
             "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
@@ -3236,6 +3407,8 @@ def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, 
                     "isCustomEntry": False,
                     "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
                 }
+    except HTTPException:
+        raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
