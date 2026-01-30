@@ -1,4 +1,5 @@
-# main.py (PetHealth+ Server) - Firebase Storage + Receipt Redaction + Signed URL + Migration + Private Hospitals (v2.1.20-final)
+# main.py (PetHealth+ Server) - Firebase Storage + Receipt Redaction + Signed URL + Migration
+# + Private Hospitals (road/jibun) + OCR Hospital Candidates + OCR ItemName Map (v2.1.20-final+qc+itemmap)
 import os
 import io
 import json
@@ -64,6 +65,9 @@ class Settings(BaseSettings):
 
     # Migration token TTL
     MIGRATION_TOKEN_TTL_SECONDS: int = 10 * 60
+
+    # OCR hospital candidates
+    OCR_HOSPITAL_CANDIDATE_LIMIT: int = 3  # UI에 3개까지만
 
     # --- Postgres ---
     DB_ENABLED: str = "true"
@@ -211,13 +215,25 @@ def _raise_mapped_db_error(e: Exception) -> None:
     if "Ownership mismatch" in msg or "Hospital access denied" in msg:
         raise HTTPException(status_code=403, detail=msg)
 
+    # Candidate insert blocked (record already confirmed)
+    if "Candidates not allowed" in msg:
+        raise HTTPException(status_code=409, detail=msg)
+
     # Pet owner update blocked
     if "Direct update of pets.user_uid is not allowed" in msg:
         raise HTTPException(status_code=409, detail=msg)
 
+    # Lat/Lng constraint (friendly)
+    if "hospitals_lat_lng_range_check" in msg:
+        raise HTTPException(status_code=400, detail="Invalid latitude/longitude range")
+
     # FK issues (e.g., invalid hospital_mgmt_no)
     if "violates foreign key constraint" in msg:
         raise HTTPException(status_code=400, detail="Invalid reference (foreign key)")
+
+    # Unique violation (e.g., ocr_item_name_maps partial uniques)
+    if "duplicate key value violates unique constraint" in msg:
+        raise HTTPException(status_code=409, detail="Duplicate value (unique constraint)")
 
     # Generic
     raise HTTPException(status_code=500, detail=f"DB error: {msg}")
@@ -241,7 +257,7 @@ def _infer_membership_tier_from_token(decoded: Dict[str, Any]) -> Optional[str]:
 
 def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict[str, Any]:
     """
-    v2.1.20 users schema:
+    users schema:
       firebase_uid (pk)
       membership_tier (guest/member/premium)
       premium_until
@@ -270,7 +286,8 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     last_seen_at = now(),
                     membership_tier = CASE
-                        WHEN public.users.membership_tier = 'guest' AND COALESCE(%s,'guest') = 'member' THEN 'member'
+                        WHEN public.users.membership_tier = 'guest'
+                             AND COALESCE(%s,'guest') = 'member' THEN 'member'
                         ELSE public.users.membership_tier
                     END
                 RETURNING
@@ -520,7 +537,7 @@ def get_vision_client() -> vision.ImageAnnotatorClient:
 def run_vision_ocr_words(image_bytes: bytes) -> List[Dict[str, Any]]:
     """
     Returns word-ish annotations with bounding boxes.
-    Never store raw OCR text in DB/logs.
+    Never store raw OCR full text in DB/logs.
     """
     client = get_vision_client()
     img = vision.Image(content=image_bytes)
@@ -719,7 +736,9 @@ def _encode_webp(img: Image.Image, quality: int) -> bytes:
 
 
 # =========================================================
-# Receipt parsing (best-effort, PII lines excluded)
+# Receipt parsing (best-effort, PII lines excluded for parse output)
+# - hospital candidate matching은 "병원명 중심 + 주소 보정"이지만,
+#   주소 문자열은 DB/로그에 저장하지 않고, 후보 검색 입력으로만 사용.
 # =========================================================
 def _parse_visit_date_from_text(text: str) -> Optional[date]:
     t = (text or "").strip()
@@ -754,7 +773,7 @@ def _guess_hospital_name_from_lines(line_texts: List[str]) -> str:
             score += 5
         if idx <= 4:
             score += 2
-        if any(x in s for x in ["TEL", "전화", "FAX", "팩스", "도로명", "주소"]):
+        if any(x in s for x in ["TEL", "전화", "FAX", "팩스", "도로명", "주소", "지번"]):
             score -= 2
         digit_count = sum(c.isdigit() for c in s)
         if digit_count >= 8:
@@ -765,6 +784,51 @@ def _guess_hospital_name_from_lines(line_texts: List[str]) -> str:
             best_score = score
             best_line = s
     return best_line.strip()
+
+
+def _guess_address_hint_from_lines(all_lines: List[str]) -> Optional[str]:
+    """
+    주소는 병원 후보 검색 보정용으로만 사용.
+    절대 DB/로그에 저장하지 않고, API 응답에도 포함하지 않음.
+    """
+    best = None
+    best_score = -999
+
+    for idx, line in enumerate((all_lines or [])[:60]):
+        t = (line or "").strip()
+        if not t:
+            continue
+        if not _looks_like_address_line(t):
+            continue
+
+        score = 0
+        if "주소" in t:
+            score += 3
+        if "도로명" in t:
+            score += 2
+        if "지번" in t:
+            score += 2
+        if idx <= 20:
+            score += 1
+        if 10 <= len(t) <= 80:
+            score += 1
+
+        # 너무 숫자만 많은 라인은 제외
+        if sum(c.isdigit() for c in t) >= 18:
+            score -= 2
+
+        if score > best_score:
+            best_score = score
+            best = t
+
+    if not best:
+        return None
+
+    # prefix 제거(주소: / 도로명주소: 등)
+    best = re.sub(r"^(주소|도로명주소|지번주소)\s*[:：]?\s*", "", best).strip()
+    if not best:
+        return None
+    return best[:200]
 
 
 def _extract_total_amount(lines: List[str]) -> Optional[int]:
@@ -803,15 +867,19 @@ def _extract_items_from_lines(lines: List[str], max_items: int = 60) -> List[Dic
         if len(item_name) < 1:
             continue
 
-        out.append(
-            {"itemName": item_name[:200], "price": price, "categoryTag": None}
-        )
+        out.append({"itemName": item_name[:200], "price": price, "categoryTag": None})
         if len(out) >= max_items:
             break
     return out
 
 
-def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict[str, Any]]:
+def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict[str, Any], Dict[str, Any]]:
+    """
+    Returns:
+      - webp_bytes (redacted)
+      - parsed (safe to return to client)
+      - hints (do NOT store; used for candidate matching only)
+    """
     img = Image.open(io.BytesIO(raw_image_bytes))
     img = img.convert("RGB")  # strip alpha/exif
 
@@ -827,6 +895,7 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
     redacted_small = _resize_to_width(redacted, int(settings.RECEIPT_MAX_WIDTH))
     webp = _encode_webp(redacted_small, int(settings.RECEIPT_WEBP_QUALITY))
 
+    # Safe lines (PII 제외)
     safe_lines: List[str] = []
     for ln in line_texts:
         if _line_contains_pii_trigger(ln):
@@ -850,7 +919,91 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
         "totalAmount": total_amount,
         "items": items,
     }
-    return webp, parsed
+
+    hints = {
+        # address hint는 PII로 취급(저장/응답 금지) — 후보 검색 입력으로만 사용
+        "addressHint": _guess_address_hint_from_lines(line_texts),
+    }
+    return webp, parsed, hints
+
+
+# =========================================================
+# OCR item_name -> canonical_name mapping (read helpers)
+# =========================================================
+def _fetch_item_name_map_for_lower_names(uid: str, lower_names: List[str]) -> Dict[str, str]:
+    """
+    returns: {lower_ocr_item_name: canonical_name}
+    priority: custom(uid) > global
+    active only.
+    """
+    if not lower_names:
+        return {}
+
+    # de-dup / cleanup
+    keys = []
+    seen = set()
+    for n in lower_names:
+        k = (n or "").strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        keys.append(k)
+
+    if not keys:
+        return {}
+
+    rows = db_fetchall(
+        """
+        SELECT DISTINCT ON (lower(ocr_item_name))
+            lower(ocr_item_name) AS k,
+            canonical_name
+        FROM public.ocr_item_name_maps
+        WHERE
+            is_active = true
+            AND lower(ocr_item_name) = ANY(%s::text[])
+            AND (is_custom_entry = false OR created_by_uid = %s)
+        ORDER BY
+            lower(ocr_item_name),
+            is_custom_entry DESC,
+            created_at DESC
+        """,
+        (keys, uid),
+    )
+
+    out: Dict[str, str] = {}
+    for r in rows:
+        k = (r.get("k") or "").strip().lower()
+        cn = (r.get("canonical_name") or "").strip()
+        if k and cn:
+            out[k] = cn
+    return out
+
+
+def _enrich_items_with_canonical(uid: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    items: health_items rows (dicts). Adds canonicalName if mapping exists.
+    Does NOT modify stored item_name.
+    """
+    if not items:
+        return items
+
+    lower_names = []
+    for it in items:
+        nm = (it.get("item_name") or it.get("itemName") or "")
+        if isinstance(nm, str):
+            lower_names.append(nm.strip().lower())
+
+    mapping = _fetch_item_name_map_for_lower_names(uid, lower_names)
+    out = []
+    for it in items:
+        d = dict(it)
+        nm = (d.get("item_name") or d.get("itemName") or "")
+        key = nm.strip().lower() if isinstance(nm, str) else ""
+        canonical = mapping.get(key)
+        d["canonicalName"] = canonical if canonical else None
+        d["isMapped"] = bool(canonical)
+        out.append(d)
+    return out
 
 
 # =========================================================
@@ -911,6 +1064,11 @@ class HealthRecordUpsertRequest(BaseModel):
     items: Optional[List[HealthItemInput]] = None
 
 
+class HealthRecordConfirmHospitalRequest(BaseModel):
+    recordId: str
+    hospitalMgmtNo: str
+
+
 class MigrationPrepareResponse(BaseModel):
     oldUid: str
     migrationCode: str
@@ -930,7 +1088,8 @@ class SignedUrlResponse(BaseModel):
 class HospitalSearchResult(BaseModel):
     hospitalMgmtNo: str
     name: str
-    roadAddress: str
+    roadAddress: Optional[str] = None
+    jibunAddress: Optional[str] = None
     lng: Optional[float] = None
     lat: Optional[float] = None
     isCustomEntry: bool
@@ -938,7 +1097,8 @@ class HospitalSearchResult(BaseModel):
 
 class HospitalCustomCreateRequest(BaseModel):
     name: str
-    roadAddress: str
+    roadAddress: Optional[str] = None
+    jibunAddress: Optional[str] = None
     lng: Optional[float] = None
     lat: Optional[float] = None
 
@@ -946,7 +1106,8 @@ class HospitalCustomCreateRequest(BaseModel):
 class HospitalCustomCreateResponse(BaseModel):
     hospitalMgmtNo: str
     name: str
-    roadAddress: str
+    roadAddress: Optional[str] = None
+    jibunAddress: Optional[str] = None
     lng: Optional[float] = None
     lat: Optional[float] = None
     isCustomEntry: bool
@@ -963,10 +1124,20 @@ class DocumentUploadResponse(BaseModel):
     updatedAt: str
 
 
+class OCRItemMapUpsertRequest(BaseModel):
+    ocrItemName: str
+    canonicalName: str
+    isActive: Optional[bool] = True
+
+
+class OCRItemMapDeactivateRequest(BaseModel):
+    ocrItemName: str
+
+
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.1.20-final")
+app = FastAPI(title="PetHealth+ Server", version="2.1.20-final+qc+itemmap")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1004,14 +1175,14 @@ def _shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (Firebase Storage + v2.1.20-final)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (Firebase Storage + v2.1.20-final+qc+itemmap)"}
 
 
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
-        "version": "2.1.20-final",
+        "version": "2.1.20-final+qc+itemmap",
         "storage": "firebase",
         "storage_bucket": settings.FIREBASE_STORAGE_BUCKET,
         "receipt_webp_quality": settings.RECEIPT_WEBP_QUALITY,
@@ -1022,6 +1193,7 @@ def health():
         "auth_required": settings.AUTH_REQUIRED,
         "db_enabled": settings.DB_ENABLED,
         "db_configured": bool(settings.DATABASE_URL),
+        "ocr_hospital_candidate_limit": int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT),
     }
 
 
@@ -1144,7 +1316,8 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
 
 # =========================================================
 # Hospitals: search + custom create/delete
-# v2.1.20: gov master + private custom entries (created_by_uid)
+# - road_address / jibun_address 공존
+# - scope: gov master always + custom only if created_by_uid=uid
 # =========================================================
 @app.get("/api/hospitals/search", response_model=List[HospitalSearchResult])
 def hospitals_search(
@@ -1165,6 +1338,7 @@ def hospitals_search(
             hospital_mgmt_no,
             name,
             road_address,
+            jibun_address,
             lng,
             lat,
             is_custom_entry
@@ -1178,19 +1352,37 @@ def hospitals_search(
         (uid, like, query, limit),
     )
 
-    out = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
         out.append(
             {
                 "hospitalMgmtNo": r["hospital_mgmt_no"],
                 "name": r["name"],
-                "roadAddress": r["road_address"],
+                "roadAddress": r.get("road_address"),
+                "jibunAddress": r.get("jibun_address"),
                 "lng": r.get("lng"),
                 "lat": r.get("lat"),
                 "isCustomEntry": bool(r.get("is_custom_entry")),
             }
         )
     return out
+
+
+def _validate_lat_lng(lat: Optional[float], lng: Optional[float]) -> None:
+    if lat is not None:
+        try:
+            v = float(lat)
+        except Exception:
+            raise HTTPException(status_code=400, detail="lat must be a number")
+        if v < -90 or v > 90:
+            raise HTTPException(status_code=400, detail="lat must be between -90 and 90")
+    if lng is not None:
+        try:
+            v = float(lng)
+        except Exception:
+            raise HTTPException(status_code=400, detail="lng must be a number")
+        if v < -180 or v > 180:
+            raise HTTPException(status_code=400, detail="lng must be between -180 and 180")
 
 
 @app.post("/api/hospitals/custom/create", response_model=HospitalCustomCreateResponse)
@@ -1203,11 +1395,15 @@ def hospitals_custom_create(
     db_touch_user(uid, desired_tier=desired)
 
     name = (req.name or "").strip()
-    road = (req.roadAddress or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
-    if not road:
-        raise HTTPException(status_code=400, detail="roadAddress is required")
+
+    road = (req.roadAddress or "").strip() if isinstance(req.roadAddress, str) else ""
+    jibun = (req.jibunAddress or "").strip() if isinstance(req.jibunAddress, str) else ""
+    road_val = road if road else None
+    jibun_val = jibun if jibun else None
+
+    _validate_lat_lng(req.lat, req.lng)
 
     mgmt_no = "CUSTOM_" + uuid.uuid4().hex
 
@@ -1215,12 +1411,12 @@ def hospitals_custom_create(
         row = db_fetchone(
             """
             INSERT INTO public.hospitals
-                (hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry, created_by_uid)
+                (hospital_mgmt_no, name, road_address, jibun_address, lng, lat, is_custom_entry, created_by_uid)
             VALUES
-                (%s, %s, %s, %s, %s, true, %s)
-            RETURNING hospital_mgmt_no, name, road_address, lng, lat, is_custom_entry
+                (%s, %s, %s, %s, %s, %s, true, %s)
+            RETURNING hospital_mgmt_no, name, road_address, jibun_address, lng, lat, is_custom_entry
             """,
-            (mgmt_no, name, road, req.lng, req.lat, uid),
+            (mgmt_no, name, road_val, jibun_val, req.lng, req.lat, uid),
         )
         if not row:
             raise HTTPException(status_code=500, detail="failed to create hospital")
@@ -1228,7 +1424,8 @@ def hospitals_custom_create(
         return {
             "hospitalMgmtNo": row["hospital_mgmt_no"],
             "name": row["name"],
-            "roadAddress": row["road_address"],
+            "roadAddress": row.get("road_address"),
+            "jibunAddress": row.get("jibun_address"),
             "lng": row.get("lng"),
             "lat": row.get("lat"),
             "isCustomEntry": True,
@@ -1278,7 +1475,8 @@ def hospitals_custom_delete(
 
 
 # =========================================================
-# DB APIs: records + items (NOTE: receipt_image_path/file_size_bytes are server-managed)
+# DB APIs: records + items
+# NOTE: receipt_image_path/file_size_bytes are server-managed in receipt upload endpoint.
 # =========================================================
 @app.post("/api/db/records/upsert")
 def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
@@ -1374,8 +1572,10 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     (record_uuid,),
                 )
                 items_rows = cur.fetchall() or []
+                items_enriched = _enrich_items_with_canonical(uid, [dict(x) for x in items_rows])
+
                 payload = dict(row)
-                payload["items"] = [dict(x) for x in items_rows]
+                payload["items"] = items_enriched
                 return jsonable_encoder(payload)
 
     except HTTPException:
@@ -1444,8 +1644,11 @@ def api_records_list(
         (record_ids,),
     )
 
+    # enrich (canonical mapping)
+    items_enriched = _enrich_items_with_canonical(uid, items)
+
     by_record: Dict[str, List[Dict[str, Any]]] = {}
-    for it in items:
+    for it in items_enriched:
         rid = str(it.get("record_id"))
         by_record.setdefault(rid, []).append(it)
 
@@ -1494,13 +1697,148 @@ def api_record_get(
         """,
         (record_uuid,),
     )
-    row["items"] = items
+    row["items"] = _enrich_items_with_canonical(uid, items)
     return jsonable_encoder(row)
 
 
 # =========================================================
+# Record -> hospital candidates (OCR) + confirm endpoint
+# =========================================================
+@app.get("/api/db/records/hospital-candidates")
+def api_record_hospital_candidates(
+    recordId: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    record_uuid = _uuid_or_400(recordId, "recordId")
+
+    rows = db_fetchall(
+        """
+        SELECT
+            c.rank,
+            c.score,
+            h.hospital_mgmt_no,
+            h.name,
+            h.road_address,
+            h.jibun_address,
+            h.lat,
+            h.lng,
+            h.is_custom_entry
+        FROM public.health_record_hospital_candidates c
+        JOIN public.hospitals h
+          ON h.hospital_mgmt_no = c.hospital_mgmt_no
+        JOIN public.health_records r
+          ON r.id = c.record_id
+        JOIN public.pets p
+          ON p.id = r.pet_id
+        WHERE
+            p.user_uid = %s
+            AND r.id = %s
+        ORDER BY c.rank ASC
+        """,
+        (uid, record_uuid),
+    )
+
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "rank": int(r["rank"]),
+                "score": float(r["score"]) if r.get("score") is not None else None,
+                "hospitalMgmtNo": r["hospital_mgmt_no"],
+                "name": r["name"],
+                "roadAddress": r.get("road_address"),
+                "jibunAddress": r.get("jibun_address"),
+                "lat": r.get("lat"),
+                "lng": r.get("lng"),
+                "isCustomEntry": bool(r.get("is_custom_entry")),
+            }
+        )
+    return out
+
+
+@app.post("/api/db/records/confirm-hospital")
+def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    record_uuid = _uuid_or_400(req.recordId, "recordId")
+    mgmt = (req.hospitalMgmtNo or "").strip()
+    if not mgmt:
+        raise HTTPException(status_code=400, detail="hospitalMgmtNo is required")
+
+    # verify record ownership
+    rec = db_fetchone(
+        """
+        SELECT r.id
+        FROM public.health_records r
+        JOIN public.pets p ON p.id = r.pet_id
+        WHERE p.user_uid = %s AND r.id = %s
+        """,
+        (uid, record_uuid),
+    )
+    if not rec:
+        raise HTTPException(status_code=404, detail="record not found")
+
+    # verify hospital scope (custom ownership)
+    hosp = db_fetchone(
+        """
+        SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
+        FROM public.hospitals
+        WHERE hospital_mgmt_no=%s
+        """,
+        (mgmt,),
+    )
+    if not hosp:
+        raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
+    if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
+        raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
+
+    try:
+        row = db_fetchone(
+            """
+            UPDATE public.health_records r
+            SET hospital_mgmt_no = %s
+            WHERE r.id = %s
+              AND EXISTS (
+                SELECT 1
+                FROM public.pets p
+                WHERE p.id = r.pet_id AND p.user_uid = %s
+              )
+            RETURNING
+                r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+                r.pet_weight_at_visit, r.tags,
+                r.receipt_image_path, r.file_size_bytes,
+                r.created_at, r.updated_at
+            """,
+            (mgmt, record_uuid, uid),
+        )
+        if not row:
+            raise HTTPException(status_code=500, detail="failed to confirm hospital")
+
+        # candidates will be auto-cleared by DB trigger on hospital change
+        items = db_fetchall(
+            """
+            SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+            FROM public.health_items
+            WHERE record_id=%s
+            ORDER BY created_at ASC
+            """,
+            (record_uuid,),
+        )
+        row["items"] = _enrich_items_with_canonical(uid, items)
+        row["hospitalCandidatesCleared"] = True
+        return jsonable_encoder(row)
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
+
+
+# =========================================================
 # Receipt endpoint (server-only upload)
-# v2.1.20: receipt_image_path + file_size_bytes are mandatory pairing
+# - hospital_mgmt_no 기본: 확정 전에는 NULL 유지
+# - 후보 리스트는 health_record_hospital_candidates에 저장 + 응답으로도 제공
 # =========================================================
 @app.post("/api/receipts/process")
 async def api_receipts_process(
@@ -1542,7 +1880,7 @@ async def api_receipts_process(
 
     # 1) OCR -> redact -> resize -> webp
     try:
-        webp_bytes, parsed = process_receipt_image_and_parse(raw)
+        webp_bytes, parsed, hints = process_receipt_image_and_parse(raw)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"receipt processing failed: {e}")
 
@@ -1570,7 +1908,8 @@ async def api_receipts_process(
     hn = hospital_name.strip() if isinstance(hospital_name, str) and hospital_name.strip() else None
     ta = int(total_amount) if isinstance(total_amount, int) and total_amount >= 0 else 0
 
-    mgmt = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
+    # user-confirmed mgmt only if provided (do not clear existing confirmed value implicitly)
+    mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
 
     extracted_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
     safe_items: List[Dict[str, Any]] = []
@@ -1590,18 +1929,22 @@ async def api_receipts_process(
                 pr = None
         safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": None})
 
+    # address hint for candidate matching (never returned/stored)
+    addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
+    addr_hint = addr_hint if isinstance(addr_hint, str) else None
+
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # optional: mgmt_no가 들어왔다면 FK + scope 에러를 더 친절히 만들기 위해 1차 확인
-                if mgmt is not None:
+                if mgmt_input is not None:
                     cur.execute(
                         """
                         SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
                         FROM public.hospitals
                         WHERE hospital_mgmt_no=%s
                         """,
-                        (mgmt,),
+                        (mgmt_input,),
                     )
                     hosp = cur.fetchone()
                     if not hosp:
@@ -1609,6 +1952,9 @@ async def api_receipts_process(
                     if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
                         raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
 
+                # IMPORTANT:
+                # - INSERT: hospital_mgmt_no = mgmt_input (can be NULL)
+                # - UPDATE: mgmt_input이 NULL이면 기존 hospital_mgmt_no 유지 (확정값을 실수로 지우지 않기)
                 cur.execute(
                     """
                     INSERT INTO public.health_records
@@ -1619,8 +1965,8 @@ async def api_receipts_process(
                        %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                       pet_id = EXCLUDED.pet_id,
-                      hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
-                      hospital_name = EXCLUDED.hospital_name,
+                      hospital_mgmt_no = COALESCE(EXCLUDED.hospital_mgmt_no, public.health_records.hospital_mgmt_no),
+                      hospital_name = COALESCE(public.health_records.hospital_name, EXCLUDED.hospital_name),
                       visit_date = EXCLUDED.visit_date,
                       total_amount = EXCLUDED.total_amount,
                       receipt_image_path = EXCLUDED.receipt_image_path,
@@ -1634,12 +1980,13 @@ async def api_receipts_process(
                       receipt_image_path, file_size_bytes,
                       created_at, updated_at
                     """,
-                    (record_uuid, pet_uuid, mgmt, hn, vd, ta, [], receipt_path, file_size_bytes, uid),
+                    (record_uuid, pet_uuid, mgmt_input, hn, vd, ta, [], receipt_path, file_size_bytes, uid),
                 )
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=500, detail="Failed to upsert health_record")
 
+                # items
                 if replaceItems:
                     cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
                     for it in safe_items:
@@ -1651,6 +1998,72 @@ async def api_receipts_process(
                             (record_uuid, it["itemName"], it["price"], None),
                         )
 
+                # OCR hospital candidates: record가 "미확정(hospital_mgmt_no is NULL)" 상태일 때만 저장
+                candidates_out: List[Dict[str, Any]] = []
+                record_confirmed = row.get("hospital_mgmt_no") is not None
+                if not record_confirmed:
+                    limit_n = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
+                    limit_n = max(1, min(limit_n, 10))
+
+                    # 후보 생성 입력이 둘 다 비면 스킵
+                    name_for_match = hn or ""
+                    addr_for_match = addr_hint or ""
+                    if (name_for_match.strip() != "") or (addr_for_match.strip() != ""):
+                        # 기존 후보 정리 후 재생성
+                        cur.execute(
+                            "DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s",
+                            (record_uuid,),
+                        )
+
+                        cur.execute(
+                            """
+                            SELECT
+                                c.hospital_mgmt_no,
+                                c.name,
+                                c.road_address,
+                                c.jibun_address,
+                                c.lat,
+                                c.lng,
+                                c.score,
+                                h.is_custom_entry
+                            FROM public.find_hospital_candidates_weighted(%s, %s, %s, %s) c
+                            JOIN public.hospitals h
+                              ON h.hospital_mgmt_no = c.hospital_mgmt_no
+                            """,
+                            (uid, name_for_match, addr_for_match, limit_n),
+                        )
+                        cand_rows = cur.fetchall() or []
+
+                        # insert candidates with rank
+                        for idx, c in enumerate(cand_rows, start=1):
+                            cur.execute(
+                                """
+                                INSERT INTO public.health_record_hospital_candidates
+                                    (record_id, hospital_mgmt_no, rank, score)
+                                VALUES
+                                    (%s, %s, %s, %s)
+                                ON CONFLICT (record_id, hospital_mgmt_no) DO UPDATE SET
+                                    rank = EXCLUDED.rank,
+                                    score = EXCLUDED.score
+                                """,
+                                (record_uuid, c["hospital_mgmt_no"], idx, c.get("score")),
+                            )
+
+                            candidates_out.append(
+                                {
+                                    "rank": idx,
+                                    "score": float(c["score"]) if c.get("score") is not None else None,
+                                    "hospitalMgmtNo": c["hospital_mgmt_no"],
+                                    "name": c["name"],
+                                    "roadAddress": c.get("road_address"),
+                                    "jibunAddress": c.get("jibun_address"),
+                                    "lat": c.get("lat"),
+                                    "lng": c.get("lng"),
+                                    "isCustomEntry": bool(c.get("is_custom_entry")),
+                                }
+                            )
+
+                # fetch items rows
                 cur.execute(
                     """
                     SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
@@ -1661,9 +2074,13 @@ async def api_receipts_process(
                     (record_uuid,),
                 )
                 items_rows = cur.fetchall() or []
+                items_enriched = _enrich_items_with_canonical(uid, [dict(x) for x in items_rows])
 
                 payload = dict(row)
-                payload["items"] = [dict(x) for x in items_rows]
+                payload["items"] = items_enriched
+                payload["hospitalCandidates"] = candidates_out
+                payload["hospitalCandidateCount"] = len(candidates_out)
+                payload["hospitalConfirmed"] = bool(payload.get("hospital_mgmt_no"))
                 return jsonable_encoder(payload)
 
     except HTTPException as he:
@@ -1687,7 +2104,6 @@ async def api_receipts_process(
 # Documents (PDF) - lab/cert only, stored in DB (pet_documents)
 # =========================================================
 def _is_pdf_bytes(data: bytes) -> bool:
-    # basic PDF signature check
     return data[:5] == b"%PDF-"
 
 
@@ -1991,7 +2407,6 @@ def storage_signed_url(
 
 # =========================================================
 # Backup endpoints (Firebase Storage)
-# NOTE: backups are allowed by rules (client read/write), but server endpoints still exist.
 # =========================================================
 @app.post("/api/backup/upload", response_model=BackupUploadResponse)
 async def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = Depends(get_current_user)):
@@ -2079,13 +2494,6 @@ def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
 
 # =========================================================
 # Migration tokens + migration execution
-# v2.1.20: DB side migrate_user_data(old_uid,new_uid) handles:
-#   - quota pre-check
-#   - set migration_mode
-#   - pets ownership move
-#   - custom hospitals move
-#   - rewrite paths
-#   - recompute stats
 # =========================================================
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -2270,6 +2678,317 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         "steps": [dict(s) for s in steps],
         "warnings": warnings,
     }
+
+
+# =========================================================
+# OCR ItemName Map APIs (custom + admin global)
+# - item_name 원문은 health_items에 그대로 저장
+# - canonicalName은 매핑 테이블에서 조회/응답용
+# =========================================================
+@app.get("/api/ocr/item-maps/list")
+def list_item_maps(
+    includeInactive: bool = Query(False),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    rows = db_fetchall(
+        """
+        SELECT
+            id,
+            ocr_item_name,
+            canonical_name,
+            is_active,
+            is_custom_entry,
+            created_by_uid,
+            created_at,
+            updated_at
+        FROM public.ocr_item_name_maps
+        WHERE
+            (is_custom_entry = false OR created_by_uid = %s)
+            AND (%s OR is_active = true)
+        ORDER BY
+            is_custom_entry DESC,
+            created_at DESC
+        """,
+        (uid, includeInactive),
+    )
+
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "id": str(r["id"]),
+                "ocrItemName": r["ocr_item_name"],
+                "canonicalName": r["canonical_name"],
+                "isActive": bool(r["is_active"]),
+                "isCustomEntry": bool(r["is_custom_entry"]),
+                "createdAt": r["created_at"].isoformat() if r.get("created_at") else None,
+                "updatedAt": r["updated_at"].isoformat() if r.get("updated_at") else None,
+            }
+        )
+    return out
+
+
+@app.post("/api/ocr/item-maps/custom/upsert")
+def upsert_custom_item_map(req: OCRItemMapUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    ocr_name = (req.ocrItemName or "").strip()
+    canonical = (req.canonicalName or "").strip()
+    is_active = bool(req.isActive) if req.isActive is not None else True
+
+    if not ocr_name:
+        raise HTTPException(status_code=400, detail="ocrItemName is required")
+    if not canonical:
+        raise HTTPException(status_code=400, detail="canonicalName is required")
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # 1) try update existing active row (same key)
+                cur.execute(
+                    """
+                    UPDATE public.ocr_item_name_maps
+                    SET
+                        canonical_name = %s,
+                        is_active = %s
+                    WHERE
+                        is_custom_entry = true
+                        AND created_by_uid = %s
+                        AND lower(ocr_item_name) = lower(%s)
+                        AND is_active = true
+                    RETURNING
+                        id, ocr_item_name, canonical_name, is_active, is_custom_entry, created_at, updated_at
+                    """,
+                    (canonical, is_active, uid, ocr_name),
+                )
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "id": str(row["id"]),
+                        "ocrItemName": row["ocr_item_name"],
+                        "canonicalName": row["canonical_name"],
+                        "isActive": bool(row["is_active"]),
+                        "isCustomEntry": True,
+                        "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
+                        "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                    }
+
+                # 2) try reactivate latest inactive row if exists (avoid duplicates history)
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM public.ocr_item_name_maps
+                    WHERE
+                        is_custom_entry = true
+                        AND created_by_uid = %s
+                        AND lower(ocr_item_name) = lower(%s)
+                        AND is_active = false
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (uid, ocr_name),
+                )
+                inactive = cur.fetchone()
+                if inactive:
+                    cur.execute(
+                        """
+                        UPDATE public.ocr_item_name_maps
+                        SET
+                            canonical_name = %s,
+                            is_active = %s
+                        WHERE id = %s
+                        RETURNING
+                            id, ocr_item_name, canonical_name, is_active, is_custom_entry, created_at, updated_at
+                        """,
+                        (canonical, is_active, inactive["id"]),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            "id": str(row["id"]),
+                            "ocrItemName": row["ocr_item_name"],
+                            "canonicalName": row["canonical_name"],
+                            "isActive": bool(row["is_active"]),
+                            "isCustomEntry": True,
+                            "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
+                            "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                        }
+
+                # 3) insert new
+                cur.execute(
+                    """
+                    INSERT INTO public.ocr_item_name_maps
+                        (ocr_item_name, canonical_name, is_active, is_custom_entry, created_by_uid)
+                    VALUES
+                        (%s, %s, %s, true, %s)
+                    RETURNING
+                        id, ocr_item_name, canonical_name, is_active, is_custom_entry, created_at, updated_at
+                    """,
+                    (ocr_name, canonical, is_active, uid),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=500, detail="failed to upsert item map")
+
+                return {
+                    "id": str(row["id"]),
+                    "ocrItemName": row["ocr_item_name"],
+                    "canonicalName": row["canonical_name"],
+                    "isActive": bool(row["is_active"]),
+                    "isCustomEntry": True,
+                    "createdAt": row["created_at"].isoformat() if row.get("created_at") else None,
+                    "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                }
+
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
+
+
+@app.post("/api/ocr/item-maps/custom/deactivate")
+def deactivate_custom_item_map(req: OCRItemMapDeactivateRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    uid = user.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    ocr_name = (req.ocrItemName or "").strip()
+    if not ocr_name:
+        raise HTTPException(status_code=400, detail="ocrItemName is required")
+
+    try:
+        row = db_fetchone(
+            """
+            UPDATE public.ocr_item_name_maps
+            SET is_active = false
+            WHERE
+                is_custom_entry = true
+                AND created_by_uid = %s
+                AND lower(ocr_item_name) = lower(%s)
+                AND is_active = true
+            RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+            """,
+            (uid, ocr_name),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="active mapping not found")
+        return {
+            "ok": True,
+            "id": str(row["id"]),
+            "ocrItemName": row["ocr_item_name"],
+            "canonicalName": row["canonical_name"],
+            "isActive": bool(row["is_active"]),
+            "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        }
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
+
+
+@app.post("/api/admin/ocr/item-maps/global/upsert")
+def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, Any] = Depends(get_admin_user)):
+    ocr_name = (req.ocrItemName or "").strip()
+    canonical = (req.canonicalName or "").strip()
+    is_active = bool(req.isActive) if req.isActive is not None else True
+
+    if not ocr_name:
+        raise HTTPException(status_code=400, detail="ocrItemName is required")
+    if not canonical:
+        raise HTTPException(status_code=400, detail="canonicalName is required")
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # update existing active global
+                cur.execute(
+                    """
+                    UPDATE public.ocr_item_name_maps
+                    SET canonical_name=%s, is_active=%s
+                    WHERE
+                        is_custom_entry=false
+                        AND is_active=true
+                        AND lower(ocr_item_name)=lower(%s)
+                    RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+                    """,
+                    (canonical, is_active, ocr_name),
+                )
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "id": str(row["id"]),
+                        "ocrItemName": row["ocr_item_name"],
+                        "canonicalName": row["canonical_name"],
+                        "isActive": bool(row["is_active"]),
+                        "isCustomEntry": False,
+                        "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                    }
+
+                # reactivate latest inactive global
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM public.ocr_item_name_maps
+                    WHERE
+                        is_custom_entry=false
+                        AND is_active=false
+                        AND lower(ocr_item_name)=lower(%s)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (ocr_name,),
+                )
+                inactive = cur.fetchone()
+                if inactive:
+                    cur.execute(
+                        """
+                        UPDATE public.ocr_item_name_maps
+                        SET canonical_name=%s, is_active=%s
+                        WHERE id=%s
+                        RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+                        """,
+                        (canonical, is_active, inactive["id"]),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            "id": str(row["id"]),
+                            "ocrItemName": row["ocr_item_name"],
+                            "canonicalName": row["canonical_name"],
+                            "isActive": bool(row["is_active"]),
+                            "isCustomEntry": False,
+                            "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                        }
+
+                # insert new global
+                cur.execute(
+                    """
+                    INSERT INTO public.ocr_item_name_maps
+                        (ocr_item_name, canonical_name, is_active, is_custom_entry, created_by_uid)
+                    VALUES
+                        (%s, %s, %s, false, NULL)
+                    RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+                    """,
+                    (ocr_name, canonical, is_active),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=500, detail="failed to upsert global item map")
+                return {
+                    "id": str(row["id"]),
+                    "ocrItemName": row["ocr_item_name"],
+                    "canonicalName": row["canonical_name"],
+                    "isActive": bool(row["is_active"]),
+                    "isCustomEntry": False,
+                    "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                }
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
 
 
 # =========================================================
