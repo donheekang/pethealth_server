@@ -1,5 +1,8 @@
-# main.py (PetHealth+ Server) - Firebase Storage + Receipt Redaction + Signed URL + Migration
-# + Private Hospitals (road/jibun) + OCR Hospital Candidates + OCR ItemName Map (v2.1.20-final+qc+itemmap)
+# main.py (PetHealth+ Server)
+# Firebase Storage + Receipt Redaction + Signed URL + Migration
+# + Private Hospitals (road/jibun) + OCR Hospital Candidates + OCR ItemName Map
+# v2.1.20-final+qc+itemmap (ops-hardening)
+
 import os
 import io
 import json
@@ -10,19 +13,20 @@ import hashlib
 import secrets
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, Tuple, Set
+from typing import Optional, List, Dict, Any, Tuple, Set, Iterable
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Pillow (image processing)
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFile, UnidentifiedImageError
 
 # Google Vision
 from google.cloud import vision
@@ -59,6 +63,12 @@ class Settings(BaseSettings):
     RECEIPT_MAX_WIDTH: int = 1024
     RECEIPT_WEBP_QUALITY: int = 85
 
+    # Upload hardening
+    MAX_RECEIPT_IMAGE_BYTES: int = 10 * 1024 * 1024
+    MAX_PDF_BYTES: int = 20 * 1024 * 1024
+    MAX_BACKUP_BYTES: int = 5 * 1024 * 1024
+    IMAGE_MAX_PIXELS: int = 20_000_000
+
     # Signed URL
     SIGNED_URL_DEFAULT_TTL_SECONDS: int = 600
     SIGNED_URL_MAX_TTL_SECONDS: int = 3600
@@ -76,6 +86,16 @@ class Settings(BaseSettings):
     DB_POOL_MAX: int = 5
     DB_AUTO_UPSERT_USER: str = "true"
 
+    # db_touch_user write throttle (seconds)
+    USER_TOUCH_THROTTLE_SECONDS: int = 300
+
+    # Error detail exposure (prod에서는 false 권장)
+    EXPOSE_ERROR_DETAILS: str = "false"
+
+    # CORS (웹 어드민 붙일 때 사용)
+    CORS_ALLOW_ORIGINS: str = "*"          # comma-separated
+    CORS_ALLOW_CREDENTIALS: str = "false"  # "*" 와 credentials는 같이 못 씀
+
     # --- Admin ---
     ADMIN_UIDS: str = ""
 
@@ -83,6 +103,10 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Pillow hardening
+Image.MAX_IMAGE_PIXELS = int(getattr(settings, "IMAGE_MAX_PIXELS", 20_000_000) or 20_000_000)
+ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 
 # =========================================================
@@ -100,6 +124,10 @@ def _uuid_or_new(value: Optional[str], field_name: str) -> uuid.UUID:
     if not v:
         return uuid.uuid4()
     return _uuid_or_400(v, field_name)
+
+
+def _new_error_id() -> str:
+    return uuid.uuid4().hex[:12]
 
 
 # =========================================================
@@ -204,41 +232,46 @@ def _pg_message(e: Exception) -> str:
     return str(e)
 
 
+def _internal_detail(msg: str, *, kind: str = "Internal Server Error") -> str:
+    eid = _new_error_id()
+    print(f"[ERR:{eid}] {kind}: {msg}")
+    if (settings.EXPOSE_ERROR_DETAILS or "").lower() == "true":
+        return f"{kind}: {msg} (errorId={eid})"
+    return f"{kind} (errorId={eid})"
+
+
 def _raise_mapped_db_error(e: Exception) -> None:
     msg = _pg_message(e)
 
-    # Quota guard error
+    # User-safe errors
     if "Quota exceeded" in msg:
         raise HTTPException(status_code=409, detail=msg)
 
-    # Ownership mismatch / scope guard
     if "Ownership mismatch" in msg or "Hospital access denied" in msg:
         raise HTTPException(status_code=403, detail=msg)
 
-    # Candidate insert blocked (record already confirmed)
     if "Candidates not allowed" in msg:
         raise HTTPException(status_code=409, detail=msg)
 
-    # Pet owner update blocked
     if "Direct update of pets.user_uid is not allowed" in msg:
         raise HTTPException(status_code=409, detail=msg)
 
-    # Lat/Lng constraint (friendly)
     if "hospitals_lat_lng_range_check" in msg:
         raise HTTPException(status_code=400, detail="Invalid latitude/longitude range")
 
-    # FK issues (e.g., invalid hospital_mgmt_no)
     if "violates foreign key constraint" in msg:
         raise HTTPException(status_code=400, detail="Invalid reference (foreign key)")
 
-    # Unique violation (e.g., ocr_item_name_maps partial uniques)
     if "duplicate key value violates unique constraint" in msg:
         raise HTTPException(status_code=409, detail="Duplicate value (unique constraint)")
 
-    # Generic
-    raise HTTPException(status_code=500, detail=f"DB error: {msg}")
+    # Generic (hide details in prod by default)
+    raise HTTPException(status_code=500, detail=_internal_detail(msg, kind="DB error"))
 
 
+# =========================================================
+# Auth / membership helpers
+# =========================================================
 def _infer_membership_tier_from_token(decoded: Dict[str, Any]) -> Optional[str]:
     """
     guest: Firebase Anonymous Auth
@@ -268,6 +301,8 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
       - 기본 guest
       - 자동 업그레이드: desired_tier='member' 이고 현재 tier가 guest면 member로 올림
       - premium은 절대 자동으로 덮어쓰지 않음
+      - write throttle: last_seen_at 갱신은 N초 간격으로만 (그 외는 DO NOTHING)
+        (users.updated_at trigger 폭탄 방지: WHERE로 update 자체를 피함)
     """
     uid = (firebase_uid or "").strip()
     if not uid:
@@ -277,6 +312,9 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
     if desired not in (None, "guest", "member"):
         desired = None
 
+    throttle = int(getattr(settings, "USER_TOUCH_THROTTLE_SECONDS", 300) or 300)
+    throttle = max(10, min(throttle, 3600))
+
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -284,20 +322,43 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                 INSERT INTO public.users (firebase_uid, membership_tier)
                 VALUES (%s, COALESCE(%s, 'guest'))
                 ON CONFLICT (firebase_uid) DO UPDATE SET
-                    last_seen_at = now(),
+                    last_seen_at = CASE
+                        WHEN public.users.last_seen_at < now() - (%s * INTERVAL '1 second')
+                        THEN now()
+                        ELSE public.users.last_seen_at
+                    END,
                     membership_tier = CASE
                         WHEN public.users.membership_tier = 'guest'
                              AND COALESCE(%s,'guest') = 'member' THEN 'member'
                         ELSE public.users.membership_tier
                     END
+                WHERE
+                    (public.users.membership_tier = 'guest' AND COALESCE(%s,'guest') = 'member')
+                    OR (public.users.last_seen_at < now() - (%s * INTERVAL '1 second'))
                 RETURNING
                     firebase_uid, membership_tier, premium_until,
                     pet_count, record_count, doc_count, total_storage_bytes,
                     created_at, updated_at, last_seen_at
                 """,
-                (uid, desired, desired),
+                (uid, desired, throttle, desired, desired, throttle),
             )
             row = cur.fetchone()
+
+            # conflict + WHERE false면 RETURNING이 비어있을 수 있음 -> SELECT로 보정
+            if not row:
+                cur.execute(
+                    """
+                    SELECT
+                        firebase_uid, membership_tier, premium_until,
+                        pet_count, record_count, doc_count, total_storage_bytes,
+                        created_at, updated_at, last_seen_at
+                    FROM public.users
+                    WHERE firebase_uid=%s
+                    """,
+                    (uid,),
+                )
+                row = cur.fetchone()
+
             if not row:
                 raise HTTPException(status_code=500, detail="Failed to upsert user")
 
@@ -332,10 +393,80 @@ def _clean_tags(tags: Any) -> List[str]:
 
 
 # =========================================================
-# Firebase Admin init & Auth dependency
+# Firebase Admin init (Auth/Storage decoupled)
 # =========================================================
 _firebase_initialized = False
 auth_scheme = HTTPBearer(auto_error=False)
+
+# Stub storage (in-memory)
+_stub_objects: Dict[str, Dict[str, Any]] = {}  # path -> {data, content_type, updated, size}
+
+
+class _StubBlob:
+    def __init__(self, bucket: "_StubBucket", name: str):
+        self._bucket = bucket
+        self.name = name
+
+    def exists(self) -> bool:
+        return self.name in self._bucket._objects
+
+    def upload_from_string(self, data: bytes, content_type: str = "application/octet-stream") -> None:
+        self._bucket._objects[self.name] = {
+            "data": data,
+            "content_type": content_type,
+            "updated": datetime.utcnow(),
+            "size": int(len(data or b"")),
+        }
+
+    def download_as_bytes(self) -> bytes:
+        obj = self._bucket._objects.get(self.name)
+        if not obj:
+            raise FileNotFoundError(self.name)
+        return obj["data"]
+
+    def delete(self) -> None:
+        self._bucket._objects.pop(self.name, None)
+
+    @property
+    def updated(self):
+        obj = self._bucket._objects.get(self.name)
+        return obj.get("updated") if obj else None
+
+    @property
+    def size(self) -> int:
+        obj = self._bucket._objects.get(self.name)
+        return int(obj.get("size") or 0) if obj else 0
+
+    def generate_signed_url(self, *args, **kwargs) -> str:
+        # stub
+        return f"/_stub/{self.name}"
+
+
+class _StubBucket:
+    def __init__(self, objects: Dict[str, Dict[str, Any]]):
+        self._objects = objects
+
+    def blob(self, name: str) -> _StubBlob:
+        return _StubBlob(self, name)
+
+    def list_blobs(self, prefix: str = "") -> Iterable[_StubBlob]:
+        for k in sorted(list(self._objects.keys())):
+            if k.startswith(prefix):
+                yield _StubBlob(self, k)
+
+    def copy_blob(self, blob: _StubBlob, _bucket: "._StubBucket", dst_name: str) -> None:
+        src = self._objects.get(blob.name)
+        if not src:
+            return
+        self._objects[dst_name] = {
+            "data": src["data"],
+            "content_type": src.get("content_type") or "application/octet-stream",
+            "updated": datetime.utcnow(),
+            "size": int(src.get("size") or len(src["data"])),
+        }
+
+
+_stub_bucket_singleton = _StubBucket(_stub_objects)
 
 
 def _normalize_private_key_newlines(info: dict) -> dict:
@@ -366,33 +497,43 @@ def _load_firebase_service_account() -> Optional[dict]:
     return None
 
 
-def init_firebase_admin() -> None:
+def init_firebase_admin(*, require_init: bool = False) -> None:
+    """
+    Auth 플래그(AUTH_REQUIRED)와 무관하게, 스토리지 목적이면 init 가능해야 함.
+    require_init=True이면, SA/bucket 누락 시 예외.
+    """
     global _firebase_initialized
     if _firebase_initialized:
         return
 
-    if settings.STUB_MODE.lower() == "true" or settings.AUTH_REQUIRED.lower() != "true":
-        print("[Auth] Firebase init skipped (STUB_MODE or AUTH_REQUIRED=false).")
+    if settings.STUB_MODE.lower() == "true":
         _firebase_initialized = True
         return
 
     info = _load_firebase_service_account()
     if not info:
-        raise RuntimeError(
-            "AUTH_REQUIRED=true but Firebase service account is empty. "
-            "Set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64."
-        )
+        if require_init:
+            raise RuntimeError("Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)")
+        _firebase_initialized = True
+        return
 
     if not settings.FIREBASE_STORAGE_BUCKET:
-        raise RuntimeError("FIREBASE_STORAGE_BUCKET is required for Firebase Storage")
+        if require_init:
+            raise RuntimeError("FIREBASE_STORAGE_BUCKET is required for Firebase Storage")
+        _firebase_initialized = True
+        return
 
     try:
-        cred = fb_credentials.Certificate(info)
-        firebase_admin.initialize_app(cred, {"storageBucket": settings.FIREBASE_STORAGE_BUCKET})
+        if not firebase_admin._apps:
+            cred = fb_credentials.Certificate(info)
+            firebase_admin.initialize_app(cred, {"storageBucket": settings.FIREBASE_STORAGE_BUCKET})
         _firebase_initialized = True
-        print("[Auth] Firebase Admin initialized.")
+        print("[Firebase] Admin initialized.")
     except Exception as e:
-        raise RuntimeError(f"Firebase Admin initialize failed: {e}")
+        if require_init:
+            raise RuntimeError(f"Firebase Admin initialize failed: {e}")
+        _firebase_initialized = True
+        print("[Firebase] init failed (ignored):", e)
 
 
 def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
@@ -411,10 +552,12 @@ def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(auth_scheme),
 ) -> Dict[str, Any]:
+    # no-auth or stub mode: still allow server to run (storage can be used separately)
     if settings.STUB_MODE.lower() == "true" or settings.AUTH_REQUIRED.lower() != "true":
         return {"uid": "dev", "email": "dev@example.com", "firebase": {"sign_in_provider": "password"}}
 
-    init_firebase_admin()
+    # auth requires firebase init
+    init_firebase_admin(require_init=True)
 
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
@@ -450,16 +593,14 @@ def get_admin_user(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str
 # =========================================================
 # Firebase Storage helpers
 # =========================================================
-def _require_storage() -> None:
-    if settings.STUB_MODE.lower() == "true":
-        return
-    if not settings.FIREBASE_STORAGE_BUCKET:
-        raise HTTPException(status_code=503, detail="FIREBASE_STORAGE_BUCKET is not set")
-
-
 def get_bucket():
-    init_firebase_admin()
-    _require_storage()
+    # stub storage
+    if settings.STUB_MODE.lower() == "true":
+        return _stub_bucket_singleton
+
+    # storage requires firebase init regardless of AUTH_REQUIRED
+    init_firebase_admin(require_init=True)
+
     return fb_storage.bucket()
 
 
@@ -502,8 +643,23 @@ def _receipt_path(uid: str, pet_id: str, record_id: str) -> str:
 
 
 def _doc_pdf_path(uid: str, pet_id: str, doc_type: str, doc_id: str) -> str:
-    # doc_type: lab or cert
     return f"{_user_prefix(uid, pet_id)}/{doc_type}/{doc_id}.pdf"
+
+
+# =========================================================
+# Upload read limits
+# =========================================================
+def _read_upload_limited(upload: UploadFile, max_bytes: int) -> bytes:
+    try:
+        upload.file.seek(0)
+    except Exception:
+        pass
+    data = upload.file.read(int(max_bytes) + 1)
+    if data is None:
+        data = b""
+    if len(data) > int(max_bytes):
+        raise HTTPException(status_code=413, detail="file too large")
+    return data
 
 
 # =========================================================
@@ -736,9 +892,8 @@ def _encode_webp(img: Image.Image, quality: int) -> bytes:
 
 
 # =========================================================
-# Receipt parsing (best-effort, PII lines excluded for parse output)
-# - hospital candidate matching은 "병원명 중심 + 주소 보정"이지만,
-#   주소 문자열은 DB/로그에 저장하지 않고, 후보 검색 입력으로만 사용.
+# Receipt parsing (best-effort)
+# - 주소 힌트는 저장/응답 금지, 후보검색 보정용으로만 사용
 # =========================================================
 def _parse_visit_date_from_text(text: str) -> Optional[date]:
     t = (text or "").strip()
@@ -787,10 +942,6 @@ def _guess_hospital_name_from_lines(line_texts: List[str]) -> str:
 
 
 def _guess_address_hint_from_lines(all_lines: List[str]) -> Optional[str]:
-    """
-    주소는 병원 후보 검색 보정용으로만 사용.
-    절대 DB/로그에 저장하지 않고, API 응답에도 포함하지 않음.
-    """
     best = None
     best_score = -999
 
@@ -812,8 +963,6 @@ def _guess_address_hint_from_lines(all_lines: List[str]) -> Optional[str]:
             score += 1
         if 10 <= len(t) <= 80:
             score += 1
-
-        # 너무 숫자만 많은 라인은 제외
         if sum(c.isdigit() for c in t) >= 18:
             score -= 2
 
@@ -824,7 +973,6 @@ def _guess_address_hint_from_lines(all_lines: List[str]) -> Optional[str]:
     if not best:
         return None
 
-    # prefix 제거(주소: / 도로명주소: 등)
     best = re.sub(r"^(주소|도로명주소|지번주소)\s*[:：]?\s*", "", best).strip()
     if not best:
         return None
@@ -880,8 +1028,15 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
       - parsed (safe to return to client)
       - hints (do NOT store; used for candidate matching only)
     """
-    img = Image.open(io.BytesIO(raw_image_bytes))
-    img = img.convert("RGB")  # strip alpha/exif
+    try:
+        img = Image.open(io.BytesIO(raw_image_bytes))
+        img = img.convert("RGB")  # strip alpha/exif
+    except Image.DecompressionBombError:
+        raise RuntimeError("image too large (decompression bomb)")
+    except UnidentifiedImageError:
+        raise RuntimeError("invalid image")
+    except Exception as e:
+        raise RuntimeError(f"image open failed: {e}")
 
     w, h = img.size
 
@@ -895,7 +1050,6 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
     redacted_small = _resize_to_width(redacted, int(settings.RECEIPT_MAX_WIDTH))
     webp = _encode_webp(redacted_small, int(settings.RECEIPT_WEBP_QUALITY))
 
-    # Safe lines (PII 제외)
     safe_lines: List[str] = []
     for ln in line_texts:
         if _line_contains_pii_trigger(ln):
@@ -921,8 +1075,7 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
     }
 
     hints = {
-        # address hint는 PII로 취급(저장/응답 금지) — 후보 검색 입력으로만 사용
-        "addressHint": _guess_address_hint_from_lines(line_texts),
+        "addressHint": _guess_address_hint_from_lines(line_texts),  # 저장/응답 금지
     }
     return webp, parsed, hints
 
@@ -931,15 +1084,9 @@ def process_receipt_image_and_parse(raw_image_bytes: bytes) -> Tuple[bytes, Dict
 # OCR item_name -> canonical_name mapping (read helpers)
 # =========================================================
 def _fetch_item_name_map_for_lower_names(uid: str, lower_names: List[str]) -> Dict[str, str]:
-    """
-    returns: {lower_ocr_item_name: canonical_name}
-    priority: custom(uid) > global
-    active only.
-    """
     if not lower_names:
         return {}
 
-    # de-dup / cleanup
     keys = []
     seen = set()
     for n in lower_names:
@@ -980,10 +1127,6 @@ def _fetch_item_name_map_for_lower_names(uid: str, lower_names: List[str]) -> Di
 
 
 def _enrich_items_with_canonical(uid: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    items: health_items rows (dicts). Adds canonicalName if mapping exists.
-    Does NOT modify stored item_name.
-    """
     if not items:
         return items
 
@@ -994,6 +1137,7 @@ def _enrich_items_with_canonical(uid: str, items: List[Dict[str, Any]]) -> List[
             lower_names.append(nm.strip().lower())
 
     mapping = _fetch_item_name_map_for_lower_names(uid, lower_names)
+
     out = []
     for it in items:
         d = dict(it)
@@ -1137,28 +1281,45 @@ class OCRItemMapDeactivateRequest(BaseModel):
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.1.20-final+qc+itemmap")
+app = FastAPI(title="PetHealth+ Server", version="2.1.20-final+qc+itemmap-ops")
+
+# CORS hardening
+_origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
+_allow_credentials = (settings.CORS_ALLOW_CREDENTIALS or "").lower() == "true"
+if "*" in _origins and _allow_credentials:
+    # 브라우저에서 * + credentials 조합은 막힘 -> 안전하게 credentials 끔
+    _allow_credentials = False
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# Global psycopg2 error handler (일관된 500/메시지)
+@app.exception_handler(psycopg2.Error)
+async def _pg_error_handler(request: Request, exc: psycopg2.Error):
+    try:
+        _raise_mapped_db_error(exc)
+    except HTTPException as he:
+        return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
+    return JSONResponse(status_code=500, content={"detail": _internal_detail(_pg_message(exc), kind="DB error")})
+
+
 @app.on_event("startup")
 def _startup():
+    # DB pool init first
+    init_db_pool()
+
+    # Firebase init은 용도별로 런타임에서(require_init=True) 보장
     if settings.AUTH_REQUIRED.lower() == "true" and settings.STUB_MODE.lower() != "true":
         try:
-            init_firebase_admin()
+            init_firebase_admin(require_init=True)
         except Exception as e:
             print("[Startup] Firebase init failed:", e)
-    else:
-        print("[Startup] Auth not required or STUB_MODE. Skipping Firebase init.")
-
-    init_db_pool()
 
 
 @app.on_event("shutdown")
@@ -1175,25 +1336,56 @@ def _shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (Firebase Storage + v2.1.20-final+qc+itemmap)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (v2.1.20-final+qc+itemmap-ops)"}
 
 
 @app.get("/api/health")
 def health():
+    db_checks: Dict[str, Any] = {"ok": None, "missing": []}
+    if (settings.DB_ENABLED or "").lower() == "true" and settings.DATABASE_URL:
+        try:
+            # lightweight existence checks
+            checks = [
+                ("users", "public.users"),
+                ("pets", "public.pets"),
+                ("hospitals", "public.hospitals"),
+                ("health_records", "public.health_records"),
+                ("health_items", "public.health_items"),
+                ("pet_documents", "public.pet_documents"),
+                ("candidates", "public.health_record_hospital_candidates"),
+                ("ocr_item_maps", "public.ocr_item_name_maps"),
+            ]
+            missing = []
+            for _, reg in checks:
+                r = db_fetchone("SELECT to_regclass(%s) AS c", (reg,))
+                if not r or not r.get("c"):
+                    missing.append(reg)
+            db_checks["ok"] = (len(missing) == 0)
+            db_checks["missing"] = missing
+        except Exception as e:
+            db_checks["ok"] = False
+            db_checks["error"] = _pg_message(e)
+
     return {
         "status": "ok",
-        "version": "2.1.20-final+qc+itemmap",
-        "storage": "firebase",
+        "version": "2.1.20-final+qc+itemmap-ops",
+        "storage": "firebase" if settings.STUB_MODE.lower() != "true" else "stub",
         "storage_bucket": settings.FIREBASE_STORAGE_BUCKET,
         "receipt_webp_quality": settings.RECEIPT_WEBP_QUALITY,
         "receipt_max_width": settings.RECEIPT_MAX_WIDTH,
+        "max_receipt_bytes": int(settings.MAX_RECEIPT_IMAGE_BYTES),
+        "max_pdf_bytes": int(settings.MAX_PDF_BYTES),
+        "image_max_pixels": int(settings.IMAGE_MAX_PIXELS),
         "signed_url_default_ttl": settings.SIGNED_URL_DEFAULT_TTL_SECONDS,
         "signed_url_max_ttl": settings.SIGNED_URL_MAX_TTL_SECONDS,
         "stub_mode": settings.STUB_MODE,
         "auth_required": settings.AUTH_REQUIRED,
         "db_enabled": settings.DB_ENABLED,
         "db_configured": bool(settings.DATABASE_URL),
+        "db_schema": db_checks,
         "ocr_hospital_candidate_limit": int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT),
+        "expose_error_details": (settings.EXPOSE_ERROR_DETAILS or "").lower() == "true",
+        "cors": {"origins": _origins, "allowCredentials": _allow_credentials},
     }
 
 
@@ -1256,44 +1448,47 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
     if neutered is not None and neutered not in ("Y", "N", "U"):
         raise HTTPException(status_code=400, detail="neutered must be one of 'Y','N','U' or null")
 
-    # allergy policy (schema chk_allergy_consistency: TRUE면 tags 비움, FALSE/NULL이면 허용)
     has_no_allergy: Optional[bool] = req.has_no_allergy
     allergy_tags = [str(x).strip() for x in (req.allergy_tags or []) if str(x).strip()]
-
     if has_no_allergy is True:
         allergy_tags = []
 
-    row = db_fetchone(
-        """
-        INSERT INTO public.pets
-            (id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags)
-        VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
-            name = EXCLUDED.name,
-            species = EXCLUDED.species,
-            breed = EXCLUDED.breed,
-            birthday = EXCLUDED.birthday,
-            weight_kg = EXCLUDED.weight_kg,
-            gender = EXCLUDED.gender,
-            neutered = EXCLUDED.neutered,
-            has_no_allergy = EXCLUDED.has_no_allergy,
-            allergy_tags = EXCLUDED.allergy_tags
-        WHERE public.pets.user_uid = EXCLUDED.user_uid
-        RETURNING
-            id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags,
-            created_at, updated_at
-        """,
-        (pet_uuid, uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags),
-    )
+    try:
+        row = db_fetchone(
+            """
+            INSERT INTO public.pets
+                (id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                species = EXCLUDED.species,
+                breed = EXCLUDED.breed,
+                birthday = EXCLUDED.birthday,
+                weight_kg = EXCLUDED.weight_kg,
+                gender = EXCLUDED.gender,
+                neutered = EXCLUDED.neutered,
+                has_no_allergy = EXCLUDED.has_no_allergy,
+                allergy_tags = EXCLUDED.allergy_tags
+            WHERE public.pets.user_uid = EXCLUDED.user_uid
+            RETURNING
+                id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags,
+                created_at, updated_at
+            """,
+            (pet_uuid, uid, name, species, breed, birthday, weight_kg, gender, neutered, has_no_allergy, allergy_tags),
+        )
+        if row:
+            return jsonable_encoder(row)
 
-    if row:
-        return jsonable_encoder(row)
-
-    exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_uuid,))
-    if exists and exists.get("user_uid") != uid:
-        raise HTTPException(status_code=403, detail="You do not own this pet id")
-    raise HTTPException(status_code=500, detail="Failed to upsert pet")
+        exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_uuid,))
+        if exists and exists.get("user_uid") != uid:
+            raise HTTPException(status_code=403, detail="You do not own this pet id")
+        raise HTTPException(status_code=500, detail="Failed to upsert pet")
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
 
 
 @app.get("/api/db/pets/list")
@@ -1316,9 +1511,24 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
 
 # =========================================================
 # Hospitals: search + custom create/delete
-# - road_address / jibun_address 공존
-# - scope: gov master always + custom only if created_by_uid=uid
 # =========================================================
+def _validate_lat_lng(lat: Optional[float], lng: Optional[float]) -> None:
+    if lat is not None:
+        try:
+            v = float(lat)
+        except Exception:
+            raise HTTPException(status_code=400, detail="lat must be a number")
+        if v < -90 or v > 90:
+            raise HTTPException(status_code=400, detail="lat must be between -90 and 90")
+    if lng is not None:
+        try:
+            v = float(lng)
+        except Exception:
+            raise HTTPException(status_code=400, detail="lng must be a number")
+        if v < -180 or v > 180:
+            raise HTTPException(status_code=400, detail="lng must be between -180 and 180")
+
+
 @app.get("/api/hospitals/search", response_model=List[HospitalSearchResult])
 def hospitals_search(
     q: str = Query(..., min_length=1),
@@ -1366,23 +1576,6 @@ def hospitals_search(
             }
         )
     return out
-
-
-def _validate_lat_lng(lat: Optional[float], lng: Optional[float]) -> None:
-    if lat is not None:
-        try:
-            v = float(lat)
-        except Exception:
-            raise HTTPException(status_code=400, detail="lat must be a number")
-        if v < -90 or v > 90:
-            raise HTTPException(status_code=400, detail="lat must be between -90 and 90")
-    if lng is not None:
-        try:
-            v = float(lng)
-        except Exception:
-            raise HTTPException(status_code=400, detail="lng must be a number")
-        if v < -180 or v > 180:
-            raise HTTPException(status_code=400, detail="lng must be between -180 and 180")
 
 
 @app.post("/api/hospitals/custom/create", response_model=HospitalCustomCreateResponse)
@@ -1448,7 +1641,6 @@ def hospitals_custom_delete(
     if not mg:
         raise HTTPException(status_code=400, detail="hospitalMgmtNo is required")
 
-    # Only allow deleting your custom hospital.
     row = db_fetchone(
         """
         SELECT hospital_mgmt_no
@@ -1460,7 +1652,6 @@ def hospitals_custom_delete(
     if not row:
         raise HTTPException(status_code=404, detail="custom hospital not found")
 
-    # If referenced by records, FK will block delete -> return 409 with hint.
     try:
         n = db_execute("DELETE FROM public.hospitals WHERE hospital_mgmt_no=%s", (mg,))
         if n <= 0:
@@ -1475,8 +1666,7 @@ def hospitals_custom_delete(
 
 
 # =========================================================
-# DB APIs: records + items
-# NOTE: receipt_image_path/file_size_bytes are server-managed in receipt upload endpoint.
+# Records + items
 # =========================================================
 @app.post("/api/db/records/upsert")
 def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
@@ -1508,7 +1698,6 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="pet not found")
 
-                # record upsert (do NOT allow client to change receipt_image_path/file_size_bytes here)
                 cur.execute(
                     """
                     INSERT INTO public.health_records
@@ -1585,6 +1774,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
         raise
 
 
+# records/list hotfix (UUID 배열 그대로 + 에러 detail)
 @app.get("/api/db/records/list")
 def api_records_list(
     petId: Optional[str] = Query(None),
@@ -1595,69 +1785,81 @@ def api_records_list(
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
 
-    if petId:
-        pet_uuid = _uuid_or_400(petId, "petId")
-        rows = db_fetchall(
+    try:
+        desired = _infer_membership_tier_from_token(user)
+        db_touch_user(uid, desired_tier=desired)
+    except Exception:
+        pass
+
+    try:
+        if petId:
+            pet_uuid = _uuid_or_400(petId, "petId")
+            rows = db_fetchall(
+                """
+                SELECT
+                    r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+                    r.pet_weight_at_visit, r.tags,
+                    r.receipt_image_path, r.file_size_bytes,
+                    r.created_at, r.updated_at
+                FROM public.health_records r
+                JOIN public.pets p ON p.id = r.pet_id
+                WHERE p.user_uid=%s AND p.id=%s
+                ORDER BY r.visit_date DESC, r.created_at DESC
+                """,
+                (uid, pet_uuid),
+            )
+        else:
+            rows = db_fetchall(
+                """
+                SELECT
+                    r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+                    r.pet_weight_at_visit, r.tags,
+                    r.receipt_image_path, r.file_size_bytes,
+                    r.created_at, r.updated_at
+                FROM public.health_records r
+                JOIN public.pets p ON p.id = r.pet_id
+                WHERE p.user_uid=%s
+                ORDER BY r.visit_date DESC, r.created_at DESC
+                """,
+                (uid,),
+            )
+
+        if not includeItems:
+            return jsonable_encoder(rows)
+
+        record_ids = [r["id"] for r in rows if r.get("id")]  # UUID 그대로
+        if not record_ids:
+            return jsonable_encoder(rows)
+
+        items = db_fetchall(
             """
-            SELECT
-                r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
-                r.pet_weight_at_visit, r.tags,
-                r.receipt_image_path, r.file_size_bytes,
-                r.created_at, r.updated_at
-            FROM public.health_records r
-            JOIN public.pets p ON p.id = r.pet_id
-            WHERE p.user_uid=%s AND p.id=%s
-            ORDER BY r.visit_date DESC, r.created_at DESC
+            SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+            FROM public.health_items
+            WHERE record_id = ANY(%s::uuid[])
+            ORDER BY created_at ASC
             """,
-            (uid, pet_uuid),
-        )
-    else:
-        rows = db_fetchall(
-            """
-            SELECT
-                r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
-                r.pet_weight_at_visit, r.tags,
-                r.receipt_image_path, r.file_size_bytes,
-                r.created_at, r.updated_at
-            FROM public.health_records r
-            JOIN public.pets p ON p.id = r.pet_id
-            WHERE p.user_uid=%s
-            ORDER BY r.visit_date DESC, r.created_at DESC
-            """,
-            (uid,),
+            (record_ids,),
         )
 
-    if not includeItems:
-        return jsonable_encoder(rows)
+        items_enriched = _enrich_items_with_canonical(uid, items)
 
-    record_ids = [str(r["id"]) for r in rows if r.get("id")]
-    if not record_ids:
-        return jsonable_encoder(rows)
+        by_record: Dict[str, List[Dict[str, Any]]] = {}
+        for it in items_enriched:
+            rid = str(it.get("record_id"))
+            by_record.setdefault(rid, []).append(it)
 
-    items = db_fetchall(
-        """
-        SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
-        FROM public.health_items
-        WHERE record_id = ANY(%s::uuid[])
-        ORDER BY created_at ASC
-        """,
-        (record_ids,),
-    )
+        out = []
+        for r in rows:
+            rr = dict(r)
+            rr["items"] = by_record.get(str(r.get("id")), [])
+            out.append(rr)
 
-    # enrich (canonical mapping)
-    items_enriched = _enrich_items_with_canonical(uid, items)
+        return jsonable_encoder(out)
 
-    by_record: Dict[str, List[Dict[str, Any]]] = {}
-    for it in items_enriched:
-        rid = str(it.get("record_id"))
-        by_record.setdefault(rid, []).append(it)
-
-    out = []
-    for r in rows:
-        rr = dict(r)
-        rr["items"] = by_record.get(str(r.get("id")), [])
-        out.append(rr)
-    return jsonable_encoder(out)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_mapped_db_error(e)
 
 
 @app.get("/api/db/records/get")
@@ -1670,39 +1872,45 @@ def api_record_get(
     if not rid:
         raise HTTPException(status_code=400, detail="recordId is required")
 
-    record_uuid = _uuid_or_400(rid, "recordId")
+    try:
+        record_uuid = _uuid_or_400(rid, "recordId")
 
-    row = db_fetchone(
-        """
-        SELECT
-            r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
-            r.pet_weight_at_visit, r.tags,
-            r.receipt_image_path, r.file_size_bytes,
-            r.created_at, r.updated_at
-        FROM public.health_records r
-        JOIN public.pets p ON p.id = r.pet_id
-        WHERE p.user_uid=%s AND r.id=%s
-        """,
-        (uid, record_uuid),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="record not found")
+        row = db_fetchone(
+            """
+            SELECT
+                r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount,
+                r.pet_weight_at_visit, r.tags,
+                r.receipt_image_path, r.file_size_bytes,
+                r.created_at, r.updated_at
+            FROM public.health_records r
+            JOIN public.pets p ON p.id = r.pet_id
+            WHERE p.user_uid=%s AND r.id=%s
+            """,
+            (uid, record_uuid),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="record not found")
 
-    items = db_fetchall(
-        """
-        SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
-        FROM public.health_items
-        WHERE record_id=%s
-        ORDER BY created_at ASC
-        """,
-        (record_uuid,),
-    )
-    row["items"] = _enrich_items_with_canonical(uid, items)
-    return jsonable_encoder(row)
+        items = db_fetchall(
+            """
+            SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
+            FROM public.health_items
+            WHERE record_id=%s
+            ORDER BY created_at ASC
+            """,
+            (record_uuid,),
+        )
+        row["items"] = _enrich_items_with_canonical(uid, items)
+        return jsonable_encoder(row)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_mapped_db_error(e)
 
 
 # =========================================================
-# Record -> hospital candidates (OCR) + confirm endpoint
+# Record -> hospital candidates + confirm
 # =========================================================
 @app.get("/api/db/records/hospital-candidates")
 def api_record_hospital_candidates(
@@ -1768,7 +1976,6 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
     if not mgmt:
         raise HTTPException(status_code=400, detail="hospitalMgmtNo is required")
 
-    # verify record ownership
     rec = db_fetchone(
         """
         SELECT r.id
@@ -1781,7 +1988,6 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
     if not rec:
         raise HTTPException(status_code=404, detail="record not found")
 
-    # verify hospital scope (custom ownership)
     hosp = db_fetchone(
         """
         SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
@@ -1817,7 +2023,6 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
         if not row:
             raise HTTPException(status_code=500, detail="failed to confirm hospital")
 
-        # candidates will be auto-cleared by DB trigger on hospital change
         items = db_fetchall(
             """
             SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
@@ -1836,20 +2041,13 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
 
 
 # =========================================================
-# Receipt endpoint (server-only upload)
-# - hospital_mgmt_no 기본: 확정 전에는 NULL 유지
-# - 후보 리스트는 health_record_hospital_candidates에 저장 + 응답으로도 제공
+# Receipts (SYNC handler to avoid event-loop blocking)
 # =========================================================
 @app.post("/api/receipts/process")
-async def api_receipts_process(
+def api_receipts_process(
     petId: str = Form(...),
     recordId: Optional[str] = Form(None),
-
-    # hospitalMgmtNo는:
-    # - 앱이 "사용자 확정" 병원을 알고 있으면 넣어줌
-    # - 자동(OCR 추정)만으로는 보통 비워둠(NULL) 추천
     hospitalMgmtNo: Optional[str] = Form(None),
-
     replaceItems: bool = Form(True),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
@@ -1869,12 +2067,11 @@ async def api_receipts_process(
     pet_uuid = _uuid_or_400(petId, "petId")
     record_uuid = _uuid_or_new(recordId, "recordId")
 
-    # ownership check
     pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
 
-    raw = await upload.read()
+    raw = _read_upload_limited(upload, int(settings.MAX_RECEIPT_IMAGE_BYTES))
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
@@ -1884,7 +2081,7 @@ async def api_receipts_process(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"receipt processing failed: {e}")
 
-    # 2) upload to Firebase Storage
+    # 2) upload to storage
     receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
         upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
@@ -1893,7 +2090,6 @@ async def api_receipts_process(
 
     file_size_bytes = int(len(webp_bytes))
 
-    # 3) upsert DB record + items
     visit_date = parsed.get("visitDate")
     hospital_name = parsed.get("hospitalName")
     total_amount = parsed.get("totalAmount")
@@ -1908,7 +2104,6 @@ async def api_receipts_process(
     hn = hospital_name.strip() if isinstance(hospital_name, str) and hospital_name.strip() else None
     ta = int(total_amount) if isinstance(total_amount, int) and total_amount >= 0 else 0
 
-    # user-confirmed mgmt only if provided (do not clear existing confirmed value implicitly)
     mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
 
     extracted_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
@@ -1929,14 +2124,13 @@ async def api_receipts_process(
                 pr = None
         safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": None})
 
-    # address hint for candidate matching (never returned/stored)
     addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
     addr_hint = addr_hint if isinstance(addr_hint, str) else None
 
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # optional: mgmt_no가 들어왔다면 FK + scope 에러를 더 친절히 만들기 위해 1차 확인
+                # optional: mgmt_no가 들어왔다면 scope 미리 체크(친절한 에러)
                 if mgmt_input is not None:
                     cur.execute(
                         """
@@ -1952,9 +2146,7 @@ async def api_receipts_process(
                     if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
                         raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
 
-                # IMPORTANT:
-                # - INSERT: hospital_mgmt_no = mgmt_input (can be NULL)
-                # - UPDATE: mgmt_input이 NULL이면 기존 hospital_mgmt_no 유지 (확정값을 실수로 지우지 않기)
+                # record upsert: 확정된 hospital_mgmt_no는 NULL로 덮어쓰지 않게 COALESCE
                 cur.execute(
                     """
                     INSERT INTO public.health_records
@@ -1986,7 +2178,6 @@ async def api_receipts_process(
                 if not row:
                     raise HTTPException(status_code=500, detail="Failed to upsert health_record")
 
-                # items
                 if replaceItems:
                     cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
                     for it in safe_items:
@@ -1998,18 +2189,16 @@ async def api_receipts_process(
                             (record_uuid, it["itemName"], it["price"], None),
                         )
 
-                # OCR hospital candidates: record가 "미확정(hospital_mgmt_no is NULL)" 상태일 때만 저장
+                # hospital candidates (only if record not confirmed)
                 candidates_out: List[Dict[str, Any]] = []
                 record_confirmed = row.get("hospital_mgmt_no") is not None
                 if not record_confirmed:
                     limit_n = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
                     limit_n = max(1, min(limit_n, 10))
 
-                    # 후보 생성 입력이 둘 다 비면 스킵
                     name_for_match = hn or ""
                     addr_for_match = addr_hint or ""
                     if (name_for_match.strip() != "") or (addr_for_match.strip() != ""):
-                        # 기존 후보 정리 후 재생성
                         cur.execute(
                             "DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s",
                             (record_uuid,),
@@ -2034,7 +2223,6 @@ async def api_receipts_process(
                         )
                         cand_rows = cur.fetchall() or []
 
-                        # insert candidates with rank
                         for idx, c in enumerate(cand_rows, start=1):
                             cur.execute(
                                 """
@@ -2063,7 +2251,6 @@ async def api_receipts_process(
                                 }
                             )
 
-                # fetch items rows
                 cur.execute(
                     """
                     SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
@@ -2084,7 +2271,7 @@ async def api_receipts_process(
                 return jsonable_encoder(payload)
 
     except HTTPException as he:
-        # DB 실패 시 업로드한 파일 정리 시도
+        # DB 실패 시 업로드 파일 정리 시도
         try:
             delete_storage_object_if_exists(receipt_path)
         except Exception:
@@ -2101,14 +2288,14 @@ async def api_receipts_process(
 
 
 # =========================================================
-# Documents (PDF) - lab/cert only, stored in DB (pet_documents)
+# Documents (PDF) - SYNC handler to avoid event-loop blocking
 # =========================================================
 def _is_pdf_bytes(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 
 @app.post("/api/docs/upload-pdf", response_model=DocumentUploadResponse)
-async def upload_pdf_document(
+def upload_pdf_document(
     petId: str = Form(...),
     docType: str = Form(...),  # lab or cert
     displayName: Optional[str] = Form(None),
@@ -2132,13 +2319,13 @@ async def upload_pdf_document(
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
 
-    data = await file.read()
+    data = _read_upload_limited(file, int(settings.MAX_PDF_BYTES))
     if not data:
         raise HTTPException(status_code=400, detail="empty pdf")
     if not _is_pdf_bytes(data):
         raise HTTPException(status_code=400, detail="file is not a valid PDF")
 
-    doc_uuid = uuid.uuid4()  # pet_documents.id is uuid
+    doc_uuid = uuid.uuid4()
     name = (displayName or "").strip()
     if not name:
         name = (file.filename or "").strip() or ("lab.pdf" if dt == "lab" else "cert.pdf")
@@ -2146,7 +2333,6 @@ async def upload_pdf_document(
     file_path = _doc_pdf_path(uid, str(pet_uuid), dt, str(doc_uuid))
     file_size_bytes = int(len(data))
 
-    # Upload first, then DB insert (DB may reject due to quota; we cleanup)
     try:
         upload_bytes_to_storage(file_path, data, "application/pdf")
     except Exception as e:
@@ -2191,54 +2377,65 @@ async def upload_pdf_document(
 @app.get("/api/docs/list")
 def list_pdf_documents(
     petId: str = Query(...),
-    docType: Optional[str] = Query(None),  # lab/cert optional
+    docType: Optional[str] = Query(None),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     uid = user.get("uid") or ""
-    pet_uuid = _uuid_or_400(petId, "petId")
 
-    dt = (docType or "").strip().lower() if docType else None
-    if dt is not None and dt not in ("lab", "cert"):
-        raise HTTPException(status_code=400, detail="docType must be 'lab' or 'cert'")
+    try:
+        pet_uuid = _uuid_or_400(petId, "petId")
 
-    if dt:
-        rows = db_fetchall(
-            """
-            SELECT d.*
-            FROM public.pet_documents d
-            JOIN public.pets p ON p.id = d.pet_id
-            WHERE p.user_uid=%s AND p.id=%s AND d.doc_type=%s
-            ORDER BY d.created_at DESC
-            """,
-            (uid, pet_uuid, dt),
-        )
-    else:
-        rows = db_fetchall(
-            """
-            SELECT d.*
-            FROM public.pet_documents d
-            JOIN public.pets p ON p.id = d.pet_id
-            WHERE p.user_uid=%s AND p.id=%s
-            ORDER BY d.created_at DESC
-            """,
-            (uid, pet_uuid),
-        )
+        dt = (docType or "").strip().lower() if docType else None
+        if dt is not None:
+            alias = {"vaccine": "cert", "vacc": "cert", "vaccination": "cert"}
+            dt = alias.get(dt, dt)
 
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": str(r["id"]),
-                "petId": str(r["pet_id"]),
-                "docType": r["doc_type"],
-                "displayName": r["display_name"],
-                "filePath": r["file_path"],
-                "fileSizeBytes": int(r["file_size_bytes"]),
-                "createdAt": r["created_at"].isoformat() if r.get("created_at") else None,
-                "updatedAt": r["updated_at"].isoformat() if r.get("updated_at") else None,
-            }
-        )
-    return out
+        if dt is not None and dt not in ("lab", "cert"):
+            raise HTTPException(status_code=400, detail="docType must be 'lab' or 'cert'")
+
+        if dt:
+            rows = db_fetchall(
+                """
+                SELECT d.*
+                FROM public.pet_documents d
+                JOIN public.pets p ON p.id = d.pet_id
+                WHERE p.user_uid=%s AND p.id=%s AND d.doc_type=%s
+                ORDER BY d.created_at DESC
+                """,
+                (uid, pet_uuid, dt),
+            )
+        else:
+            rows = db_fetchall(
+                """
+                SELECT d.*
+                FROM public.pet_documents d
+                JOIN public.pets p ON p.id = d.pet_id
+                WHERE p.user_uid=%s AND p.id=%s
+                ORDER BY d.created_at DESC
+                """,
+                (uid, pet_uuid),
+            )
+
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": str(r["id"]),
+                    "petId": str(r["pet_id"]),
+                    "docType": r["doc_type"],
+                    "displayName": r["display_name"],
+                    "filePath": r["file_path"],
+                    "fileSizeBytes": int(r["file_size_bytes"]),
+                    "createdAt": r["created_at"].isoformat() if r.get("created_at") else None,
+                    "updatedAt": r["updated_at"].isoformat() if r.get("updated_at") else None,
+                }
+            )
+        return out
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_mapped_db_error(e)
 
 
 @app.delete("/api/docs/delete")
@@ -2249,7 +2446,6 @@ def delete_pdf_document(
     uid = user.get("uid") or ""
     doc_uuid = _uuid_or_400(docId, "docId")
 
-    # fetch doc + ownership
     row = db_fetchone(
         """
         SELECT d.id, d.file_path
@@ -2264,7 +2460,6 @@ def delete_pdf_document(
 
     file_path = row["file_path"]
 
-    # Try delete storage first (if missing, still allow DB delete)
     try:
         delete_storage_object_if_exists(file_path)
     except Exception as e:
@@ -2279,25 +2474,25 @@ def delete_pdf_document(
     return {"ok": True, "deleted": {"docId": str(doc_uuid), "filePath": file_path}}
 
 
-# Backward compatible wrappers (optional)
+# compat wrappers
 @app.post("/api/lab/upload-pdf", response_model=DocumentUploadResponse)
-async def upload_lab_pdf_compat(
+def upload_lab_pdf_compat(
     petId: str = Form(...),
     displayName: Optional[str] = Form(None),
     file: UploadFile = File(...),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
-    return await upload_pdf_document(petId=petId, docType="lab", displayName=displayName, file=file, user=user)
+    return upload_pdf_document(petId=petId, docType="lab", displayName=displayName, file=file, user=user)
 
 
 @app.post("/api/cert/upload-pdf", response_model=DocumentUploadResponse)
-async def upload_cert_pdf_compat(
+def upload_cert_pdf_compat(
     petId: str = Form(...),
     displayName: Optional[str] = Form(None),
     file: UploadFile = File(...),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
-    return await upload_pdf_document(petId=petId, docType="cert", displayName=displayName, file=file, user=user)
+    return upload_pdf_document(petId=petId, docType="cert", displayName=displayName, file=file, user=user)
 
 
 # =========================================================
@@ -2349,7 +2544,6 @@ def _assert_path_owned(uid: str, path: str) -> Dict[str, Any]:
 
 
 def _generate_signed_url(path: str, ttl_seconds: int, filename: Optional[str] = None) -> Tuple[str, str]:
-    _require_storage()
     if settings.STUB_MODE.lower() == "true":
         expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat() + "Z"
         return f"/_stub/{path}", expires_at
@@ -2406,14 +2600,22 @@ def storage_signed_url(
 
 
 # =========================================================
-# Backup endpoints (Firebase Storage)
+# Backup endpoints (SYNC)
 # =========================================================
 @app.post("/api/backup/upload", response_model=BackupUploadResponse)
-async def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = Depends(get_current_user)):
+def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = Depends(get_current_user)):
     uid = user.get("uid") or "unknown"
     desired = _infer_membership_tier_from_token(user)
     if uid and uid != "unknown":
-        db_touch_user(uid, desired_tier=desired)
+        try:
+            db_touch_user(uid, desired_tier=desired)
+        except Exception:
+            pass
+
+    # size hardening (rough)
+    payload_bytes = json.dumps(req.snapshot, ensure_ascii=False).encode("utf-8")
+    if len(payload_bytes) > int(settings.MAX_BACKUP_BYTES):
+        raise HTTPException(status_code=413, detail="backup too large")
 
     backup_id = uuid.uuid4().hex
     created_at = datetime.utcnow().isoformat() + "Z"
@@ -2532,10 +2734,6 @@ def migration_prepare(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 def _copy_prefix(old_uid: str, new_uid: str) -> int:
-    """
-    Copy all objects under users/{old_uid}/ to users/{new_uid}/
-    Skip overwrite if destination exists.
-    """
     b = get_bucket()
     src_prefix = f"users/{old_uid}/"
     dst_prefix = f"users/{new_uid}/"
@@ -2579,7 +2777,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
 
     now = datetime.utcnow()
 
-    # 1) validate token
     token_row = db_fetchone(
         """
         SELECT *
@@ -2616,7 +2813,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         )
         return {"ok": True, "oldUid": old_uid, "newUid": new_uid, "copied": 0, "deleted": 0, "dbUpdated": False, "warnings": ["oldUid == newUid (no-op)"]}
 
-    # mark processing
     db_execute(
         """
         UPDATE public.migration_tokens
@@ -2626,7 +2822,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         (new_uid, code_hash),
     )
 
-    # 2) Storage copy
     try:
         copied = _copy_prefix(old_uid, new_uid)
     except Exception as e:
@@ -2636,7 +2831,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         )
         raise HTTPException(status_code=500, detail=f"storage copy failed: {e}")
 
-    # 3) DB migration via function
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2650,7 +2844,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         _raise_mapped_db_error(e)
         raise
 
-    # 4) delete old prefix (best-effort)
     deleted = 0
     warnings: List[str] = []
     try:
@@ -2658,7 +2851,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
     except Exception as e:
         warnings.append(f"delete failed (manual cleanup may be needed): {e}")
 
-    # 5) finalize token
     db_execute(
         """
         UPDATE public.migration_tokens
@@ -2681,9 +2873,7 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
 
 
 # =========================================================
-# OCR ItemName Map APIs (custom + admin global)
-# - item_name 원문은 health_items에 그대로 저장
-# - canonicalName은 매핑 테이블에서 조회/응답용
+# OCR ItemName Map APIs
 # =========================================================
 @app.get("/api/ocr/item-maps/list")
 def list_item_maps(
@@ -2750,7 +2940,6 @@ def upsert_custom_item_map(req: OCRItemMapUpsertRequest, user: Dict[str, Any] = 
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # 1) try update existing active row (same key)
                 cur.execute(
                     """
                     UPDATE public.ocr_item_name_maps
@@ -2779,7 +2968,6 @@ def upsert_custom_item_map(req: OCRItemMapUpsertRequest, user: Dict[str, Any] = 
                         "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
                     }
 
-                # 2) try reactivate latest inactive row if exists (avoid duplicates history)
                 cur.execute(
                     """
                     SELECT id
@@ -2820,7 +3008,6 @@ def upsert_custom_item_map(req: OCRItemMapUpsertRequest, user: Dict[str, Any] = 
                             "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
                         }
 
-                # 3) insert new
                 cur.execute(
                     """
                     INSERT INTO public.ocr_item_name_maps
@@ -2904,7 +3091,6 @@ def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, 
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # update existing active global
                 cur.execute(
                     """
                     UPDATE public.ocr_item_name_maps
@@ -2928,7 +3114,6 @@ def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, 
                         "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
                     }
 
-                # reactivate latest inactive global
                 cur.execute(
                     """
                     SELECT id
@@ -2964,7 +3149,6 @@ def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, 
                             "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
                         }
 
-                # insert new global
                 cur.execute(
                     """
                     INSERT INTO public.ocr_item_name_maps
