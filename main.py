@@ -11,6 +11,7 @@ import re
 import base64
 import hashlib
 import secrets
+import threading
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Tuple, Set, Iterable
@@ -50,6 +51,10 @@ import psycopg2.extras
 class Settings(BaseSettings):
     # --- Google Vision ---
     GOOGLE_APPLICATION_CREDENTIALS: str = ""  # JSON string or file path
+
+    # Vision runtime hardening
+    OCR_TIMEOUT_SECONDS: int = 12
+    OCR_MAX_CONCURRENCY: int = 4
 
     # --- Firebase Auth / Storage ---
     AUTH_REQUIRED: str = "true"
@@ -107,6 +112,9 @@ settings = Settings()
 # Pillow hardening
 Image.MAX_IMAGE_PIXELS = int(getattr(settings, "IMAGE_MAX_PIXELS", 20_000_000) or 20_000_000)
 ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+# OCR concurrency limiter (process-wide)
+_OCR_SEMA = threading.BoundedSemaphore(max(1, int(getattr(settings, "OCR_MAX_CONCURRENCY", 4) or 4)))
 
 
 # =========================================================
@@ -323,7 +331,8 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                 VALUES (%s, COALESCE(%s, 'guest'))
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     last_seen_at = CASE
-                        WHEN public.users.last_seen_at < now() - (%s * INTERVAL '1 second')
+                        WHEN COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
+                             < now() - (%s * INTERVAL '1 second')
                         THEN now()
                         ELSE public.users.last_seen_at
                     END,
@@ -334,7 +343,8 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                     END
                 WHERE
                     (public.users.membership_tier = 'guest' AND COALESCE(%s,'guest') = 'member')
-                    OR (public.users.last_seen_at < now() - (%s * INTERVAL '1 second'))
+                    OR (COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
+                        < now() - (%s * INTERVAL '1 second'))
                 RETURNING
                     firebase_uid, membership_tier, premium_until,
                     pet_count, record_count, doc_count, total_storage_bytes,
@@ -360,7 +370,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                 row = cur.fetchone()
 
             if not row:
-                raise HTTPException(status_code=500, detail="Failed to upsert user")
+                raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert user", kind="DB error"))
 
             # DAU (optional)
             try:
@@ -373,7 +383,8 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                     (uid,),
                 )
             except Exception as e:
-                print("[DB] user_daily_active insert failed (ignored):", e)
+                # 운영상 중요도 낮음: 로그만
+                print("[DB] user_daily_active insert failed (ignored):", _pg_message(e))
 
             return dict(row)
 
@@ -398,8 +409,9 @@ def _clean_tags(tags: Any) -> List[str]:
 _firebase_initialized = False
 auth_scheme = HTTPBearer(auto_error=False)
 
-# Stub storage (in-memory)
+# Stub storage (in-memory) - thread-safe
 _stub_objects: Dict[str, Dict[str, Any]] = {}  # path -> {data, content_type, updated, size}
+_stub_lock = threading.RLock()
 
 
 class _StubBlob:
@@ -408,34 +420,40 @@ class _StubBlob:
         self.name = name
 
     def exists(self) -> bool:
-        return self.name in self._bucket._objects
+        with _stub_lock:
+            return self.name in self._bucket._objects
 
     def upload_from_string(self, data: bytes, content_type: str = "application/octet-stream") -> None:
-        self._bucket._objects[self.name] = {
-            "data": data,
-            "content_type": content_type,
-            "updated": datetime.utcnow(),
-            "size": int(len(data or b"")),
-        }
+        with _stub_lock:
+            self._bucket._objects[self.name] = {
+                "data": data,
+                "content_type": content_type,
+                "updated": datetime.utcnow(),
+                "size": int(len(data or b"")),
+            }
 
     def download_as_bytes(self) -> bytes:
-        obj = self._bucket._objects.get(self.name)
-        if not obj:
-            raise FileNotFoundError(self.name)
-        return obj["data"]
+        with _stub_lock:
+            obj = self._bucket._objects.get(self.name)
+            if not obj:
+                raise FileNotFoundError(self.name)
+            return obj["data"]
 
     def delete(self) -> None:
-        self._bucket._objects.pop(self.name, None)
+        with _stub_lock:
+            self._bucket._objects.pop(self.name, None)
 
     @property
     def updated(self):
-        obj = self._bucket._objects.get(self.name)
-        return obj.get("updated") if obj else None
+        with _stub_lock:
+            obj = self._bucket._objects.get(self.name)
+            return obj.get("updated") if obj else None
 
     @property
     def size(self) -> int:
-        obj = self._bucket._objects.get(self.name)
-        return int(obj.get("size") or 0) if obj else 0
+        with _stub_lock:
+            obj = self._bucket._objects.get(self.name)
+            return int(obj.get("size") or 0) if obj else 0
 
     def generate_signed_url(self, *args, **kwargs) -> str:
         # stub
@@ -450,20 +468,24 @@ class _StubBucket:
         return _StubBlob(self, name)
 
     def list_blobs(self, prefix: str = "") -> Iterable[_StubBlob]:
-        for k in sorted(list(self._objects.keys())):
-            if k.startswith(prefix):
-                yield _StubBlob(self, k)
+        with _stub_lock:
+            keys = sorted([k for k in self._objects.keys() if k.startswith(prefix)])
+        for k in keys:
+            yield _StubBlob(self, k)
 
     def copy_blob(self, blob: _StubBlob, _bucket: "._StubBucket", dst_name: str) -> None:
-        src = self._objects.get(blob.name)
-        if not src:
-            return
-        self._objects[dst_name] = {
-            "data": src["data"],
-            "content_type": src.get("content_type") or "application/octet-stream",
-            "updated": datetime.utcnow(),
-            "size": int(src.get("size") or len(src["data"])),
-        }
+        with _stub_lock:
+            src = self._objects.get(blob.name)
+            if not src:
+                return
+            if dst_name in self._objects:
+                return
+            self._objects[dst_name] = {
+                "data": src["data"],
+                "content_type": src.get("content_type") or "application/octet-stream",
+                "updated": datetime.utcnow(),
+                "size": int(src.get("size") or len(src["data"])),
+            }
 
 
 _stub_bucket_singleton = _StubBucket(_stub_objects)
@@ -499,41 +521,48 @@ def _load_firebase_service_account() -> Optional[dict]:
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
     """
-    Auth 플래그(AUTH_REQUIRED)와 무관하게, 스토리지 목적이면 init 가능해야 함.
-    require_init=True이면, SA/bucket 누락 시 예외.
+    ⚠️ 중요 (ops-hardening):
+    - _firebase_initialized는 "실제로 firebase_admin 앱이 존재할 때만" True.
+    - require_init=False 상태에서 SA/bucket 누락이면 그냥 return (플래그 세팅 X)
+      -> 나중에 require_init=True로 들어왔을 때 반드시 init 시도/검증됨.
     """
     global _firebase_initialized
-    if _firebase_initialized:
-        return
 
     if settings.STUB_MODE.lower() == "true":
         _firebase_initialized = True
         return
 
+    # 이미 앱이 있으면 OK
+    if firebase_admin._apps:
+        _firebase_initialized = True
+        return
+
+    # 이전 버전/경로에서 플래그만 True가 된 상태 방어
+    if _firebase_initialized and not firebase_admin._apps:
+        _firebase_initialized = False
+
     info = _load_firebase_service_account()
     if not info:
         if require_init:
             raise RuntimeError("Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)")
-        _firebase_initialized = True
         return
 
     if not settings.FIREBASE_STORAGE_BUCKET:
         if require_init:
             raise RuntimeError("FIREBASE_STORAGE_BUCKET is required for Firebase Storage")
-        _firebase_initialized = True
         return
 
     try:
-        if not firebase_admin._apps:
-            cred = fb_credentials.Certificate(info)
-            firebase_admin.initialize_app(cred, {"storageBucket": settings.FIREBASE_STORAGE_BUCKET})
+        cred = fb_credentials.Certificate(info)
+        firebase_admin.initialize_app(cred, {"storageBucket": settings.FIREBASE_STORAGE_BUCKET})
         _firebase_initialized = True
         print("[Firebase] Admin initialized.")
     except Exception as e:
         if require_init:
             raise RuntimeError(f"Firebase Admin initialize failed: {e}")
-        _firebase_initialized = True
+        # require_init=False면 플래그 세팅하지 않고 조용히 종료
         print("[Firebase] init failed (ignored):", e)
+        return
 
 
 def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
@@ -546,7 +575,7 @@ def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
         desired = _infer_membership_tier_from_token(decoded)
         db_touch_user(uid, desired_tier=desired)
     except Exception as e:
-        print("[DB] auto upsert user failed:", e)
+        print("[DB] auto upsert user failed:", _pg_message(e))
 
 
 def get_current_user(
@@ -557,7 +586,10 @@ def get_current_user(
         return {"uid": "dev", "email": "dev@example.com", "firebase": {"sign_in_provider": "password"}}
 
     # auth requires firebase init
-    init_firebase_admin(require_init=True)
+    try:
+        init_firebase_admin(require_init=True)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=_internal_detail(str(e), kind="Firebase init error"))
 
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
@@ -568,6 +600,7 @@ def get_current_user(
         _maybe_auto_upsert_user(decoded)
         return decoded
     except Exception as e:
+        # auth는 사용자 피드백이 필요해서 그대로(민감정보 없음)
         raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
 
 
@@ -599,9 +632,15 @@ def get_bucket():
         return _stub_bucket_singleton
 
     # storage requires firebase init regardless of AUTH_REQUIRED
-    init_firebase_admin(require_init=True)
+    try:
+        init_firebase_admin(require_init=True)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=_internal_detail(str(e), kind="Firebase init error"))
 
-    return fb_storage.bucket()
+    try:
+        return fb_storage.bucket()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
 
 def upload_bytes_to_storage(path: str, data: bytes, content_type: str) -> str:
@@ -697,7 +736,20 @@ def run_vision_ocr_words(image_bytes: bytes) -> List[Dict[str, Any]]:
     """
     client = get_vision_client()
     img = vision.Image(content=image_bytes)
-    resp = client.text_detection(image=img)
+
+    timeout_s = float(getattr(settings, "OCR_TIMEOUT_SECONDS", 12) or 12)
+
+    # concurrency limit
+    _OCR_SEMA.acquire()
+    try:
+        try:
+            resp = client.text_detection(image=img, timeout=timeout_s)
+        except TypeError:
+            # 일부 버전 호환
+            resp = client.text_detection(image=img)
+    finally:
+        _OCR_SEMA.release()
+
     if resp.error.message:
         raise RuntimeError(f"OCR error: {resp.error.message}")
 
@@ -1298,7 +1350,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # Global psycopg2 error handler (일관된 500/메시지)
 @app.exception_handler(psycopg2.Error)
 async def _pg_error_handler(request: Request, exc: psycopg2.Error):
@@ -1307,6 +1358,16 @@ async def _pg_error_handler(request: Request, exc: psycopg2.Error):
     except HTTPException as he:
         return JSONResponse(status_code=he.status_code, content={"detail": he.detail})
     return JSONResponse(status_code=500, content={"detail": _internal_detail(_pg_message(exc), kind="DB error")})
+
+
+# Global fallback exception handler (DB 외 영역도 errorId 통일)
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # FastAPI 기본 HTTPException 처리보다 더 구체적인 핸들러가 있으면 그게 우선됨.
+    # 여기선 "진짜 미처리 예외"만 errorId 형태로 통일.
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return JSONResponse(status_code=500, content={"detail": _internal_detail(str(exc), kind="Internal Server Error")})
 
 
 @app.on_event("startup")
@@ -1344,7 +1405,6 @@ def health():
     db_checks: Dict[str, Any] = {"ok": None, "missing": []}
     if (settings.DB_ENABLED or "").lower() == "true" and settings.DATABASE_URL:
         try:
-            # lightweight existence checks
             checks = [
                 ("users", "public.users"),
                 ("pets", "public.pets"),
@@ -1384,6 +1444,8 @@ def health():
         "db_configured": bool(settings.DATABASE_URL),
         "db_schema": db_checks,
         "ocr_hospital_candidate_limit": int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT),
+        "ocr_timeout_seconds": int(settings.OCR_TIMEOUT_SECONDS),
+        "ocr_max_concurrency": int(settings.OCR_MAX_CONCURRENCY),
         "expose_error_details": (settings.EXPOSE_ERROR_DETAILS or "").lower() == "true",
         "cors": {"origins": _origins, "allowCredentials": _allow_credentials},
     }
@@ -1483,7 +1545,7 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
         exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_uuid,))
         if exists and exists.get("user_uid") != uid:
             raise HTTPException(status_code=403, detail="You do not own this pet id")
-        raise HTTPException(status_code=500, detail="Failed to upsert pet")
+        raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert pet", kind="DB error"))
     except HTTPException:
         raise
     except Exception as e:
@@ -1612,7 +1674,7 @@ def hospitals_custom_create(
             (mgmt_no, name, road_val, jibun_val, req.lng, req.lat, uid),
         )
         if not row:
-            raise HTTPException(status_code=500, detail="failed to create hospital")
+            raise HTTPException(status_code=500, detail=_internal_detail("failed to create hospital", kind="DB error"))
 
         return {
             "hospitalMgmtNo": row["hospital_mgmt_no"],
@@ -1727,7 +1789,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=500, detail="Failed to upsert record")
+                    raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert record", kind="DB error"))
 
                 if req.items is not None:
                     cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
@@ -2021,7 +2083,7 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
             (mgmt, record_uuid, uid),
         )
         if not row:
-            raise HTTPException(status_code=500, detail="failed to confirm hospital")
+            raise HTTPException(status_code=500, detail=_internal_detail("failed to confirm hospital", kind="DB error"))
 
         items = db_fetchall(
             """
@@ -2079,14 +2141,14 @@ def api_receipts_process(
     try:
         webp_bytes, parsed, hints = process_receipt_image_and_parse(raw)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"receipt processing failed: {e}")
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
 
     # 2) upload to storage
     receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
         upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage upload failed: {e}")
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     file_size_bytes = int(len(webp_bytes))
 
@@ -2176,7 +2238,7 @@ def api_receipts_process(
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=500, detail="Failed to upsert health_record")
+                    raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert health_record", kind="DB error"))
 
                 if replaceItems:
                     cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
@@ -2336,7 +2398,7 @@ def upload_pdf_document(
     try:
         upload_bytes_to_storage(file_path, data, "application/pdf")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage upload failed: {e}")
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     try:
         row = db_fetchone(
@@ -2352,7 +2414,7 @@ def upload_pdf_document(
             (doc_uuid, pet_uuid, dt, name, file_path, file_size_bytes),
         )
         if not row:
-            raise HTTPException(status_code=500, detail="failed to insert pet_document")
+            raise HTTPException(status_code=500, detail=_internal_detail("failed to insert pet_document", kind="DB error"))
 
         return {
             "id": str(row["id"]),
@@ -2463,7 +2525,7 @@ def delete_pdf_document(
     try:
         delete_storage_object_if_exists(file_path)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"storage delete failed: {e}")
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     try:
         db_execute("DELETE FROM public.pet_documents WHERE id=%s", (doc_uuid,))
@@ -2572,7 +2634,7 @@ def _generate_signed_url(path: str, ttl_seconds: int, filename: Optional[str] = 
         )
         return url, expires_at
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"signed url generation failed: {e}")
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Signed URL error"))
 
 
 @app.get("/api/storage/signed-url", response_model=SignedUrlResponse)
@@ -2634,7 +2696,10 @@ def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = D
     }
 
     path = f"{_backup_prefix(uid)}/{backup_id}.json"
-    upload_bytes_to_storage(path, json.dumps(doc, ensure_ascii=False).encode("utf-8"), "application/json")
+    try:
+        upload_bytes_to_storage(path, json.dumps(doc, ensure_ascii=False).encode("utf-8"), "application/json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     return {"ok": True, "uid": uid, "backupId": backup_id, "objectPath": path, "createdAt": created_at}
 
@@ -2800,7 +2865,7 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         raise HTTPException(status_code=410, detail="migration token expired")
 
     if not old_uid:
-        raise HTTPException(status_code=500, detail="invalid token row (old_uid)")
+        raise HTTPException(status_code=500, detail=_internal_detail("invalid token row (old_uid)", kind="DB error"))
 
     if old_uid == new_uid:
         db_execute(
@@ -2829,7 +2894,7 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
             "UPDATE public.migration_tokens SET status='failed' WHERE code_hash=%s",
             (code_hash,),
         )
-        raise HTTPException(status_code=500, detail=f"storage copy failed: {e}")
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage copy failed"))
 
     try:
         with db_conn() as conn:
@@ -2849,7 +2914,8 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
     try:
         deleted = _delete_prefix(old_uid)
     except Exception as e:
-        warnings.append(f"delete failed (manual cleanup may be needed): {e}")
+        # 사용자에게 내부 메시지 노출하지 않고 errorId 형태로 경고
+        warnings.append(_internal_detail(str(e), kind="Cleanup error"))
 
     db_execute(
         """
@@ -3021,7 +3087,7 @@ def upsert_custom_item_map(req: OCRItemMapUpsertRequest, user: Dict[str, Any] = 
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=500, detail="failed to upsert item map")
+                    raise HTTPException(status_code=500, detail=_internal_detail("failed to upsert item map", kind="DB error"))
 
                 return {
                     "id": str(row["id"]),
@@ -3161,7 +3227,7 @@ def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, 
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=500, detail="failed to upsert global item map")
+                    raise HTTPException(status_code=500, detail=_internal_detail("failed to upsert global item map", kind="DB error"))
                 return {
                     "id": str(row["id"]),
                     "ocrItemName": row["ocr_item_name"],
