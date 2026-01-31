@@ -452,6 +452,8 @@ def _clean_tags(tags: Any) -> List[str]:
 # Firebase Admin init (Auth/Storage decoupled)
 # =========================================================
 _firebase_initialized = False
+_firebase_init_lock = threading.Lock()
+_firebase_last_init_error: Optional[str] = None
 auth_scheme = HTTPBearer(auto_error=False)
 
 # Stub storage (in-memory) - thread-safe
@@ -538,6 +540,9 @@ _stub_bucket_singleton = _StubBucket(_stub_objects)
 
 
 def _normalize_private_key_newlines(info: dict) -> dict:
+    """Normalize service account private_key newlines.
+    Env에 JSON을 넣을 때 \\n 형태로 들어가는 경우가 많아서 실제 개행으로 복원한다.
+    """
     if not isinstance(info, dict):
         return info
     pk = info.get("private_key")
@@ -546,61 +551,200 @@ def _normalize_private_key_newlines(info: dict) -> dict:
     return info
 
 
-def _load_firebase_service_account() -> Optional[dict]:
-    if settings.FIREBASE_ADMIN_SA_JSON:
-        try:
-            info = json.loads(settings.FIREBASE_ADMIN_SA_JSON)
-        except Exception as e:
-            raise RuntimeError(f"FIREBASE_ADMIN_SA_JSON JSON parse failed: {e}")
-        return _normalize_private_key_newlines(info)
+def _normalize_bucket_name(bucket: str) -> str:
+    b = (bucket or "").strip()
+    if b.startswith("gs://"):
+        b = b[len("gs://"):]
+    b = b.strip().strip("/")
+    return b
 
-    if settings.FIREBASE_ADMIN_SA_B64:
+
+def _strip_wrapping_quotes(s: str) -> str:
+    t = (s or "").strip()
+    # Render 등에서 큰 JSON env가 따옴표로 감싸져 들어가는 경우 방어
+    if (len(t) >= 2) and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
+        t = t[1:-1].strip()
+    return t
+
+
+_RE_B64ISH = re.compile(r"^[A-Za-z0-9_\-]+=*$")
+
+
+def _b64decode_json_text(value: str, *, what: str) -> str:
+    """base64 / urlsafe-base64 -> UTF-8 JSON string.
+    (패딩 빠진 값도 자동 보정)
+    """
+    v = re.sub(r"\s+", "", (value or ""))
+    v = _strip_wrapping_quotes(v)
+    if v.lower().startswith("base64:"):
+        v = v.split(":", 1)[1].strip()
+
+    if not v:
+        raise RuntimeError(f"{what} is empty")
+
+    # padding 보정
+    v = v + ("=" * (-len(v) % 4))
+
+    try:
+        raw = base64.b64decode(v, validate=True)
+    except Exception:
         try:
-            raw = base64.b64decode(settings.FIREBASE_ADMIN_SA_B64).decode("utf-8")
-            info = json.loads(raw)
+            raw = base64.urlsafe_b64decode(v)
+        except Exception as e2:
+            raise RuntimeError(f"{what} base64 decode failed: {e2}") from e2
+
+    try:
+        return raw.decode("utf-8")
+    except Exception as e:
+        raise RuntimeError(f"{what} decoded bytes are not valid UTF-8: {e}") from e
+
+
+def _load_json_info(text_or_path: str, *, what: str) -> dict:
+    """JSON string or file path -> dict"""
+    v = _strip_wrapping_quotes(text_or_path)
+
+    # 파일 경로면 읽어서 JSON 로드
+    if v and (not v.lstrip().startswith("{")) and os.path.exists(v):
+        try:
+            with open(v, "r", encoding="utf-8") as f:
+                v = f.read()
         except Exception as e:
-            raise RuntimeError(f"FIREBASE_ADMIN_SA_B64 decode/parse failed: {e}")
-        return _normalize_private_key_newlines(info)
+            raise RuntimeError(f"{what} file read failed: {e}") from e
+
+    try:
+        info = json.loads(v)
+    except Exception as e:
+        raise RuntimeError(f"{what} JSON parse failed: {e}") from e
+
+    if not isinstance(info, dict):
+        raise RuntimeError(f"{what} must decode to a JSON object")
+
+    return _normalize_private_key_newlines(info)
+
+
+def _load_firebase_service_account() -> Optional[dict]:
+    """Firebase Admin service account 로딩.
+
+    지원 형태:
+      - FIREBASE_ADMIN_SA_JSON:
+          * JSON 문자열
+          * 파일 경로
+          * base64: 로 시작하는 base64 JSON
+          * 또는 그냥 base64 JSON(길고 b64스러운 문자열)도 시도
+      - FIREBASE_ADMIN_SA_B64:
+          * base64/url-safe-base64 JSON (패딩 없어도 됨)
+    """
+    errors: List[str] = []
+
+    raw_json = _strip_wrapping_quotes(settings.FIREBASE_ADMIN_SA_JSON)
+    raw_b64 = _strip_wrapping_quotes(settings.FIREBASE_ADMIN_SA_B64)
+
+    # 1) FIREBASE_ADMIN_SA_JSON 우선
+    if raw_json:
+        try:
+            if raw_json.lstrip().startswith("{"):
+                return _load_json_info(raw_json, what="FIREBASE_ADMIN_SA_JSON")
+
+            # base64:xxxx 형태
+            if raw_json.lower().startswith("base64:"):
+                decoded = _b64decode_json_text(raw_json, what="FIREBASE_ADMIN_SA_JSON")
+                return _load_json_info(decoded, what="FIREBASE_ADMIN_SA_JSON(base64:)")
+
+            # b64처럼 생긴 긴 문자열이면 base64로도 시도 (Render에서 따옴표/개행/패딩 이슈 대비)
+            compact = re.sub(r"\s+", "", raw_json)
+            if _RE_B64ISH.match(compact) and len(compact) > 80:
+                decoded = _b64decode_json_text(compact, what="FIREBASE_ADMIN_SA_JSON(b64ish)")
+                return _load_json_info(decoded, what="FIREBASE_ADMIN_SA_JSON(b64ish)")
+
+            # 파일 경로
+            if os.path.exists(raw_json):
+                return _load_json_info(raw_json, what="FIREBASE_ADMIN_SA_JSON(file)")
+
+            # 마지막 시도: 그냥 JSON 파싱
+            return _load_json_info(raw_json, what="FIREBASE_ADMIN_SA_JSON")
+        except Exception as e:
+            errors.append(str(e))
+
+    # 2) FIREBASE_ADMIN_SA_B64
+    if raw_b64:
+        try:
+            decoded = _b64decode_json_text(raw_b64, what="FIREBASE_ADMIN_SA_B64")
+            return _load_json_info(decoded, what="FIREBASE_ADMIN_SA_B64")
+        except Exception as e:
+            errors.append(str(e))
+
+    if errors:
+        raise RuntimeError(" | ".join(errors))
 
     return None
 
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
-    global _firebase_initialized
+    """Firebase Admin SDK 초기화 (프로세스 1회).
 
-    if settings.STUB_MODE.lower() == "true":
+    - Auth(verify_id_token)는 Admin 초기화가 반드시 필요
+    - Storage bucket은 Auth와 독립 (있으면 옵션으로만 세팅)
+    """
+    global _firebase_initialized, _firebase_last_init_error
+
+    if settings.STUB_MODE:
         _firebase_initialized = True
+        _firebase_last_init_error = None
         return
 
     if firebase_admin._apps:
         _firebase_initialized = True
+        _firebase_last_init_error = None
         return
 
-    if _firebase_initialized and not firebase_admin._apps:
-        _firebase_initialized = False
+    with _firebase_init_lock:
+        if firebase_admin._apps:
+            _firebase_initialized = True
+            _firebase_last_init_error = None
+            return
 
-    info = _load_firebase_service_account()
-    if not info:
-        if require_init:
-            raise RuntimeError("Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)")
-        return
+        try:
+            info = _load_firebase_service_account()
+        except Exception as e:
+            _firebase_last_init_error = str(e)
+            if require_init:
+                raise
+            logger.warning("[Firebase] service account load failed (ignored): %s", _sanitize_for_log(repr(e)))
+            return
 
-    try:
-        cred = fb_credentials.Certificate(info)
+        if not info:
+            msg = "Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)"
+            _firebase_last_init_error = msg
+            if require_init:
+                raise RuntimeError(msg)
+            logger.info("[Firebase] %s", msg)
+            return
 
-        # ✅ bucket 없어도 Auth는 init 가능하게
-        opts = {}
-        if (settings.FIREBASE_STORAGE_BUCKET or "").strip():
-            opts["storageBucket"] = settings.FIREBASE_STORAGE_BUCKET.strip()
+        try:
+            cred = fb_credentials.Certificate(info)
 
-        firebase_admin.initialize_app(cred, opts if opts else None)
-        _firebase_initialized = True
-        print("[Firebase] Admin initialized.")
-    except Exception as e:
-        if require_init:
-            raise RuntimeError(f"Firebase Admin initialize failed: {e}")
-        print("[Firebase] init failed (ignored):", _sanitize_for_log(repr(e)))
-        return
+            bucket = _normalize_bucket_name(settings.FIREBASE_STORAGE_BUCKET)
+            opts: Dict[str, Any] = {}
+            if bucket:
+                opts["storageBucket"] = bucket
+
+            if opts:
+                firebase_admin.initialize_app(cred, opts)
+            else:
+                firebase_admin.initialize_app(cred)
+
+            _firebase_initialized = True
+            _firebase_last_init_error = None
+            logger.info("[Firebase] Admin initialized. bucket=%s", bucket or "(not set)")
+
+        except Exception as e:
+            _firebase_last_init_error = str(e)
+            if require_init:
+                raise RuntimeError(f"Firebase Admin initialize failed: {e}")
+            logger.warning("[Firebase] init failed (ignored): %s", _sanitize_for_log(repr(e)))
+            return
+
+
 
 
 def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
