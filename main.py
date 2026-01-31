@@ -566,26 +566,16 @@ def _load_firebase_service_account() -> Optional[dict]:
 
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
-    """
-    Initialize Firebase Admin SDK.
-
-    ✅ ops-hardening (auth/storage decoupled):
-    - _firebase_initialized는 "실제로 firebase_admin 앱이 존재할 때만" True.
-    - Auth(verify_id_token)에는 Service Account만 필요. (bucket 없어도 초기화 가능)
-    - Storage bucket은 get_bucket()에서 별도로 강제한다.
-    """
     global _firebase_initialized
 
-    if settings.STUB_MODE:
+    if settings.STUB_MODE.lower() == "true":
         _firebase_initialized = True
         return
 
-    # 이미 앱이 있으면 OK
     if firebase_admin._apps:
         _firebase_initialized = True
         return
 
-    # 이전 경로에서 플래그만 True가 된 상태 방어
     if _firebase_initialized and not firebase_admin._apps:
         _firebase_initialized = False
 
@@ -595,22 +585,17 @@ def init_firebase_admin(*, require_init: bool = False) -> None:
             raise RuntimeError("Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)")
         return
 
-    bucket = (settings.FIREBASE_STORAGE_BUCKET or "").strip()
-
     try:
         cred = fb_credentials.Certificate(info)
 
-        # bucket이 없어도 Auth용으로 initialize_app 가능
-        if bucket:
-            firebase_admin.initialize_app(cred, {"storageBucket": bucket})
-            print("[Firebase] Admin initialized (with storage bucket).")
+        # ✅ bucket 없어도 Auth는 init 가능하게
+        opts = {}
+        if (settings.FIREBASE_STORAGE_BUCKET or "").strip():
+            opts["storageBucket"] = settings.FIREBASE_STORAGE_BUCKET.strip()
 
-        else:
-            firebase_admin.initialize_app(cred)
-            print("[Firebase] Admin initialized (no storage bucket).")
-
+        firebase_admin.initialize_app(cred, opts if opts else None)
         _firebase_initialized = True
-
+        print("[Firebase] Admin initialized.")
     except Exception as e:
         if require_init:
             raise RuntimeError(f"Firebase Admin initialize failed: {e}")
