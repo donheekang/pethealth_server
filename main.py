@@ -1,7 +1,7 @@
 # main.py (PetHealth+ Server)
 # Firebase Storage + Receipt Redaction + Signed URL + Migration
 # + Private Hospitals (road/jibun) + OCR Hospital Candidates + OCR ItemName Map
-# v2.1.21-ops (refactor + hardening)
+# v2.1.22-ops (refactor + hardening)
 
 from __future__ import annotations
 
@@ -567,9 +567,12 @@ def _load_firebase_service_account() -> Optional[dict]:
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
     """
-    ops-hardening:
+    Initialize Firebase Admin SDK.
+
+    ✅ ops-hardening (auth/storage decoupled):
     - _firebase_initialized는 "실제로 firebase_admin 앱이 존재할 때만" True.
-    - require_init=False 상태에서 SA/bucket 누락이면 return (플래그 세팅 X)
+    - Auth(verify_id_token)에는 Service Account만 필요. (bucket 없어도 초기화 가능)
+    - Storage bucket은 get_bucket()에서 별도로 강제한다.
     """
     global _firebase_initialized
 
@@ -592,20 +595,26 @@ def init_firebase_admin(*, require_init: bool = False) -> None:
             raise RuntimeError("Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)")
         return
 
-    if not settings.FIREBASE_STORAGE_BUCKET:
-        if require_init:
-            raise RuntimeError("FIREBASE_STORAGE_BUCKET is required for Firebase Storage")
-        return
+    bucket = (settings.FIREBASE_STORAGE_BUCKET or "").strip()
 
     try:
         cred = fb_credentials.Certificate(info)
-        firebase_admin.initialize_app(cred, {"storageBucket": settings.FIREBASE_STORAGE_BUCKET})
+
+        # bucket이 없어도 Auth용으로 initialize_app 가능
+        if bucket:
+            firebase_admin.initialize_app(cred, {"storageBucket": bucket})
+            print("[Firebase] Admin initialized (with storage bucket).")
+
+        else:
+            firebase_admin.initialize_app(cred)
+            print("[Firebase] Admin initialized (no storage bucket).")
+
         _firebase_initialized = True
-        logger.info("[Firebase] Admin initialized.")
+
     except Exception as e:
         if require_init:
             raise RuntimeError(f"Firebase Admin initialize failed: {e}")
-        logger.exception("[Firebase] init failed (ignored): %s", _sanitize_for_log(repr(e)))
+        print("[Firebase] init failed (ignored):", _sanitize_for_log(repr(e)))
         return
 
 
@@ -677,14 +686,23 @@ def get_bucket():
     if settings.STUB_MODE:
         return _stub_bucket_singleton
 
-    # storage requires firebase init regardless of AUTH_REQUIRED
+    # ✅ Auth와 Storage를 분리: 앱 초기화(=Auth)는 bucket 없이도 가능
     try:
         init_firebase_admin(require_init=True)
     except Exception as e:
         raise HTTPException(status_code=503, detail=_internal_detail(str(e), kind="Firebase init error"))
 
+    bucket = (settings.FIREBASE_STORAGE_BUCKET or "").strip()
+    if not bucket:
+        # Storage가 필요한 API에서만 bucket을 강제
+        raise HTTPException(
+            status_code=503,
+            detail=_internal_detail("FIREBASE_STORAGE_BUCKET is not set", kind="Firebase init error"),
+        )
+
     try:
-        return fb_storage.bucket()
+        # 항상 bucket 이름을 명시해서 app options에 의존하지 않게 한다.
+        return fb_storage.bucket(bucket)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
@@ -1400,7 +1418,7 @@ class OCRItemMapDeactivateRequest(BaseModel):
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.1.21-ops")
+app = FastAPI(title="PetHealth+ Server", version="2.1.22-ops")
 
 # CORS hardening
 _origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
@@ -1461,7 +1479,7 @@ def _shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (v2.1.21-ops)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (v2.1.22-ops)"}
 
 
 @app.get("/api/health")
@@ -1499,7 +1517,7 @@ def health():
 
     return {
         "status": "ok",
-        "version": "2.1.21-ops",
+        "version": "2.1.22-ops",
         "storage": "stub" if settings.STUB_MODE else "firebase",
         "storage_bucket": settings.FIREBASE_STORAGE_BUCKET,
         "receipt_webp_quality": int(settings.RECEIPT_WEBP_QUALITY),
