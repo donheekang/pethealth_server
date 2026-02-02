@@ -452,8 +452,6 @@ def _clean_tags(tags: Any) -> List[str]:
 # Firebase Admin init (Auth/Storage decoupled)
 # =========================================================
 _firebase_initialized = False
-_firebase_init_lock = threading.Lock()
-_firebase_last_init_error: Optional[str] = None
 auth_scheme = HTTPBearer(auto_error=False)
 
 # Stub storage (in-memory) - thread-safe
@@ -540,9 +538,6 @@ _stub_bucket_singleton = _StubBucket(_stub_objects)
 
 
 def _normalize_private_key_newlines(info: dict) -> dict:
-    """Normalize service account private_key newlines.
-    Env에 JSON을 넣을 때 \\n 형태로 들어가는 경우가 많아서 실제 개행으로 복원한다.
-    """
     if not isinstance(info, dict):
         return info
     pk = info.get("private_key")
@@ -551,200 +546,76 @@ def _normalize_private_key_newlines(info: dict) -> dict:
     return info
 
 
-def _normalize_bucket_name(bucket: str) -> str:
-    b = (bucket or "").strip()
-    if b.startswith("gs://"):
-        b = b[len("gs://"):]
-    b = b.strip().strip("/")
-    return b
-
-
-def _strip_wrapping_quotes(s: str) -> str:
-    t = (s or "").strip()
-    # Render 등에서 큰 JSON env가 따옴표로 감싸져 들어가는 경우 방어
-    if (len(t) >= 2) and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
-        t = t[1:-1].strip()
-    return t
-
-
-_RE_B64ISH = re.compile(r"^[A-Za-z0-9_\-]+=*$")
-
-
-def _b64decode_json_text(value: str, *, what: str) -> str:
-    """base64 / urlsafe-base64 -> UTF-8 JSON string.
-    (패딩 빠진 값도 자동 보정)
-    """
-    v = re.sub(r"\s+", "", (value or ""))
-    v = _strip_wrapping_quotes(v)
-    if v.lower().startswith("base64:"):
-        v = v.split(":", 1)[1].strip()
-
-    if not v:
-        raise RuntimeError(f"{what} is empty")
-
-    # padding 보정
-    v = v + ("=" * (-len(v) % 4))
-
-    try:
-        raw = base64.b64decode(v, validate=True)
-    except Exception:
-        try:
-            raw = base64.urlsafe_b64decode(v)
-        except Exception as e2:
-            raise RuntimeError(f"{what} base64 decode failed: {e2}") from e2
-
-    try:
-        return raw.decode("utf-8")
-    except Exception as e:
-        raise RuntimeError(f"{what} decoded bytes are not valid UTF-8: {e}") from e
-
-
-def _load_json_info(text_or_path: str, *, what: str) -> dict:
-    """JSON string or file path -> dict"""
-    v = _strip_wrapping_quotes(text_or_path)
-
-    # 파일 경로면 읽어서 JSON 로드
-    if v and (not v.lstrip().startswith("{")) and os.path.exists(v):
-        try:
-            with open(v, "r", encoding="utf-8") as f:
-                v = f.read()
-        except Exception as e:
-            raise RuntimeError(f"{what} file read failed: {e}") from e
-
-    try:
-        info = json.loads(v)
-    except Exception as e:
-        raise RuntimeError(f"{what} JSON parse failed: {e}") from e
-
-    if not isinstance(info, dict):
-        raise RuntimeError(f"{what} must decode to a JSON object")
-
-    return _normalize_private_key_newlines(info)
-
-
 def _load_firebase_service_account() -> Optional[dict]:
-    """Firebase Admin service account 로딩.
-
-    지원 형태:
-      - FIREBASE_ADMIN_SA_JSON:
-          * JSON 문자열
-          * 파일 경로
-          * base64: 로 시작하는 base64 JSON
-          * 또는 그냥 base64 JSON(길고 b64스러운 문자열)도 시도
-      - FIREBASE_ADMIN_SA_B64:
-          * base64/url-safe-base64 JSON (패딩 없어도 됨)
-    """
-    errors: List[str] = []
-
-    raw_json = _strip_wrapping_quotes(settings.FIREBASE_ADMIN_SA_JSON)
-    raw_b64 = _strip_wrapping_quotes(settings.FIREBASE_ADMIN_SA_B64)
-
-    # 1) FIREBASE_ADMIN_SA_JSON 우선
-    if raw_json:
+    if settings.FIREBASE_ADMIN_SA_JSON:
         try:
-            if raw_json.lstrip().startswith("{"):
-                return _load_json_info(raw_json, what="FIREBASE_ADMIN_SA_JSON")
-
-            # base64:xxxx 형태
-            if raw_json.lower().startswith("base64:"):
-                decoded = _b64decode_json_text(raw_json, what="FIREBASE_ADMIN_SA_JSON")
-                return _load_json_info(decoded, what="FIREBASE_ADMIN_SA_JSON(base64:)")
-
-            # b64처럼 생긴 긴 문자열이면 base64로도 시도 (Render에서 따옴표/개행/패딩 이슈 대비)
-            compact = re.sub(r"\s+", "", raw_json)
-            if _RE_B64ISH.match(compact) and len(compact) > 80:
-                decoded = _b64decode_json_text(compact, what="FIREBASE_ADMIN_SA_JSON(b64ish)")
-                return _load_json_info(decoded, what="FIREBASE_ADMIN_SA_JSON(b64ish)")
-
-            # 파일 경로
-            if os.path.exists(raw_json):
-                return _load_json_info(raw_json, what="FIREBASE_ADMIN_SA_JSON(file)")
-
-            # 마지막 시도: 그냥 JSON 파싱
-            return _load_json_info(raw_json, what="FIREBASE_ADMIN_SA_JSON")
+            info = json.loads(settings.FIREBASE_ADMIN_SA_JSON)
         except Exception as e:
-            errors.append(str(e))
+            raise RuntimeError(f"FIREBASE_ADMIN_SA_JSON JSON parse failed: {e}")
+        return _normalize_private_key_newlines(info)
 
-    # 2) FIREBASE_ADMIN_SA_B64
-    if raw_b64:
+    if settings.FIREBASE_ADMIN_SA_B64:
         try:
-            decoded = _b64decode_json_text(raw_b64, what="FIREBASE_ADMIN_SA_B64")
-            return _load_json_info(decoded, what="FIREBASE_ADMIN_SA_B64")
+            raw = base64.b64decode(settings.FIREBASE_ADMIN_SA_B64).decode("utf-8")
+            info = json.loads(raw)
         except Exception as e:
-            errors.append(str(e))
-
-    if errors:
-        raise RuntimeError(" | ".join(errors))
+            raise RuntimeError(f"FIREBASE_ADMIN_SA_B64 decode/parse failed: {e}")
+        return _normalize_private_key_newlines(info)
 
     return None
 
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
-    """Firebase Admin SDK 초기화 (프로세스 1회).
-
-    - Auth(verify_id_token)는 Admin 초기화가 반드시 필요
-    - Storage bucket은 Auth와 독립 (있으면 옵션으로만 세팅)
     """
-    global _firebase_initialized, _firebase_last_init_error
+    Initialize Firebase Admin SDK.
+
+    ✅ ops-hardening (auth/storage decoupled):
+    - _firebase_initialized는 "실제로 firebase_admin 앱이 존재할 때만" True.
+    - Auth(verify_id_token)에는 Service Account만 필요. (bucket 없어도 초기화 가능)
+    - Storage bucket은 get_bucket()에서 별도로 강제한다.
+    """
+    global _firebase_initialized
 
     if settings.STUB_MODE:
         _firebase_initialized = True
-        _firebase_last_init_error = None
         return
 
+    # 이미 앱이 있으면 OK
     if firebase_admin._apps:
         _firebase_initialized = True
-        _firebase_last_init_error = None
         return
 
-    with _firebase_init_lock:
-        if firebase_admin._apps:
-            _firebase_initialized = True
-            _firebase_last_init_error = None
-            return
+    # 이전 경로에서 플래그만 True가 된 상태 방어
+    if _firebase_initialized and not firebase_admin._apps:
+        _firebase_initialized = False
 
-        try:
-            info = _load_firebase_service_account()
-        except Exception as e:
-            _firebase_last_init_error = str(e)
-            if require_init:
-                raise
-            logger.warning("[Firebase] service account load failed (ignored): %s", _sanitize_for_log(repr(e)))
-            return
+    info = _load_firebase_service_account()
+    if not info:
+        if require_init:
+            raise RuntimeError("Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)")
+        return
 
-        if not info:
-            msg = "Firebase service account missing (set FIREBASE_ADMIN_SA_JSON or FIREBASE_ADMIN_SA_B64)"
-            _firebase_last_init_error = msg
-            if require_init:
-                raise RuntimeError(msg)
-            logger.info("[Firebase] %s", msg)
-            return
+    bucket = (settings.FIREBASE_STORAGE_BUCKET or "").strip()
 
-        try:
-            cred = fb_credentials.Certificate(info)
+    try:
+        cred = fb_credentials.Certificate(info)
 
-            bucket = _normalize_bucket_name(settings.FIREBASE_STORAGE_BUCKET)
-            opts: Dict[str, Any] = {}
-            if bucket:
-                opts["storageBucket"] = bucket
+        # bucket이 없어도 Auth용으로 initialize_app 가능
+        if bucket:
+            firebase_admin.initialize_app(cred, {"storageBucket": bucket})
+            print("[Firebase] Admin initialized (with storage bucket).")
 
-            if opts:
-                firebase_admin.initialize_app(cred, opts)
-            else:
-                firebase_admin.initialize_app(cred)
+        else:
+            firebase_admin.initialize_app(cred)
+            print("[Firebase] Admin initialized (no storage bucket).")
 
-            _firebase_initialized = True
-            _firebase_last_init_error = None
-            logger.info("[Firebase] Admin initialized. bucket=%s", bucket or "(not set)")
+        _firebase_initialized = True
 
-        except Exception as e:
-            _firebase_last_init_error = str(e)
-            if require_init:
-                raise RuntimeError(f"Firebase Admin initialize failed: {e}")
-            logger.warning("[Firebase] init failed (ignored): %s", _sanitize_for_log(repr(e)))
-            return
-
-
+    except Exception as e:
+        if require_init:
+            raise RuntimeError(f"Firebase Admin initialize failed: {e}")
+        print("[Firebase] init failed (ignored):", _sanitize_for_log(repr(e)))
+        return
 
 
 def _maybe_auto_upsert_user(decoded: Dict[str, Any]) -> None:
@@ -1456,7 +1327,10 @@ class HealthRecordUpsertRequest(BaseModel):
     hospital_name: Optional[str] = Field(default=None, alias="hospitalName")
     hospital_mgmt_no: Optional[str] = Field(default=None, alias="hospitalMgmtNo")
 
-    total_amount: Optional[int] = Field(default=0, alias="totalAmount")
+    # totalAmount:
+    # - 클라이언트가 명시적으로 보낸 값이 있으면 그 값을 사용
+    # - 없거나 0이면 items 합계로 자동 계산 (가능할 때)
+    total_amount: Optional[int] = Field(default=None, alias="totalAmount")
     pet_weight_at_visit: Optional[float] = Field(default=None, alias="petWeightAtVisit")
 
     tags: List[str] = Field(default_factory=list)
@@ -2042,20 +1916,67 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
     visit_date = req.visit_date
     hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) and req.hospital_name.strip() else None
     hospital_mgmt_no = req.hospital_mgmt_no.strip() if isinstance(req.hospital_mgmt_no, str) and req.hospital_mgmt_no.strip() else None
+    # Validate totalAmount (optional)
+    total_amount_in: Optional[int] = None
+    if req.total_amount is not None:
+        try:
+            total_amount_in = int(req.total_amount)
+        except Exception:
+            raise HTTPException(status_code=400, detail="totalAmount must be a number")
+        if total_amount_in < 0:
+            raise HTTPException(status_code=400, detail="totalAmount must be >= 0")
 
-    total_amount = int(req.total_amount or 0)
-    if total_amount < 0:
-        raise HTTPException(status_code=400, detail="totalAmount must be >= 0")
+    # Validate petWeightAtVisit (optional)
+    pet_weight_in: Optional[float] = None
+    if req.pet_weight_at_visit is not None:
+        try:
+            pet_weight_in = float(req.pet_weight_at_visit)
+        except Exception:
+            raise HTTPException(status_code=400, detail="petWeightAtVisit must be a number")
+        if pet_weight_in <= 0:
+            raise HTTPException(status_code=400, detail="petWeightAtVisit must be > 0")
 
-    pet_weight_at_visit = float(req.pet_weight_at_visit) if req.pet_weight_at_visit is not None else None
+    # Auto-calc totalAmount from items (when totalAmount missing/0)
+    items_sum = 0
+    has_any_price = False
+    if req.items is not None:
+        for it in req.items:
+            if it.price is not None:
+                try:
+                    p = int(it.price)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="item price must be a number")
+                if p < 0:
+                    raise HTTPException(status_code=400, detail="item price must be >= 0")
+                has_any_price = True
+                items_sum += p
+
     tags = _clean_tags(req.tags)
 
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
-                if not cur.fetchone():
+                cur.execute("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+                pet_row = cur.fetchone()
+                if not pet_row:
                     raise HTTPException(status_code=404, detail="pet not found")
+
+                # default petWeightAtVisit to pets.weight_kg if not provided
+                pet_weight_at_visit = pet_weight_in
+                if pet_weight_at_visit is None:
+                    try:
+                        wkg = pet_row.get("weight_kg")
+                        pet_weight_at_visit = float(wkg) if wkg is not None else None
+                    except Exception:
+                        pet_weight_at_visit = None
+
+                # totalAmount: if missing/0, auto-calc from items sum if possible
+                total_amount = total_amount_in
+                if total_amount is None or total_amount <= 0:
+                    if has_any_price and items_sum > 0:
+                        total_amount = items_sum
+                    else:
+                        total_amount = 0
 
                 cur.execute(
                     """
@@ -2093,7 +2014,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     for it in req.items:
                         item_name = (it.item_name or "").strip()
                         if not item_name:
-                            raise HTTPException(status_code=400, detail="itemName is required")
+                            continue
 
                         price = it.price
                         if price is not None:
@@ -2269,6 +2190,71 @@ def api_record_get(
         raise
 
 
+
+# =========================================================
+# Record delete
+# =========================================================
+@app.delete("/api/db/records/delete")
+def api_record_delete(
+    recordId: str = Query(...),
+    deleteReceiptFile: bool = Query(False),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    record_uuid = _uuid_or_400(recordId, "recordId")
+    receipt_path: Optional[str] = None
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT r.id, r.receipt_image_path
+                    FROM public.health_records r
+                    JOIN public.pets p ON p.id = r.pet_id
+                    WHERE p.user_uid=%s AND r.id=%s
+                    """
+                    ,
+                    (uid, record_uuid),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="record not found")
+                receipt_path = row.get("receipt_image_path")
+
+                cur.execute("DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s", (record_uuid,))
+                candidates_deleted = cur.rowcount or 0
+
+                cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
+                items_deleted = cur.rowcount or 0
+
+                cur.execute("DELETE FROM public.health_records WHERE id=%s", (record_uuid,))
+                records_deleted = cur.rowcount or 0
+                if records_deleted <= 0:
+                    raise HTTPException(status_code=500, detail=_internal_detail("failed to delete record", kind="DB error"))
+
+        receipt_deleted = False
+        if deleteReceiptFile and receipt_path:
+            try:
+                receipt_deleted = delete_storage_object_if_exists(receipt_path)
+            except Exception as e:
+                logger.warning("[RecordDelete] receipt delete failed: %s", _sanitize_for_log(repr(e)))
+
+        return {
+            "ok": True,
+            "recordId": str(record_uuid),
+            "db": {"records": records_deleted, "items": items_deleted, "candidates": candidates_deleted},
+            "receipt": {"requested": bool(deleteReceiptFile), "path": receipt_path, "deleted": bool(receipt_deleted)},
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
 # =========================================================
 # Record -> hospital candidates + confirm
 # =========================================================
@@ -2429,9 +2415,16 @@ def api_receipts_process(
     pet_uuid = _uuid_or_400(petId, "petId")
     record_uuid = _uuid_or_new(recordId, "recordId")
 
-    pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+    pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
+
+    pet_weight_kg: Optional[float] = None
+    try:
+        wkg = pet.get("weight_kg") if isinstance(pet, dict) else None
+        pet_weight_kg = float(wkg) if wkg is not None else None
+    except Exception:
+        pet_weight_kg = None
 
     raw = _read_upload_limited(upload, int(settings.MAX_RECEIPT_IMAGE_BYTES))
     if not raw:
@@ -2456,20 +2449,19 @@ def api_receipts_process(
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     file_size_bytes = int(len(webp_bytes))
-
     visit_date = parsed.get("visitDate")
     hospital_name = parsed.get("hospitalName")
     total_amount = parsed.get("totalAmount")
 
-    vd: date = date.today()
+    vd_from_ocr: Optional[date] = None
     if isinstance(visit_date, str) and visit_date:
         try:
-            vd = datetime.strptime(visit_date, "%Y-%m-%d").date()
+            vd_from_ocr = datetime.strptime(visit_date, "%Y-%m-%d").date()
         except Exception:
-            vd = date.today()
+            vd_from_ocr = None
 
     hn = hospital_name.strip() if isinstance(hospital_name, str) and hospital_name.strip() else None
-    ta = int(total_amount) if isinstance(total_amount, int) and total_amount >= 0 else 0
+    ta_from_ocr: Optional[int] = int(total_amount) if isinstance(total_amount, int) and int(total_amount) > 0 else None
 
     mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
 
@@ -2512,22 +2504,53 @@ def api_receipts_process(
                         raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
                     if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
                         raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
+                # 기존 레코드가 있으면(특히 영수증 교체) visit_date/total_amount/pet_weight_at_visit를 "낮추지 않게" 보호
+                cur.execute(
+                    """
+                    SELECT r.visit_date, r.total_amount, r.pet_weight_at_visit
+                    FROM public.health_records r
+                    JOIN public.pets p ON p.id = r.pet_id
+                    WHERE p.user_uid = %s AND r.id = %s
+                    """,
+                    (uid, record_uuid),
+                )
+                existing = cur.fetchone() or {}
+                existing_total = existing.get("total_amount")
+                existing_visit = existing.get("visit_date")
+                existing_weight = existing.get("pet_weight_at_visit")
+
+                items_sum = 0
+                for it in safe_items:
+                    pr = it.get("price")
+                    if isinstance(pr, int) and pr > 0:
+                        items_sum += pr
+
+                # 후보 총액: OCR totalAmount 우선, 없으면 items 합
+                ta_candidate = int(ta_from_ocr) if ta_from_ocr is not None and int(ta_from_ocr) > 0 else (items_sum if items_sum > 0 else 0)
+
+                vd_final = existing_visit or vd_from_ocr or date.today()
+                ta_final = int(existing_total) if existing_total is not None and int(existing_total) > 0 else int(ta_candidate)
+                w_final = existing_weight if existing_weight is not None else pet_weight_kg
 
                 # record upsert: 확정된 hospital_mgmt_no는 NULL로 덮어쓰지 않게 COALESCE
                 cur.execute(
                     """
                     INSERT INTO public.health_records
-                      (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, tags,
+                      (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
                        receipt_image_path, file_size_bytes)
                     VALUES
-                      (%s, %s, %s, %s, %s, %s, %s,
+                      (%s, %s, %s, %s, %s, %s, %s, %s,
                        %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                       pet_id = EXCLUDED.pet_id,
                       hospital_mgmt_no = COALESCE(EXCLUDED.hospital_mgmt_no, public.health_records.hospital_mgmt_no),
                       hospital_name = COALESCE(public.health_records.hospital_name, EXCLUDED.hospital_name),
-                      visit_date = EXCLUDED.visit_date,
-                      total_amount = EXCLUDED.total_amount,
+                      pet_weight_at_visit = COALESCE(public.health_records.pet_weight_at_visit, EXCLUDED.pet_weight_at_visit),
+                      visit_date = COALESCE(public.health_records.visit_date, EXCLUDED.visit_date),
+                      total_amount = CASE
+                        WHEN COALESCE(public.health_records.total_amount, 0) > 0 THEN public.health_records.total_amount
+                        ELSE EXCLUDED.total_amount
+                      END,
                       receipt_image_path = EXCLUDED.receipt_image_path,
                       file_size_bytes = EXCLUDED.file_size_bytes
                     WHERE EXISTS (
@@ -2535,11 +2558,11 @@ def api_receipts_process(
                       WHERE p.id = EXCLUDED.pet_id AND p.user_uid = %s
                     )
                     RETURNING
-                      id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount,
+                      id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit,
                       receipt_image_path, file_size_bytes,
                       created_at, updated_at
                     """,
-                    (record_uuid, pet_uuid, mgmt_input, hn, vd, ta, [], receipt_path, file_size_bytes, uid),
+                    (record_uuid, pet_uuid, mgmt_input, hn, vd_final, ta_final, w_final, [], receipt_path, file_size_bytes, uid),
                 )
                 row = cur.fetchone()
                 if not row:
