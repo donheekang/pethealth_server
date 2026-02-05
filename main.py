@@ -1,22 +1,16 @@
 # main.py (PetHealth+ Server)
-# Firebase Storage + Signed URL + Migration (fallback) + Snapshot Backup
-# DB schema alignment:
-#   - Soft delete SoT (deleted_at => path NULL + bytes=0) via DB triggers
-#   - No undelete (enforced by DB)
-#   - Quota enforcement via SELECT ... FOR UPDATE on users row (DB triggers call fn_guard_quota_for_user)
+# Firebase Storage + Signed URL + Migration
+# + DB schema aligned with:
+#   - Soft delete SoT (deleted_at => path null/dummy + bytes=0) via triggers
+#   - No undelete
+#   - Quota enforcement via SELECT ... FOR UPDATE on users row (trigger calls fn_guard_quota_for_user)
 #   - Accounting via triggers (users.total_storage_bytes, counts)
-#   - Storage delete jobs enqueued by DB triggers on soft-delete transition
+#   - Storage delete jobs enqueued by triggers on soft-delete transition
 #
-# Tier policy (DB is source of truth):
-#   membership_tier: 'anonymous' | 'free' | 'pro'
-#   effective_tier : 'pro' only when premium_until > now(); else 'free' (NOT anonymous) when membership_tier='pro'
-#
-# Notes:
-# - This server supports link-first auth (UID stays the same). Migration is only used as a fallback.
-# - IMPORTANT: storage_delete_jobs are queued by DB triggers, but actual deletion must be performed by a worker.
-#   This file provides an admin drain endpoint: /api/admin/storage-delete-jobs/drain
-#
-# Version: 2.2.2-ops
+# Architecture:
+#   main.py     : API + DB I/O + pipeline wiring
+#   ocr_policy  : OCR + redaction + receipt parsing -> items/meta (NO tag decision)
+#   tag_policy  : items/text -> standard tag codes (SoT is your ReceiptTag codes)
 
 from __future__ import annotations
 
@@ -338,8 +332,11 @@ def _raise_mapped_db_error(e: Exception) -> None:
     if "Ownership mismatch" in msg or "Hospital access denied" in msg:
         raise HTTPException(status_code=403, detail=msg)
 
-    if "Hard DELETE is blocked" in msg:
-        raise HTTPException(status_code=409, detail="Hard DELETE is blocked. Use soft delete.")
+    if "Candidates not allowed" in msg:
+        raise HTTPException(status_code=409, detail=msg)
+
+    if "Direct update of pets.user_uid is not allowed" in msg:
+        raise HTTPException(status_code=409, detail=msg)
 
     if "violates foreign key constraint" in msg:
         raise HTTPException(status_code=400, detail="Invalid reference (foreign key)")
@@ -351,63 +348,27 @@ def _raise_mapped_db_error(e: Exception) -> None:
     raise HTTPException(status_code=500, detail=_internal_detail(msg, kind="DB error"))
 
 
-def db_has_regproc(signature: str) -> bool:
-    """
-    signature examples:
-      - public.get_effective_tier(text)
-      - public.migrate_user_data(text,text)
-      - public.find_hospital_candidates_weighted(text,text,text,integer)
-    """
-    sig = (signature or "").strip()
-    if not sig:
-        return False
-    try:
-        row = db_fetchone("SELECT to_regprocedure(%s) IS NOT NULL AS ok", (sig,))
-        return bool(row and row.get("ok"))
-    except Exception:
-        return False
-
-
 # =========================================================
 # Auth / membership helpers
 # =========================================================
 def _infer_membership_tier_from_token(decoded: Dict[str, Any]) -> Optional[str]:
-    """
-    anonymous: Firebase Anonymous Auth
-    free     : any non-anonymous provider (google.com, apple.com, password, etc.)
-    pro      : never auto-set here (payments/admin only)
-    """
     fb = decoded.get("firebase") or {}
     if isinstance(fb, dict):
         provider = (fb.get("sign_in_provider") or "").lower()
         if provider == "anonymous":
-            return "anonymous"
+            return "guest"
         if provider:
-            return "free"
+            return "member"
     return None
 
 
 def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict[str, Any]:
-    """
-    users schema:
-      firebase_uid (pk)
-      membership_tier (anonymous/free/pro)
-      premium_until
-      pet_count/record_count/doc_count/total_storage_bytes
-      last_seen_at/updated_at/created_at
-
-    정책:
-      - 기본 anonymous
-      - 자동 업그레이드: desired_tier='free' 이고 현재 tier가 anonymous면 free로 올림
-      - pro는 절대 자동으로 덮어쓰지 않음
-      - write throttle: last_seen_at 갱신은 N초 간격으로만
-    """
     uid = (firebase_uid or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="firebase_uid is empty")
 
     desired = (desired_tier or "").strip().lower() if desired_tier else None
-    if desired not in (None, "anonymous", "free"):
+    if desired not in (None, "guest", "member"):
         desired = None
 
     throttle = int(settings.USER_TOUCH_THROTTLE_SECONDS or 300)
@@ -418,7 +379,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
             cur.execute(
                 """
                 INSERT INTO public.users (firebase_uid, membership_tier)
-                VALUES (%s, COALESCE(%s, 'anonymous'))
+                VALUES (%s, COALESCE(%s, 'guest'))
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     last_seen_at = CASE
                         WHEN COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
@@ -427,12 +388,12 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                         ELSE public.users.last_seen_at
                     END,
                     membership_tier = CASE
-                        WHEN public.users.membership_tier = 'anonymous'
-                             AND COALESCE(%s,'anonymous') = 'free' THEN 'free'
+                        WHEN public.users.membership_tier = 'guest'
+                             AND COALESCE(%s,'guest') = 'member' THEN 'member'
                         ELSE public.users.membership_tier
                     END
                 WHERE
-                    (public.users.membership_tier = 'anonymous' AND COALESCE(%s,'anonymous') = 'free')
+                    (public.users.membership_tier = 'guest' AND COALESCE(%s,'guest') = 'member')
                     OR (COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
                         < now() - (%s * INTERVAL '1 second'))
                 RETURNING
@@ -444,7 +405,6 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
             )
             row = cur.fetchone()
 
-            # conflict + WHERE false면 RETURNING이 비어있을 수 있음 -> SELECT로 보정
             if not row:
                 cur.execute(
                     """
@@ -588,13 +548,6 @@ def _load_firebase_service_account() -> Optional[dict]:
 
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
-    """
-    Initialize Firebase Admin SDK.
-
-    ops-hardening:
-    - _firebase_initialized is True only when firebase_admin app exists.
-    - Auth(verify_id_token) needs service account; bucket can be configured separately.
-    """
     global _firebase_initialized
 
     if settings.STUB_MODE:
@@ -844,19 +797,6 @@ class SignedUrlResponse(BaseModel):
     expiresAt: str
 
 
-class MeSummaryResponse(BaseModel):
-    uid: str
-    membership_tier: str
-    effective_tier: str
-    premium_until: Optional[str]
-    used_bytes: int
-    quota_bytes: int
-    remaining_bytes: int
-    pet_count: int
-    record_count: int
-    doc_count: int
-
-
 class DocumentUploadResponse(BaseModel):
     id: str
     petId: str
@@ -878,27 +818,10 @@ class OCRItemMapDeactivateRequest(BaseModel):
     ocrItemName: str
 
 
-class StorageDeleteJobDrainItem(BaseModel):
-    id: str
-    ownerUid: str
-    path: str
-    status: str
-    deletedFromStorage: bool
-    error: Optional[str] = None
-
-
-class StorageDeleteJobDrainResponse(BaseModel):
-    ok: bool
-    processed: int
-    done: int
-    failed: int
-    items: List[StorageDeleteJobDrainItem]
-
-
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.2.2-ops")
+app = FastAPI(title="PetHealth+ Server", version="2.2.0-ops")
 
 _origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
 _allow_credentials = bool(settings.CORS_ALLOW_CREDENTIALS)
@@ -954,12 +877,9 @@ def _shutdown():
         _db_pool = None
 
 
-# =========================================================
-# Health + Me
-# =========================================================
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (v2.2.2-ops)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (v2.2.0-ops)"}
 
 
 @app.get("/api/health")
@@ -977,7 +897,6 @@ def health():
                 ("candidates", "public.health_record_hospital_candidates"),
                 ("ocr_item_maps", "public.ocr_item_name_maps"),
                 ("migration_tokens", "public.migration_tokens"),
-                ("storage_delete_jobs", "public.storage_delete_jobs"),
             ]
             missing = []
             for _, reg in checks:
@@ -997,22 +916,14 @@ def health():
         "appInitialized": bool(firebase_admin._apps),
     }
 
-    func_checks = {
-        "get_effective_tier": db_has_regproc("public.get_effective_tier(text)"),
-        "get_tier_quota": db_has_regproc("public.get_tier_quota(text)"),
-        "migrate_user_data": db_has_regproc("public.migrate_user_data(text,text)"),
-        "find_hospital_candidates_weighted": db_has_regproc("public.find_hospital_candidates_weighted(text,text,text,integer)"),
-    }
-
     return {
         "status": "ok",
-        "version": "2.2.2-ops",
+        "version": "2.2.0-ops",
         "storage": "stub" if settings.STUB_MODE else "firebase",
         "db_enabled": bool(settings.DB_ENABLED),
         "db_configured": bool(settings.DATABASE_URL),
         "db_schema": db_checks,
         "firebase": fb_check,
-        "functions": func_checks,
         "cors": {"origins": _origins, "allowCredentials": _allow_credentials},
         "modules": {
             "ocr_policy": bool(ocr_policy is not None),
@@ -1032,112 +943,6 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
     except Exception:
         row = None
     return {"uid": uid, "email": user.get("email"), "user": row}
-
-
-def _compute_effective_tier_fallback(membership_tier: str, premium_until: Optional[datetime]) -> str:
-    mt = (membership_tier or "anonymous").strip().lower()
-    if mt == "pro":
-        if premium_until and premium_until > datetime.utcnow().replace(tzinfo=None):
-            return "pro"
-        return "free"
-    if mt in ("anonymous", "free"):
-        return mt
-    return "anonymous"
-
-
-def _quota_fallback(tier: str) -> int:
-    t = (tier or "anonymous").strip().lower()
-    if t == "anonymous":
-        return 50 * 1024 * 1024
-    if t == "free":
-        return 100 * 1024 * 1024
-    if t == "pro":
-        return 2 * 1024 * 1024 * 1024
-    return 50 * 1024 * 1024
-
-
-@app.get("/api/me/summary", response_model=MeSummaryResponse)
-def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
-    uid = (user.get("uid") or "").strip()
-    if not uid:
-        raise HTTPException(status_code=401, detail="missing uid")
-
-    desired = _infer_membership_tier_from_token(user)
-    _ = db_touch_user(uid, desired_tier=desired)
-
-    has_effective = db_has_regproc("public.get_effective_tier(text)")
-    has_quota_fn = db_has_regproc("public.get_tier_quota(text)")
-
-    if has_effective and has_quota_fn:
-        row = db_fetchone(
-            """
-            SELECT
-                firebase_uid,
-                membership_tier,
-                premium_until,
-                pet_count,
-                record_count,
-                doc_count,
-                total_storage_bytes AS used_bytes,
-                public.get_effective_tier(firebase_uid) AS effective_tier,
-                public.get_tier_quota(public.get_effective_tier(firebase_uid)) AS quota_bytes
-            FROM public.users
-            WHERE firebase_uid = %s
-            """,
-            (uid,),
-        )
-    else:
-        # Fallback if DB functions are not installed yet.
-        row = db_fetchone(
-            """
-            SELECT
-                firebase_uid,
-                membership_tier,
-                premium_until,
-                pet_count,
-                record_count,
-                doc_count,
-                total_storage_bytes AS used_bytes
-            FROM public.users
-            WHERE firebase_uid = %s
-            """,
-            (uid,),
-        )
-
-    if not row:
-        raise HTTPException(status_code=500, detail=_internal_detail("user row missing", kind="DB error"))
-
-    used = int(row.get("used_bytes") or 0)
-    membership = str(row.get("membership_tier") or "anonymous")
-
-    pu = row.get("premium_until")
-    premium_until_str = pu.isoformat() if hasattr(pu, "isoformat") and pu is not None else None
-
-    if has_effective and has_quota_fn:
-        effective = str(row.get("effective_tier") or membership)
-        quota = int(row.get("quota_bytes") or 0)
-    else:
-        # compute locally
-        pu_dt: Optional[datetime] = None
-        if isinstance(pu, datetime):
-            pu_dt = pu.replace(tzinfo=None)
-        effective = _compute_effective_tier_fallback(membership, pu_dt)
-        quota = _quota_fallback(effective)
-
-    remaining = max(0, quota - used)
-
-    return {
-        "uid": uid,
-        "membership_tier": membership,
-        "effective_tier": effective,
-        "premium_until": premium_until_str,
-        "used_bytes": used,
-        "quota_bytes": int(quota),
-        "remaining_bytes": int(remaining),
-        "pet_count": int(row.get("pet_count") or 0),
-        "record_count": int(row.get("record_count") or 0),
-        "doc_count": int(row.get("doc_count") or 0),
-    }
 
 
 # =========================================================
@@ -1249,6 +1054,7 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
 
 # =========================================================
 # Hospitals: search + custom create/delete
+# (unchanged conceptually; search SQL can be upgraded later to strict trigger approach)
 # =========================================================
 def _validate_lat_lng(lat: Optional[float], lng: Optional[float]) -> None:
     if lat is not None:
@@ -1486,7 +1292,8 @@ def hospitals_custom_delete(
 
 
 # =========================================================
-# Records + items (active records are deleted_at IS NULL)
+# Records + items
+#   - IMPORTANT: active records are deleted_at IS NULL
 # =========================================================
 @app.post("/api/db/records/upsert")
 def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Depends(get_current_user)):
@@ -1564,7 +1371,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     else:
                         total_amount = 0
 
-                # IMPORTANT: block updates to soft-deleted records
+                # ✅ important: block updates to soft-deleted records
                 cur.execute(
                     """
                     INSERT INTO public.health_records
@@ -1596,6 +1403,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 )
                 row = cur.fetchone()
                 if not row:
+                    # could be "record soft-deleted" or ownership mismatch
                     exists = db_fetchone("SELECT id FROM public.health_records WHERE id=%s", (record_uuid,))
                     if exists:
                         raise HTTPException(status_code=409, detail="record is deleted or not editable")
@@ -1791,7 +1599,7 @@ def api_record_delete(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Soft delete only.
+    ✅ Soft delete only.
     - sets deleted_at=now()
     - trigger enqueues storage delete job (once) using OLD path
     - trigger enforces SoT: receipt_image_path NULL, file_size_bytes=0
@@ -1840,7 +1648,7 @@ def api_record_delete(
             "ok": True,
             "recordId": str(record_uuid),
             "softDeleted": True,
-            "oldReceiptPath": old_path,
+            "oldReceiptPath": old_path,  # 참고용
             "storageDeletion": "queued_by_trigger",
         }
 
@@ -1997,6 +1805,7 @@ def api_receipts_process(
     recordId: Optional[str] = Form(None),
     hospitalMgmtNo: Optional[str] = Form(None),
     replaceItems: bool = Form(True),
+    # optional future: replaceTags: bool = Form(False),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
     user: Dict[str, Any] = Depends(get_current_user),
@@ -2042,6 +1851,7 @@ def api_receipts_process(
             receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
             receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
             image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
+            # redact_mode="minimal"  # (우리가 다음 단계에서 고정할 것)
         )
     except HTTPException:
         raise
@@ -2100,10 +1910,12 @@ def api_receipts_process(
         tag_result = tag_policy.resolve_record_tags(  # type: ignore
             items=safe_items,
             hospital_name=hn,
+            # future: allow passing raw text / extra hints
         )
         resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
         tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
     except Exception as e:
+        # Tagging failure shouldn't block receipt saving; degrade gracefully
         resolved_tags = []
         tag_evidence = None
         logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
@@ -2162,7 +1974,7 @@ def api_receipts_process(
                 ta_final = int(existing_total) if existing_total is not None and int(existing_total) > 0 else int(ta_candidate)
                 w_final = existing_weight if existing_weight is not None else pet_weight_kg
 
-                # tags policy:
+                # ✅ tags policy:
                 # - if user already has tags, keep them (do not override)
                 # - else apply resolved tags
                 tags_final = existing_tags if len(existing_tags) > 0 else resolved_tags
@@ -2220,12 +2032,10 @@ def api_receipts_process(
                             (record_uuid, it["itemName"], it.get("price"), it.get("categoryTag")),
                         )
 
-                # hospital candidates (only if record not confirmed) — OPTIONAL
+                # hospital candidates (only if record not confirmed)
                 candidates_out: List[Dict[str, Any]] = []
                 record_confirmed = row.get("hospital_mgmt_no") is not None
-
-                has_cand_fn = db_has_regproc("public.find_hospital_candidates_weighted(text,text,text,integer)")
-                if (not record_confirmed) and has_cand_fn:
+                if not record_confirmed:
                     limit_n = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
                     limit_n = max(1, min(limit_n, 10))
 
@@ -2303,6 +2113,7 @@ def api_receipts_process(
                 return jsonable_encoder(payload)
 
     except HTTPException as he:
+        # DB 실패 시 업로드 파일 정리 시도(즉시)
         try:
             delete_storage_object_if_exists(receipt_path)
         except Exception:
@@ -2488,10 +2299,10 @@ def delete_pdf_document(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Soft delete only.
+    ✅ Soft delete only.
     - sets deleted_at=now()
     - trigger enqueues storage delete job using OLD path
-    - trigger sets bytes=0 and path NULL per schema policy
+    - trigger sets bytes=0 and path dummy/null per schema policy
     """
     uid = (user.get("uid") or "").strip()
     doc_uuid = _uuid_or_400(docId, "docId")
@@ -2671,7 +2482,7 @@ def storage_signed_url(
 
 
 # =========================================================
-# Backup endpoints (Snapshot storage)
+# Backup endpoints
 # =========================================================
 @app.post("/api/backup/upload", response_model=BackupUploadResponse)
 def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = Depends(get_current_user)):
@@ -2712,6 +2523,44 @@ def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = D
     return {"ok": True, "uid": uid, "backupId": backup_id, "objectPath": path, "createdAt": created_at}
 
 
+@app.get("/api/backup/list")
+def backup_list(user: Dict[str, Any] = Depends(get_current_user)):
+    uid = (user.get("uid") or "unknown").strip()
+    prefix = _backup_prefix(uid) + "/"
+    b = get_bucket()
+    out = []
+    for blob in b.list_blobs(prefix=prefix):
+        if not blob.name.endswith(".json"):
+            continue
+        bid = os.path.splitext(os.path.basename(blob.name))[0]
+        out.append(
+            {
+                "backupId": bid,
+                "objectPath": blob.name,
+                "lastModified": blob.updated.isoformat() if getattr(blob, "updated", None) else None,
+                "size": int(getattr(blob, "size", 0) or 0),
+            }
+        )
+    out.sort(key=lambda x: x.get("lastModified") or "", reverse=True)
+    return out
+
+
+@app.get("/api/backup/get")
+def backup_get(backupId: str = Query(...), user: Dict[str, Any] = Depends(get_current_user)):
+    uid = (user.get("uid") or "unknown").strip()
+    bid = (backupId or "").strip()
+    if not bid:
+        raise HTTPException(status_code=400, detail="backupId is required")
+    path = f"{_backup_prefix(uid)}/{bid}.json"
+
+    b = get_bucket()
+    blob = b.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="backup not found")
+    raw = blob.download_as_bytes()
+    return json.loads(raw.decode("utf-8"))
+
+
 @app.get("/api/backup/latest")
 def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
     uid = (user.get("uid") or "unknown").strip()
@@ -2730,7 +2579,7 @@ def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # =========================================================
-# Migration tokens + migration execution (fallback)
+# Migration tokens + migration execution
 # =========================================================
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -2850,13 +2699,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         )
         return {"ok": True, "oldUid": old_uid, "newUid": new_uid, "copied": 0, "deleted": 0, "dbUpdated": False, "warnings": ["oldUid == newUid (no-op)"]}
 
-    # Make sure DB RPC exists; otherwise migration should be disabled in prod.
-    if not db_has_regproc("public.migrate_user_data(text,text)"):
-        raise HTTPException(
-            status_code=503,
-            detail="DB function public.migrate_user_data(text,text) is missing. Install DB RPC before using migration fallback.",
-        )
-
     db_execute(
         """
         UPDATE public.migration_tokens
@@ -2872,7 +2714,6 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         db_execute("UPDATE public.migration_tokens SET status='failed' WHERE code_hash=%s", (code_hash,))
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage copy failed"))
 
-    # DB-side migration: should handle rollups + path rewrite + job merge safely
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2915,7 +2756,7 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
 
 
 # =========================================================
-# OCR ItemName Map APIs
+# OCR ItemName Map APIs (unchanged)
 # =========================================================
 @app.get("/api/ocr/item-maps/list")
 def list_item_maps(
@@ -3123,6 +2964,109 @@ def deactivate_custom_item_map(req: OCRItemMapDeactivateRequest, user: Dict[str,
         raise
 
 
+@app.post("/api/admin/ocr/item-maps/global/upsert")
+def admin_upsert_global_item_map(req: OCRItemMapUpsertRequest, admin: Dict[str, Any] = Depends(get_admin_user)):
+    ocr_name = (req.ocrItemName or "").strip()
+    canonical = (req.canonicalName or "").strip()
+    is_active = bool(req.isActive) if req.isActive is not None else True
+
+    if not ocr_name:
+        raise HTTPException(status_code=400, detail="ocrItemName is required")
+    if not canonical:
+        raise HTTPException(status_code=400, detail="canonicalName is required")
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    UPDATE public.ocr_item_name_maps
+                    SET canonical_name=%s, is_active=%s
+                    WHERE
+                        is_custom_entry=false
+                        AND is_active=true
+                        AND lower(ocr_item_name)=lower(%s)
+                    RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+                    """,
+                    (canonical, is_active, ocr_name),
+                )
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "id": str(row["id"]),
+                        "ocrItemName": row["ocr_item_name"],
+                        "canonicalName": row["canonical_name"],
+                        "isActive": bool(row["is_active"]),
+                        "isCustomEntry": False,
+                        "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                    }
+
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM public.ocr_item_name_maps
+                    WHERE
+                        is_custom_entry=false
+                        AND is_active=false
+                        AND lower(ocr_item_name)=lower(%s)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (ocr_name,),
+                )
+                inactive = cur.fetchone()
+                if inactive:
+                    cur.execute(
+                        """
+                        UPDATE public.ocr_item_name_maps
+                        SET canonical_name=%s, is_active=%s
+                        WHERE id=%s
+                        RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+                        """,
+                        (canonical, is_active, inactive["id"]),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            "id": str(row["id"]),
+                            "ocrItemName": row["ocr_item_name"],
+                            "canonicalName": row["canonical_name"],
+                            "isActive": bool(row["is_active"]),
+                            "isCustomEntry": False,
+                            "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                        }
+
+                cur.execute(
+                    """
+                    INSERT INTO public.ocr_item_name_maps
+                        (ocr_item_name, canonical_name, is_active, is_custom_entry, created_by_uid)
+                    VALUES
+                        (%s, %s, %s, false, NULL)
+                    RETURNING id, ocr_item_name, canonical_name, is_active, created_at, updated_at
+                    """,
+                    (ocr_name, canonical, is_active),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=500, detail=_internal_detail("failed to upsert global item map", kind="DB error"))
+                return {
+                    "id": str(row["id"]),
+                    "ocrItemName": row["ocr_item_name"],
+                    "canonicalName": row["canonical_name"],
+                    "isActive": bool(row["is_active"]),
+                    "isCustomEntry": False,
+                    "updatedAt": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _raise_mapped_db_error(e)
+        raise
+
+
+# =========================================================
+# Admin overview
+# =========================================================
 @app.get("/api/admin/overview")
 def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
     # total (including deleted)
@@ -3147,136 +3091,5 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
         "totalAmountSum_active": int(total_amount["s"]),
         "updatedAt": datetime.utcnow().isoformat() + "Z",
     }
-
-
-# =========================================================
-# Admin: Drain storage_delete_jobs (worker-lite)
-# =========================================================
-@app.post("/api/admin/storage-delete-jobs/drain", response_model=StorageDeleteJobDrainResponse)
-def admin_storage_delete_jobs_drain(
-    limit: int = Query(50, ge=1, le=200),
-    requeueStaleRunningSeconds: int = Query(0, ge=0, le=86400),
-    admin: Dict[str, Any] = Depends(get_admin_user),
-):
-    """
-    Drain queued/failed storage_delete_jobs and delete objects from storage.
-
-    - Reserves up to `limit` jobs using FOR UPDATE SKIP LOCKED.
-    - Marks them running, then attempts deletion from Firebase Storage.
-    - Updates status to done/failed accordingly.
-
-    Optional:
-    - requeueStaleRunningSeconds > 0 will requeue "running" jobs whose updated_at is older than the threshold.
-      (useful if a previous drain crashed mid-flight)
-    """
-    items: List[StorageDeleteJobDrainItem] = []
-
-    # Optional: requeue stale running jobs
-    if requeueStaleRunningSeconds and int(requeueStaleRunningSeconds) > 0:
-        try:
-            db_execute(
-                """
-                UPDATE public.storage_delete_jobs
-                SET status='queued', updated_at=now()
-                WHERE status='running'
-                  AND updated_at < now() - (%s * INTERVAL '1 second')
-                """,
-                (int(requeueStaleRunningSeconds),),
-            )
-        except Exception as e:
-            logger.warning("[Drain] requeue stale failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
-
-    # Reserve jobs -> mark running
-    reserved: List[Dict[str, Any]] = []
-    try:
-        with db_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    WITH next AS (
-                        SELECT id
-                        FROM public.storage_delete_jobs
-                        WHERE status IN ('queued','failed')
-                        ORDER BY updated_at ASC
-                        LIMIT %s
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE public.storage_delete_jobs j
-                    SET status='running', updated_at=now()
-                    FROM next
-                    WHERE j.id = next.id
-                    RETURNING j.id, j.owner_uid, j.path, j.status, j.attempt_count
-                    """,
-                    (int(limit),),
-                )
-                reserved = [dict(r) for r in (cur.fetchall() or [])]
-    except Exception as e:
-        _raise_mapped_db_error(e)
-        raise
-
-    done_cnt = 0
-    fail_cnt = 0
-
-    for j in reserved:
-        jid = str(j.get("id"))
-        owner_uid = str(j.get("owner_uid") or "")
-        path = str(j.get("path") or "")
-
-        deleted_ok = False
-        err: Optional[str] = None
-        try:
-            deleted_ok = delete_storage_object_if_exists(path)
-        except Exception as e:
-            deleted_ok = False
-            err = _pg_message(e)
-
-        # Update job row
-        try:
-            if deleted_ok:
-                db_execute(
-                    """
-                    UPDATE public.storage_delete_jobs
-                    SET status='done', last_error=NULL, updated_at=now()
-                    WHERE id=%s
-                    """,
-                    (_uuid_or_400(jid, "id"),),
-                )
-                done_cnt += 1
-            else:
-                db_execute(
-                    """
-                    UPDATE public.storage_delete_jobs
-                    SET status='failed',
-                        attempt_count = COALESCE(attempt_count,0) + 1,
-                        last_error=%s,
-                        updated_at=now()
-                    WHERE id=%s
-                    """,
-                    (err or "delete failed or object not found", _uuid_or_400(jid, "id")),
-                )
-                fail_cnt += 1
-        except Exception as e:
-            # If DB update fails, still return something useful
-            fail_cnt += 1
-            err = err or _pg_message(e)
-
-        items.append(
-            StorageDeleteJobDrainItem(
-                id=jid,
-                ownerUid=owner_uid,
-                path=path,
-                status="done" if deleted_ok else "failed",
-                deletedFromStorage=bool(deleted_ok),
-                error=None if deleted_ok else (err or "delete failed or object not found"),
-            )
-        )
-
-    return StorageDeleteJobDrainResponse(
-        ok=True,
-        processed=len(reserved),
-        done=done_cnt,
-        failed=fail_cnt,
-        items=items,
-    )
 
 
