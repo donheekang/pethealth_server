@@ -1839,7 +1839,7 @@ def api_receipts_process(
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
-    # 1) OCR + minimal redaction + parse (module)
+       # 1) OCR + minimal redaction + parse (module)
     _require_module(ocr_policy, "ocr_policy")
     try:
         webp_bytes, parsed, hints = ocr_policy.process_receipt(  # type: ignore
@@ -1851,21 +1851,31 @@ def api_receipts_process(
             receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
             receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
             image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
-            # redact_mode="minimal"  # (우리가 다음 단계에서 고정할 것)
         )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
+        eid = _new_error_id()
 
-    # 2) upload redacted webp to storage
-    receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
-    try:
-        upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
+        # ✅ stack trace까지 찍히게
+        logger.exception(
+            "[ERR:%s] ocr_policy.process_receipt failed (ct=%s size=%d bytes)",
+            eid,
+            getattr(upload, "content_type", None),
+            len(raw),
+        )
+
+        # ✅ 클라이언트에 “타입” 정도는 보여주기 (민감정보 없이)
+        # (EXPOSE_ERROR_DETAILS=true면 메시지까지 보여주게)
+        if settings.EXPOSE_ERROR_DETAILS:
+            detail = f"Receipt processing failed: {type(e).__name__}: {e} (errorId={eid})"
+        else:
+            detail = f"Receipt processing failed ({type(e).__name__}) (errorId={eid})"
+
+        raise HTTPException(status_code=500, detail=detail)
+
+
+
 
     file_size_bytes = int(len(webp_bytes))
 
