@@ -1925,16 +1925,6 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
         raise
 
 
-# =========================================================
-# Receipts (SYNC handler)
-#   - OCR/Redaction is in ocr_policy
-#   - Tag decision is in tag_policy
-# =========================================================
-# =========================================================
-# Receipts (SYNC handler)
-#   - OCR/Redaction is in ocr_policy
-#   - Tag decision is in tag_policy
-# =========================================================
 @app.post("/api/receipts/process")
 def api_receipts_process(
     petId: str = Form(...),
@@ -1947,6 +1937,8 @@ def api_receipts_process(
 ):
     # ---- local helpers (copy/paste safe) ----
     _AMOUNT_RE = re.compile(r"([0-9][0-9,]*)")
+    _MONEY_TOKEN_RE = re.compile(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,}")  # 30,000 or 30000+
+    _DATE_RE = re.compile(r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b")
 
     _NOISE_TOKENS = [
         "고객", "고객번호", "고객 번호",
@@ -1992,6 +1984,13 @@ def api_receipts_process(
             return True
         low = n.lower()
 
+        # 날짜만 있는 라인 등 제거 (OCR 전체 텍스트 fallback에서 중요)
+        if _DATE_RE.search(n):
+            # "날짜: 2025-11-28" 같은 건 토큰으로 걸러지지만
+            # "2025-11-28" 단독 라인 같은 것 방지
+            if len(_norm_key(n)) <= 10:
+                return True
+
         # 너무 짧은 단어는 제외 (오탐 방지)
         if len(_norm_key(n)) < 2:
             return True
@@ -2003,22 +2002,76 @@ def api_receipts_process(
         return False
 
     def _extract_item_name(it: Dict[str, Any]) -> str:
-        for k in ("itemName", "item_name", "name", "desc", "description", "label"):
+        for k in ("itemName", "item_name", "name", "desc", "description", "label", "text"):
             v = it.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return ""
 
+    def _clean_item_name_from_line(line: str) -> str:
+        s = (line or "").strip()
+        if not s:
+            return ""
+        # 앞쪽 불릿/별 제거
+        s = re.sub(r"^[\*\-\•\·\+]+", "", s).strip()
+
+        # "Rabbies 30,000 1 30,000" 같은 테이블 로우는
+        # 첫 '금액처럼 보이는' 토큰 앞까지만 이름으로 사용
+        m = _MONEY_TOKEN_RE.search(s)
+        if m:
+            left = s[:m.start()].strip()
+            if len(_norm_key(left)) >= 2:
+                s = left
+
+        return s.strip()
+
+    def _guess_price_from_text(line: str) -> Optional[int]:
+        s = (line or "").strip()
+        if not s:
+            return None
+
+        # 1) "30,000원" 우선
+        m_won = re.findall(r"([0-9][0-9,]*)\s*원", s)
+        cand = []
+        for x in m_won:
+            n = _coerce_amount_int(x)
+            if isinstance(n, int) and n >= 100:
+                cand.append(n)
+        if cand:
+            return max(cand)
+
+        # 2) 그 외 숫자들 중 '금액처럼 보이는' 최대값
+        m_all = _AMOUNT_RE.findall(s)
+        nums: List[int] = []
+        for x in m_all:
+            n = _coerce_amount_int(x)
+            if isinstance(n, int) and n >= 100:
+                nums.append(n)
+        if not nums:
+            return None
+        return max(nums)
+
     def _parse_date_flex(s: str) -> Optional[date]:
         ss = (s or "").strip()
         if not ss:
             return None
-        # 흔한 포맷들 대응
         for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%y-%m-%d", "%y.%m.%d", "%y/%m/%d"):
             try:
                 return datetime.strptime(ss, fmt).date()
             except Exception:
                 pass
+        return None
+
+    def _pick_first(d: Dict[str, Any], keys: List[str]) -> Any:
+        for k in keys:
+            v = d.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            if isinstance(v, list) and len(v) == 0:
+                continue
+            return v
         return None
 
     # ---- original logic ----
@@ -2034,7 +2087,7 @@ def api_receipts_process(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(petId, "petId")
-    record_uuid = _uuid_or_new(recordId, "recordId")  # keep backward-compat (recordId optional)
+    record_uuid = _uuid_or_new(recordId, "recordId")
 
     pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
@@ -2051,7 +2104,6 @@ def api_receipts_process(
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
-    # 1) OCR + minimal redaction + parse (module)
     _require_module(ocr_policy, "ocr_policy")
     try:
         webp_bytes, parsed, hints = ocr_policy.process_receipt(  # type: ignore
@@ -2069,7 +2121,6 @@ def api_receipts_process(
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
 
-    # 2) upload redacted webp to storage
     receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
         upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
@@ -2080,40 +2131,46 @@ def api_receipts_process(
 
     file_size_bytes = int(len(webp_bytes))
 
-    # ✅ parsed 키가 달라도 최대한 살려서 읽기
+    # ✅ parsed 키/중첩 구조가 달라도 최대한 살려서 읽기
     visit_date_raw = None
     hospital_name_raw = None
     total_amount_raw = None
     items_raw = None
+    ocr_text = None
 
+    roots: List[Dict[str, Any]] = []
     if isinstance(parsed, dict):
-        visit_date_raw = (
-            parsed.get("visitDate")
-            or parsed.get("visit_date")
-            or parsed.get("date")
-            or parsed.get("visitedAt")
-        )
-        hospital_name_raw = (
-            parsed.get("hospitalName")
-            or parsed.get("hospital_name")
-            or parsed.get("hospital")
-            or parsed.get("clinicName")
-        )
-        total_amount_raw = (
-            parsed.get("totalAmount")
-            or parsed.get("total_amount")
-            or parsed.get("amountTotal")
-            or parsed.get("grandTotal")
-            or parsed.get("total")
-        )
-        items_raw = (
-            parsed.get("items")
-            or parsed.get("lineItems")
-            or parsed.get("line_items")
-            or parsed.get("rows")
-        )
+        roots.append(parsed)
+        for k in ("parsed", "receipt", "data", "result"):
+            v = parsed.get(k)
+            if isinstance(v, dict):
+                roots.append(v)
 
-    extracted_items = items_raw if isinstance(items_raw, list) else []
+    for r in roots:
+        if visit_date_raw is None:
+            visit_date_raw = _pick_first(r, ["visitDate", "visit_date", "date", "visitedAt"])
+        if hospital_name_raw is None:
+            hospital_name_raw = _pick_first(r, ["hospitalName", "hospital_name", "hospital", "clinicName"])
+        if total_amount_raw is None:
+            total_amount_raw = _pick_first(r, ["totalAmount", "total_amount", "amountTotal", "grandTotal", "total"])
+        if items_raw is None:
+            items_raw = _pick_first(r, ["items", "lineItems", "line_items", "rows", "rowItems", "details"])
+        if ocr_text is None:
+            ocr_text = _pick_first(r, ["text", "fullText", "rawText", "ocrText", "redactedText", "receiptText"])
+
+    extracted_items: List[Any] = items_raw if isinstance(items_raw, list) else []
+
+    # ✅ items가 없으면 lines류라도 잡아보기
+    if not extracted_items:
+        for r in roots:
+            lines_raw = _pick_first(r, ["lines", "textLines", "ocrLines", "rawLines", "lineTexts"])
+            if isinstance(lines_raw, list) and lines_raw:
+                extracted_items = lines_raw
+                break
+
+    # ✅ 그것도 없으면 OCR 전체 텍스트를 라인으로 쪼개서 후보로 사용
+    if (not extracted_items) and isinstance(ocr_text, str) and ocr_text.strip():
+        extracted_items = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
 
     vd_from_ocr: Optional[date] = None
     if isinstance(visit_date_raw, str):
@@ -2127,43 +2184,61 @@ def api_receipts_process(
 
     mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
 
-    # normalize items (safe) ✅ 키/금액 문자열/노이즈 대응
+    # ✅ normalize items: dict + str 둘 다 지원
     safe_items: List[Dict[str, Any]] = []
-    for it in extracted_items[:120]:
-        if not isinstance(it, dict):
+    for it in extracted_items[:250]:
+        nm = ""
+        raw_price = None
+        ct = None
+
+        if isinstance(it, dict):
+            nm = _extract_item_name(it)
+            raw_price = it.get("price")
+            if raw_price is None:
+                raw_price = it.get("amount") or it.get("value") or it.get("total")
+            ct = it.get("categoryTag")
+            if ct is None:
+                ct = it.get("category_tag")
+
+        elif isinstance(it, str):
+            nm = it.strip()
+
+        else:
             continue
 
-        nm = _extract_item_name(it)
         if not nm:
             continue
-        if _is_noise_line(nm):
+
+        # str 라인은 "Rabbies 30,000 1 30,000" 같은 경우가 많으니 이름만 정리
+        nm_clean = _clean_item_name_from_line(nm)
+        if not nm_clean:
             continue
 
-        # price 키 다양성 대응
-        raw_price = it.get("price")
-        if raw_price is None:
-            raw_price = it.get("amount") or it.get("value")
+        if _is_noise_line(nm_clean):
+            continue
 
         pr = _coerce_amount_int(raw_price)
+        if pr is None:
+            # 라인에서 직접 가격 추측
+            pr = _guess_price_from_text(nm)
+
         if pr is not None and pr < 0:
             pr = None
 
-        # ✅ 아주 작은 금액은 OCR 쓰레기일 확률 높음 (9원/58원 등)
+        # 너무 작은 금액 제거 (9원/58원 등 OCR 쓰레기)
         if pr is not None and pr < 100:
             continue
 
-        ct = it.get("categoryTag")
-        if ct is None:
-            ct = it.get("category_tag")
+        safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-        safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": ct})
-
-    # 3) resolve record tags (module, your standard codes)
+    # 3) resolve record tags
     _require_module(tag_policy, "tag_policy")
     try:
+        # ✅ ocr_text도 넘겨두면(tag_policy가 원하면 사용) items가 빈 케이스에 도움됨
         tag_result = tag_policy.resolve_record_tags(  # type: ignore
             items=safe_items,
             hospital_name=hn,
+            ocr_text=(ocr_text[:4000] if isinstance(ocr_text, str) else None),
         )
         resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
         tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
@@ -2181,29 +2256,32 @@ def api_receipts_process(
                 for r in rows:
                     if not isinstance(r, dict):
                         continue
-                    nm = (r.get("itemName") or "").strip()
-                    ct = (r.get("categoryTag") or "").strip()
-                    if nm and ct:
-                        item_tag_map[_norm_key(nm)] = ct
+                    nm2 = (r.get("itemName") or "").strip()
+                    ct2 = (r.get("categoryTag") or "").strip()
+                    if nm2 and ct2:
+                        item_tag_map[_norm_key(nm2)] = ct2
     except Exception:
         item_tag_map = {}
 
     for it in safe_items:
         if not it.get("categoryTag"):
-            ct = item_tag_map.get(_norm_key(it.get("itemName") or ""))
-            if ct:
-                it["categoryTag"] = ct
+            ct2 = item_tag_map.get(_norm_key(it.get("itemName") or ""))
+            if ct2:
+                it["categoryTag"] = ct2
 
-    # ✅ items에 가격이 하나도 없는데 totalAmount는 있으면 fallback item 추가 (iOS 합계 0원 방지)
+    # ✅ 가격이 하나도 없으면: (1) 항목 1개면 그 항목에 total을 넣고, (2) 항목이 없으면 fallback 추가
     has_any_price = any(isinstance(x.get("price"), int) and int(x.get("price")) > 0 for x in safe_items)
     if (not has_any_price) and (ta_from_ocr is not None) and (ta_from_ocr >= 100):
-        safe_items.append(
-            {
-                "itemName": "진료비",
-                "price": int(ta_from_ocr),
-                "categoryTag": (resolved_tags[0] if resolved_tags else None),
-            }
-        )
+        if len(safe_items) == 1 and safe_items[0].get("price") is None:
+            safe_items[0]["price"] = int(ta_from_ocr)
+        elif len(safe_items) == 0:
+            safe_items.append(
+                {
+                    "itemName": "진료비",
+                    "price": int(ta_from_ocr),
+                    "categoryTag": (resolved_tags[0] if resolved_tags else "checkup_general"),
+                }
+            )
 
     # hints
     addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
@@ -2259,9 +2337,6 @@ def api_receipts_process(
                 ta_final = int(existing_total) if existing_total is not None and int(existing_total) > 0 else int(ta_candidate)
                 w_final = existing_weight if existing_weight is not None else pet_weight_kg
 
-                # tags policy:
-                # - if user already has tags, keep them (do not override)
-                # - else apply resolved tags
                 tags_final = existing_tags if len(existing_tags) > 0 else resolved_tags
 
                 cur.execute(
@@ -2406,7 +2481,7 @@ def api_receipts_process(
                 payload["hospitalCandidates"] = candidates_out
                 payload["hospitalCandidateCount"] = len(candidates_out)
                 payload["hospitalConfirmed"] = bool(payload.get("hospital_mgmt_no"))
-                payload["tagEvidence"] = tag_evidence  # debug/admin용 (원하면 나중에 숨김)
+                payload["tagEvidence"] = tag_evidence
                 return jsonable_encoder(payload)
 
     except HTTPException as he:
@@ -2423,9 +2498,6 @@ def api_receipts_process(
             pass
         _raise_mapped_db_error(e)
         raise
-
-
-
 
 
 # =========================================================
