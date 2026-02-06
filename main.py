@@ -1930,6 +1930,11 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
 #   - OCR/Redaction is in ocr_policy
 #   - Tag decision is in tag_policy
 # =========================================================
+# =========================================================
+# Receipts (SYNC handler)
+#   - OCR/Redaction is in ocr_policy
+#   - Tag decision is in tag_policy
+# =========================================================
 @app.post("/api/receipts/process")
 def api_receipts_process(
     petId: str = Form(...),
@@ -1940,6 +1945,83 @@ def api_receipts_process(
     image: Optional[UploadFile] = File(None),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
+    # ---- local helpers (copy/paste safe) ----
+    _AMOUNT_RE = re.compile(r"([0-9][0-9,]*)")
+
+    _NOISE_TOKENS = [
+        "고객", "고객번호", "고객 번호",
+        "발행", "발행일", "발행 일",
+        "사업자", "사업자등록", "대표", "전화", "주소",
+        "serial", "sign", "승인", "카드", "현금",
+        "부가세", "vat", "면세", "과세", "공급가",
+        "소계", "합계", "총액", "총 금액", "총금액", "청구", "결제",
+    ]
+
+    def _coerce_amount_int(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, bool):  # bool is subclass of int
+            return None
+        if isinstance(v, int):
+            return int(v)
+        if isinstance(v, float):
+            try:
+                return int(v)
+            except Exception:
+                return None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            m = _AMOUNT_RE.search(s.replace(" ", ""))
+            if not m:
+                return None
+            num = m.group(1).replace(",", "")
+            try:
+                return int(num)
+            except Exception:
+                return None
+        return None
+
+    def _norm_key(s: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z가-힣]", "", (s or "").lower())
+
+    def _is_noise_line(name: str) -> bool:
+        n = (name or "").strip()
+        if not n:
+            return True
+        low = n.lower()
+
+        # 너무 짧은 단어는 제외 (오탐 방지)
+        if len(_norm_key(n)) < 2:
+            return True
+
+        for t in _NOISE_TOKENS:
+            if t in n or t in low:
+                return True
+
+        return False
+
+    def _extract_item_name(it: Dict[str, Any]) -> str:
+        for k in ("itemName", "item_name", "name", "desc", "description", "label"):
+            v = it.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    def _parse_date_flex(s: str) -> Optional[date]:
+        ss = (s or "").strip()
+        if not ss:
+            return None
+        # 흔한 포맷들 대응
+        for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%y-%m-%d", "%y.%m.%d", "%y/%m/%d"):
+            try:
+                return datetime.strptime(ss, fmt).date()
+            except Exception:
+                pass
+        return None
+
+    # ---- original logic ----
     upload = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail="file/image is required")
@@ -1998,54 +2080,163 @@ def api_receipts_process(
 
     file_size_bytes = int(len(webp_bytes))
 
-    visit_date = parsed.get("visitDate")
-    hospital_name = parsed.get("hospitalName")
-    total_amount = parsed.get("totalAmount")
-    extracted_items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
+    # ✅ parsed 키가 달라도 최대한 살려서 읽기
+    visit_date_raw = None
+    hospital_name_raw = None
+    total_amount_raw = None
+    items_raw = None
+
+    if isinstance(parsed, dict):
+        visit_date_raw = (
+            parsed.get("visitDate")
+            or parsed.get("visit_date")
+            or parsed.get("date")
+            or parsed.get("visitedAt")
+        )
+        hospital_name_raw = (
+            parsed.get("hospitalName")
+            or parsed.get("hospital_name")
+            or parsed.get("hospital")
+            or parsed.get("clinicName")
+        )
+        total_amount_raw = (
+            parsed.get("totalAmount")
+            or parsed.get("total_amount")
+            or parsed.get("amountTotal")
+            or parsed.get("grandTotal")
+            or parsed.get("total")
+        )
+        items_raw = (
+            parsed.get("items")
+            or parsed.get("lineItems")
+            or parsed.get("line_items")
+            or parsed.get("rows")
+        )
+
+    extracted_items = items_raw if isinstance(items_raw, list) else []
 
     vd_from_ocr: Optional[date] = None
-    if isinstance(visit_date, str) and visit_date:
-        try:
-            vd_from_ocr = datetime.strptime(visit_date, "%Y-%m-%d").date()
-        except Exception:
-            vd_from_ocr = None
+    if isinstance(visit_date_raw, str):
+        vd_from_ocr = _parse_date_flex(visit_date_raw)
 
-    hn = hospital_name.strip() if isinstance(hospital_name, str) and hospital_name.strip() else None
-    ta_from_ocr: Optional[int] = int(total_amount) if isinstance(total_amount, int) and int(total_amount) > 0 else None
+    hn = hospital_name_raw.strip() if isinstance(hospital_name_raw, str) and hospital_name_raw.strip() else None
+
+    ta_from_ocr: Optional[int] = _coerce_amount_int(total_amount_raw)
+    if ta_from_ocr is not None and ta_from_ocr <= 0:
+        ta_from_ocr = None
 
     mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
 
-    # normalize items (safe)
+    # normalize items (safe) ✅ 키/금액 문자열/노이즈 대응
     safe_items: List[Dict[str, Any]] = []
-    for it in extracted_items[:80]:
+    for it in extracted_items[:120]:
         if not isinstance(it, dict):
             continue
-        nm = (it.get("itemName") or "").strip()
+
+        nm = _extract_item_name(it)
         if not nm:
             continue
-        pr = it.get("price")
-        if pr is not None:
-            try:
-                pr = int(pr)
-                if pr < 0:
-                    pr = None
-            except Exception:
-                pr = None
-        safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": it.get("categoryTag")})
+        if _is_noise_line(nm):
+            continue
 
-    # 3) resolve record tags (module, your standard codes)
-    _require_module(tag_policy, "tag_policy")
-    try:
-        tag_result = tag_policy.resolve_record_tags(  # type: ignore
-            items=safe_items,
-            hospital_name=hn,
-        )
-        resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
-        tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
-    except Exception as e:
+        # price 키 다양성 대응
+        raw_price = it.get("price")
+        if raw_price is None:
+            raw_price = it.get("amount") or it.get("value")
+
+        pr = _coerce_amount_int(raw_price)
+        if pr is not None and pr < 0:
+            pr = None
+
+        # ✅ 아주 작은 금액은 OCR 쓰레기일 확률 높음 (9원/58원 등)
+        if pr is not None and pr < 100:
+            continue
+
+        ct = it.get("categoryTag")
+        if ct is None:
+            ct = it.get("category_tag")
+
+        safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": ct})
+
+  # 3) resolve record tags (module, your standard codes)
+_require_module(tag_policy, "tag_policy")
+
+item_tag_rows: List[Dict[str, Any]] = []
+try:
+    tag_result = tag_policy.resolve_record_tags(  # type: ignore
+        items=safe_items,
+        hospital_name=hn,
+        # (선택) tag_policy가 이 파라미터들을 받는 버전이면 같이 넘겨서 정확도 개선
+        # record_thresh=125,
+        # item_thresh=140,
+        # min_price_for_inference=1000,
+    )
+
+    if isinstance(tag_result, dict):
+        resolved_tags = _clean_tags(tag_result.get("tags") or [])
+        tag_evidence = tag_result.get("evidence")
+        item_tag_rows = tag_result.get("itemCategoryTags") or []
+    else:
         resolved_tags = []
         tag_evidence = None
-        logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
+        item_tag_rows = []
+
+    # ✅ 핵심: itemCategoryTags를 safe_items에 반영 (DB insert 전에!)
+    if isinstance(item_tag_rows, list):
+        for info in item_tag_rows:
+            if not isinstance(info, dict):
+                continue
+            idx = info.get("idx")
+            cat = info.get("categoryTag")
+
+            if not cat:
+                continue
+            if isinstance(idx, int) and 0 <= idx < len(safe_items):
+                # 기존에 categoryTag가 이미 있으면 덮어쓰지 않음(보수적으로)
+                if not safe_items[idx].get("categoryTag"):
+                    safe_items[idx]["categoryTag"] = str(cat)
+
+except Exception as e:
+    resolved_tags = []
+    tag_evidence = None
+    item_tag_rows = []
+    logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
+
+
+
+
+    # ✅ tag_policy의 itemCategoryTags를 safe_items.categoryTag에 반영 (DB 저장용)
+    item_tag_map: Dict[str, str] = {}
+    try:
+        if isinstance(tag_result, dict):
+            rows = tag_result.get("itemCategoryTags")
+            if isinstance(rows, list):
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    nm = (r.get("itemName") or "").strip()
+                    ct = (r.get("categoryTag") or "").strip()
+                    if nm and ct:
+                        item_tag_map[_norm_key(nm)] = ct
+    except Exception:
+        item_tag_map = {}
+
+    for it in safe_items:
+        if not it.get("categoryTag"):
+            ct = item_tag_map.get(_norm_key(it.get("itemName") or ""))
+            if ct:
+                it["categoryTag"] = ct
+
+    # ✅ items에 가격이 하나도 없는데 totalAmount는 있으면 fallback item 추가 (iOS 합계 0원 방지)
+    has_any_price = any(isinstance(x.get("price"), int) and int(x.get("price")) > 0 for x in safe_items)
+    if (not has_any_price) and (ta_from_ocr is not None) and (ta_from_ocr >= 100):
+        safe_items.append(
+            {
+                "itemName": "진료비",
+                "price": int(ta_from_ocr),
+                "categoryTag": (resolved_tags[0] if resolved_tags else None),
+            }
+        )
 
     # hints
     addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
@@ -2265,6 +2456,9 @@ def api_receipts_process(
             pass
         _raise_mapped_db_error(e)
         raise
+
+
+
 
 
 # =========================================================
