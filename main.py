@@ -123,10 +123,24 @@ class Settings(BaseSettings):
     # --- Admin ---
     ADMIN_UIDS: str = ""
 
+    # =========================================================
+    # ✅ Gemini (AI enrichment for receipt understanding)
+    # =========================================================
+    GEMINI_ENABLED: bool = False
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SECONDS: int = 8
+
+    # (옵션) GCP 위치/프로젝트를 쓰는 코드가 있다면 대비용
+    GCP_PROJECT_ID: str = ""
+    GCP_LOCATION: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
+
+
 
 
 # =========================================================
