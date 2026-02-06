@@ -1,4 +1,4 @@
-# main.py (PetHealth+ Server)
+# main.py (PetHealth+ Server) — v2.2.1-ops (DB-aligned)
 # Firebase Storage + Signed URL + Migration
 # + DB schema aligned with:
 #   - Soft delete SoT (deleted_at => path NULL + bytes=0) via DB triggers
@@ -12,11 +12,10 @@
 #   ocr_policy  : OCR + redaction + receipt parsing -> items/meta (NO tag decision)
 #   tag_policy  : items/text -> standard tag codes (SoT is your ReceiptTag codes)
 #
-# Tier policy (DB is source of truth):
-#   membership_tier: 'anonymous' | 'free' | 'pro'
-#   effective_tier : pro only when premium_until > now(), otherwise free/anonymous.
-#   NOTE: Ensure DB function public.get_effective_tier() matches your desired rule
-#         (ex: expired pro -> free, not anonymous) because quota triggers depend on it.
+# ✅ Tier policy (DB is source of truth):
+#   membership_tier: 'guest' | 'member' | 'premium'
+#   effective_tier : 'premium' only when premium_until > now(), otherwise membership_tier.
+#   quota          : public.get_tier_quota(effective_tier)
 
 from __future__ import annotations
 
@@ -204,6 +203,30 @@ def _clean_tags(tags: Any) -> List[str]:
     return out
 
 
+def _effective_tier_from_row(membership_tier: Optional[str], premium_until: Any) -> str:
+    """
+    effective_tier: premium only when premium_until > now(), else membership_tier
+    membership_tier is DB SoT: guest/member/premium
+    """
+    tier = (membership_tier or "guest").strip().lower()
+    if tier not in ("guest", "member", "premium"):
+        tier = "guest"
+
+    try:
+        if premium_until is not None:
+            # psycopg2 usually returns datetime for timestamptz
+            if hasattr(premium_until, "tzinfo"):
+                now = datetime.now(tz=premium_until.tzinfo)
+            else:
+                now = datetime.utcnow()
+            if premium_until > now:
+                return "premium"
+    except Exception:
+        pass
+
+    return tier
+
+
 # =========================================================
 # DB helpers
 # =========================================================
@@ -328,7 +351,13 @@ def _pg_message(e: Exception) -> str:
 def _raise_mapped_db_error(e: Exception) -> None:
     msg = _pg_message(e)
 
-    # User-safe errors
+    # ---- High-signal schema mismatch / operator errors ----
+    if "function public.get_effective_tier" in msg and "does not exist" in msg:
+        raise HTTPException(status_code=503, detail="DB schema mismatch: get_effective_tier() is missing")
+    if "users_membership_tier_check" in msg or "membership_tier" in msg and "check constraint" in msg:
+        raise HTTPException(status_code=500, detail="Server tier mapping bug: membership_tier check failed")
+
+    # ---- User-safe errors ----
     if "Quota exceeded" in msg:
         raise HTTPException(status_code=409, detail=msg)
 
@@ -355,21 +384,22 @@ def _raise_mapped_db_error(e: Exception) -> None:
 
 
 # =========================================================
-# Auth / membership helpers
+# Auth / membership helpers (DB-aligned)
 # =========================================================
 def _infer_membership_tier_from_token(decoded: Dict[str, Any]) -> Optional[str]:
     """
-    anonymous: Firebase Anonymous Auth
-    free     : any non-anonymous provider (google.com, apple.com, password, etc.)
-    pro      : never auto-set here (payments/admin only)
+    DB tiers:
+      guest   : Firebase Anonymous Auth
+      member  : any non-anonymous provider (google.com, apple.com, password, etc.)
+      premium : NEVER auto-set here (payments/admin only)
     """
     fb = decoded.get("firebase") or {}
     if isinstance(fb, dict):
         provider = (fb.get("sign_in_provider") or "").lower()
         if provider == "anonymous":
-            return "anonymous"
+            return "guest"
         if provider:
-            return "free"
+            return "member"
     return None
 
 
@@ -377,15 +407,15 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
     """
     users schema:
       firebase_uid (pk)
-      membership_tier (anonymous/free/pro)
+      membership_tier (guest/member/premium)
       premium_until
       pet_count/record_count/doc_count/total_storage_bytes
       last_seen_at/updated_at/created_at
 
     정책:
-      - 기본 anonymous
-      - 자동 업그레이드: desired_tier='free' 이고 현재 tier가 anonymous면 free로 올림
-      - pro는 절대 자동으로 덮어쓰지 않음
+      - 기본 guest
+      - 자동 업그레이드: desired_tier='member' 이고 현재 tier가 guest면 member로 올림
+      - premium은 절대 자동으로 덮어쓰지 않음
       - write throttle: last_seen_at 갱신은 N초 간격으로만
     """
     uid = (firebase_uid or "").strip()
@@ -393,7 +423,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
         raise HTTPException(status_code=400, detail="firebase_uid is empty")
 
     desired = (desired_tier or "").strip().lower() if desired_tier else None
-    if desired not in (None, "anonymous", "free"):
+    if desired not in (None, "guest", "member"):
         desired = None
 
     throttle = int(settings.USER_TOUCH_THROTTLE_SECONDS or 300)
@@ -404,7 +434,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
             cur.execute(
                 """
                 INSERT INTO public.users (firebase_uid, membership_tier)
-                VALUES (%s, COALESCE(%s, 'anonymous'))
+                VALUES (%s, COALESCE(%s, 'guest'))
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     last_seen_at = CASE
                         WHEN COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
@@ -413,12 +443,12 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                         ELSE public.users.last_seen_at
                     END,
                     membership_tier = CASE
-                        WHEN public.users.membership_tier = 'anonymous'
-                             AND COALESCE(%s,'anonymous') = 'free' THEN 'free'
+                        WHEN public.users.membership_tier = 'guest'
+                             AND COALESCE(%s,'guest') = 'member' THEN 'member'
                         ELSE public.users.membership_tier
                     END
                 WHERE
-                    (public.users.membership_tier = 'anonymous' AND COALESCE(%s,'anonymous') = 'free')
+                    (public.users.membership_tier = 'guest' AND COALESCE(%s,'guest') = 'member')
                     OR (COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
                         < now() - (%s * INTERVAL '1 second'))
                 RETURNING
@@ -1012,9 +1042,7 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
             pet_count,
             record_count,
             doc_count,
-            total_storage_bytes AS used_bytes,
-            public.get_effective_tier(firebase_uid) AS effective_tier,
-            public.get_tier_quota(public.get_effective_tier(firebase_uid)) AS quota_bytes
+            total_storage_bytes AS used_bytes
         FROM public.users
         WHERE firebase_uid = %s
         """,
@@ -1023,17 +1051,23 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
     if not row:
         raise HTTPException(status_code=500, detail=_internal_detail("user row missing", kind="DB error"))
 
+    membership_tier = str(row.get("membership_tier") or "guest")
+    premium_until_raw = row.get("premium_until")
+    effective_tier = _effective_tier_from_row(membership_tier, premium_until_raw)
+
+    quota_row = db_fetchone("SELECT public.get_tier_quota(%s) AS quota_bytes", (effective_tier,))
+    quota = int((quota_row or {}).get("quota_bytes") or 0)
+
     used = int(row.get("used_bytes") or 0)
-    quota = int(row.get("quota_bytes") or 0)
     remaining = max(0, quota - used)
 
-    pu = row.get("premium_until")
+    pu = premium_until_raw
     premium_until = pu.isoformat() if hasattr(pu, "isoformat") and pu is not None else None
 
     return {
         "uid": uid,
-        "membership_tier": str(row.get("membership_tier") or "anonymous"),
-        "effective_tier": str(row.get("effective_tier") or "anonymous"),
+        "membership_tier": membership_tier,
+        "effective_tier": effective_tier,
         "premium_until": premium_until,
         "used_bytes": used,
         "quota_bytes": quota,
@@ -1918,7 +1952,7 @@ def api_receipts_process(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(petId, "petId")
-    record_uuid = _uuid_or_new(recordId, "recordId")
+    record_uuid = _uuid_or_new(recordId, "recordId")  # keep backward-compat (recordId optional)
 
     pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
@@ -2135,8 +2169,6 @@ def api_receipts_process(
                     name_for_match = hn or ""
                     addr_for_match = addr_hint or ""
                     if (name_for_match.strip() != "") or (addr_for_match.strip() != ""):
-                        # Some deployments may not have the candidates table/function yet.
-                        # We isolate this step with a SAVEPOINT so a failure does not abort the whole transaction.
                         cur.execute("SAVEPOINT cand_sp")
                         try:
                             cur.execute(
@@ -2192,7 +2224,6 @@ def api_receipts_process(
 
                             cur.execute("RELEASE SAVEPOINT cand_sp")
                         except Exception as e:
-                            # clear failed sub-transaction and continue
                             try:
                                 cur.execute("ROLLBACK TO SAVEPOINT cand_sp")
                                 cur.execute("RELEASE SAVEPOINT cand_sp")
@@ -2200,6 +2231,7 @@ def api_receipts_process(
                                 pass
                             candidates_out = []
                             logger.warning("[Candidates] generation failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
+
                 cur.execute(
                     """
                     SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
@@ -3198,3 +3230,5 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
         "totalAmountSum_active": int(total_amount["s"]),
         "updatedAt": datetime.utcnow().isoformat() + "Z",
     }
+
+
