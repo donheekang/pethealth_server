@@ -2120,16 +2120,22 @@ def api_receipts_process(
 
     _require_module(ocr_policy, "ocr_policy")
     try:
-        webp_bytes, parsed, hints = ocr_policy.process_receipt(  # type: ignore
-            raw,
-            google_credentials=settings.GOOGLE_APPLICATION_CREDENTIALS,
-            ocr_timeout_seconds=int(settings.OCR_TIMEOUT_SECONDS),
-            ocr_max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
-            ocr_sema_acquire_timeout_seconds=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
-            receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
-            receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
-            image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
-        )
+        webp_bytes, parsed, hints = ocr_policy.process_receipt(
+    raw,
+    google_credentials=settings.GOOGLE_APPLICATION_CREDENTIALS,
+    ocr_timeout_seconds=int(settings.OCR_TIMEOUT_SECONDS),
+    ocr_max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
+    ocr_sema_acquire_timeout_seconds=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
+    receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
+    receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
+    image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
+
+    gemini_enabled=bool(settings.GEMINI_ENABLED),
+    gemini_api_key=settings.GEMINI_API_KEY,
+    gemini_model_name=settings.GEMINI_MODEL_NAME,
+    gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
+)
+
     except HTTPException:
         raise
     except Exception as e:
