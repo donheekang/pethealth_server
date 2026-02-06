@@ -302,42 +302,121 @@ def _pick_total_amount(lines: List[str]) -> Optional[int]:
 
 
 def _extract_items(lines: List[str], limit: int = 50) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    banned = ["합계", "총", "부가", "vat", "결제", "청구", "카드", "현금", "승인", "영수증", "사업자", "대표", "전화", "주소"]
+    """
+    Robust item extraction for receipts.
 
+    Supports patterns:
+      A) "ItemName 10,000"
+      B) "ItemName 10,000원"
+      C) "ItemName 10,000 1 10,000"   (unit price / qty / total)
+      D) "ItemName : 10,000" or "ItemName ₩10,000"
+
+    Filters:
+      - total/vat/payment lines
+      - phone/business number/time/date etc.
+      - tiny numbers (e.g., 9, 58) that often come from "customer no" or timestamps
+    """
+    out: List[Dict[str, Any]] = []
+
+    # Strong “not an item” keywords
+    banned_words = [
+        # totals/payments
+        "합계", "총액", "총금액", "총 금액", "총진료비", "총 진료비", "결제", "결제금액", "청구", "청구금액",
+        "부가", "vat", "면세", "과세", "카드", "현금", "승인", "영수증", "거스름", "거래", "승인번호",
+        # header/meta
+        "사업자", "대표", "전화", "tel", "fax", "주소", "약도", "고객", "고객번호", "번호", "발행", "일시",
+        "시간", "날짜", "no.", "serial", "code",
+    ]
+
+    # Skip lines that are too “meta”
+    phone_like = re.compile(r"(01[016789]|0\d{1,2})[-\s]?\d{3,4}[-\s]?\d{4}")
+    bizno_like = re.compile(r"\b\d{3}[-\s]?\d{2}[-\s]?\d{5}\b")
+    time_like = re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b")
+    date_like = re.compile(r"(20\d{2})[.\-/년\s]*(\d{1,2})[.\-/월\s]*(\d{1,2})")
+
+    def has_banned(name: str) -> bool:
+        l = name.lower()
+        for b in banned_words:
+            if b.lower() in l:
+                return True
+        return False
+
+    # Heuristic: drop tiny “prices” that are almost always noise
+    def price_is_noise(p: int) -> bool:
+        return p < 500  # <- tweak: 500원 미만은 거의 잡음으로 간주
+
+    # Normalize spaces
     for line in lines:
-        l = " ".join(line.strip().split())
+        l = " ".join((line or "").strip().split())
         if not l:
             continue
 
-        # Example matches:
-        #   "X-ray 10,000"
-        #   "진료비 30000원"
-        m = re.match(r"^(.{2,60}?)\s+(\d[\d,]*)\s*원?\s*$", l)
+        low = l.lower()
+
+        # Hard filters
+        if phone_like.search(l) or bizno_like.search(l) or time_like.search(l):
+            continue
+        # date line often not an item
+        if date_like.search(l) and len(re.sub(r"[^\d]", "", l)) >= 6 and len(l) < 30:
+            continue
+
+        # Ignore lines that are mostly digits/punct
+        if len(re.sub(r"[\d\W_]+", "", l)) < 2:
+            continue
+
+        # -------------------------------------------------
+        # Pattern C: "Name 30,000 1 30,000" (table-like)
+        # -------------------------------------------------
+        # Capture: name + (unit) + qty + total  OR  name + qty + total
+        m = re.match(r"^(.{2,80}?)\s+(\d[\d,]*)\s+(\d{1,3})\s+(\d[\d,]*)\s*원?$", l)
         if not m:
-            # Sometimes price comes with ':' or '₩'
-            m = re.match(r"^(.{2,60}?)[\s:₩]+(\d[\d,]*)\s*원?\s*$", l)
-        if not m:
+            m = re.match(r"^(.{2,80}?)\s+(\d{1,3})\s+(\d[\d,]*)\s*원?$", l)
+
+        if m:
+            if len(m.groups()) == 4:
+                name = (m.group(1) or "").strip()
+                total = _parse_amount(m.group(4) or "")
+            else:
+                name = (m.group(1) or "").strip()
+                total = _parse_amount(m.group(3) or "")
+
+            if not name or total is None or total <= 0:
+                continue
+            if has_banned(name):
+                continue
+            if price_is_noise(total):
+                continue
+
+            # Avoid ultra-long “name”
+            name = name[:200]
+            out.append({"itemName": name, "price": total, "categoryTag": None})
+            if len(out) >= limit:
+                break
             continue
 
-        name = (m.group(1) or "").strip()
-        price = _parse_amount(m.group(2) or "")
+        # -------------------------------------------------
+        # Pattern A/B/D: "Name 10,000" or "Name: 10,000"
+        # -------------------------------------------------
+        m2 = re.match(r"^(.{2,80}?)[\s:₩]+(\d[\d,]*)\s*원?\s*$", l)
+        if m2:
+            name = (m2.group(1) or "").strip()
+            price = _parse_amount(m2.group(2) or "")
 
-        if price is None or price <= 0:
+            if not name or price is None or price <= 0:
+                continue
+            if has_banned(name):
+                continue
+            if price_is_noise(price):
+                continue
+
+            # Another guard: if name is basically “고객번호” 같은 형태면 제외
+            if re.search(r"(고객\s*번호|발행|승인|거래|No\.?)", name, re.IGNORECASE):
+                continue
+
+            out.append({"itemName": name[:200], "price": price, "categoryTag": None})
+            if len(out) >= limit:
+                break
             continue
-
-        # Filter banned keywords in name
-        lowered = name.lower()
-        if any(b in name for b in banned) or any(b in lowered for b in banned):
-            continue
-
-        # Avoid too generic names
-        if len(re.sub(r"[\W_]+", "", name)) < 2:
-            continue
-
-        out.append({"itemName": name[:200], "price": price, "categoryTag": None})
-        if len(out) >= limit:
-            break
 
     return out
 
