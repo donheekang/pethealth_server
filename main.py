@@ -148,13 +148,15 @@ settings = Settings()
 # =========================================================
 try:
     import ocr_policy  # type: ignore
-except Exception:
+except Exception as e:
     ocr_policy = None
+    logger.exception("[Import] ocr_policy import failed: %r", e)
 
 try:
     import tag_policy  # type: ignore
-except Exception:
+except Exception as e:
     tag_policy = None
+    logger.exception("[Import] tag_policy import failed: %r", e)
 
 
 def _require_module(mod, name: str):
