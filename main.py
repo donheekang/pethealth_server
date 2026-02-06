@@ -2158,52 +2158,19 @@ def api_receipts_process(
 
         safe_items.append({"itemName": nm[:200], "price": pr, "categoryTag": ct})
 
-  # 3) resolve record tags (module, your standard codes)
-_require_module(tag_policy, "tag_policy")
-
-item_tag_rows: List[Dict[str, Any]] = []
-try:
-    tag_result = tag_policy.resolve_record_tags(  # type: ignore
-        items=safe_items,
-        hospital_name=hn,
-        # (선택) tag_policy가 이 파라미터들을 받는 버전이면 같이 넘겨서 정확도 개선
-        # record_thresh=125,
-        # item_thresh=140,
-        # min_price_for_inference=1000,
-    )
-
-    if isinstance(tag_result, dict):
-        resolved_tags = _clean_tags(tag_result.get("tags") or [])
-        tag_evidence = tag_result.get("evidence")
-        item_tag_rows = tag_result.get("itemCategoryTags") or []
-    else:
+    # 3) resolve record tags (module, your standard codes)
+    _require_module(tag_policy, "tag_policy")
+    try:
+        tag_result = tag_policy.resolve_record_tags(  # type: ignore
+            items=safe_items,
+            hospital_name=hn,
+        )
+        resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
+        tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
+    except Exception as e:
         resolved_tags = []
         tag_evidence = None
-        item_tag_rows = []
-
-    # ✅ 핵심: itemCategoryTags를 safe_items에 반영 (DB insert 전에!)
-    if isinstance(item_tag_rows, list):
-        for info in item_tag_rows:
-            if not isinstance(info, dict):
-                continue
-            idx = info.get("idx")
-            cat = info.get("categoryTag")
-
-            if not cat:
-                continue
-            if isinstance(idx, int) and 0 <= idx < len(safe_items):
-                # 기존에 categoryTag가 이미 있으면 덮어쓰지 않음(보수적으로)
-                if not safe_items[idx].get("categoryTag"):
-                    safe_items[idx]["categoryTag"] = str(cat)
-
-except Exception as e:
-    resolved_tags = []
-    tag_evidence = None
-    item_tag_rows = []
-    logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
-
-
-
+        logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
 
     # ✅ tag_policy의 itemCategoryTags를 safe_items.categoryTag에 반영 (DB 저장용)
     item_tag_map: Dict[str, str] = {}
@@ -3424,5 +3391,3 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
         "totalAmountSum_active": int(total_amount["s"]),
         "updatedAt": datetime.utcnow().isoformat() + "Z",
     }
-
-
