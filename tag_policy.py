@@ -1,9 +1,29 @@
 # tag_policy.py (PetHealth+)
 # items/text -> ReceiptTag codes (aligned with iOS ReceiptTag.rawValue)
+#
+# Required public API:
+#   resolve_record_tags(items: list, hospital_name: Optional[str] = None, **kwargs) -> dict
+#
+# Strategy:
+#  1) Catalog-based matching (fast, deterministic)
+#  2) Optional Gemini mapping (when enabled + API key exists, and catalog is weak/empty)
+#
+# Env:
+#  - GEMINI_ENABLED=true|false
+#  - GEMINI_API_KEY=...
+#  - GEMINI_MODEL_NAME=gemini-2.5-flash   (default)
+#
+# Notes:
+#  - Gemini call is best-effort. Any failure falls back to catalog.
+#  - This module must NEVER crash the server.
 
 from __future__ import annotations
+
+import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
 
 # -----------------------------
 # Tag catalog (subset; expand as needed)
@@ -67,9 +87,8 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "grooming_basic", "group": "grooming", "aliases": ["grooming","bath","trim","미용","목욕","클리핑"]},
 ]
 
-# ---- Normalization/token rules (similar to iOS)
-_alnum = re.compile(r"[0-9a-zA-Z가-힣]+")
 
+# ---- Normalization/token rules (similar to iOS)
 def _normalize(s: str) -> str:
     s = (s or "").lower()
     # keep alnum + korean only
@@ -91,6 +110,48 @@ def _is_single_latin_char(s: str) -> bool:
     c = s.lower()
     return "a" <= c <= "z"
 
+
+# ---- Noise filters (to avoid "고객번호 9원" 같은 OCR 쓰레기 라인)
+_NOISE_TOKENS = [
+    "고객", "고객번호", "고객 번호",
+    "발행", "발행일", "발행 일",
+    "사업자", "사업자등록", "대표", "전화", "주소",
+    "serial", "sign", "승인", "카드", "현금",
+    "부가세", "vat", "면세", "과세", "공급가",
+    "소계", "합계", "총액", "총 금액", "총금액", "청구", "결제",
+]
+
+def _is_noise_name(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return True
+    low = n.lower()
+
+    # 너무 짧은 단어는 태그 매핑에서 제외
+    if len(_normalize(n)) < 2:
+        return True
+
+    # 노이즈 토큰 포함
+    for t in _NOISE_TOKENS:
+        if t in n or t in low:
+            return True
+
+    return False
+
+def _is_plausible_amount(price: Optional[int]) -> bool:
+    # 아주 작은 금액(예: 9원, 58원)은 OCR 오탐일 가능성이 높음
+    # (원하면 50/100/500 등으로 조절 가능)
+    if price is None:
+        return True
+    try:
+        return int(price) >= 100
+    except Exception:
+        return True
+
+
+# -----------------------------
+# Catalog matching
+# -----------------------------
 def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
     q_raw = (query or "").strip()
     if not q_raw:
@@ -112,8 +173,8 @@ def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
     strong = False
     why: List[str] = []
 
-    code_norm = _normalize(tag["code"])
-    if code_norm == q_norm:
+    code_norm = _normalize(tag.get("code", ""))
+    if code_norm and code_norm == q_norm:
         return 230, {"why": ["code==query"]}
 
     # alias match
@@ -158,46 +219,375 @@ def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
 
     return best, {"why": why[:8]}
 
+def _catalog_candidates(query: str, limit: int = 12) -> List[Tuple[str, int, Dict[str, Any]]]:
+    scored: List[Tuple[str, int, Dict[str, Any]]] = []
+    for tag in TAG_CATALOG:
+        s, ev = _match_score(tag, query)
+        if s > 0:
+            scored.append((tag["code"], s, ev))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:limit]
+
+def _pick_from_catalog(query: str, thresh: int = 135, max_tags: int = 6) -> Tuple[List[str], Dict[str, Any]]:
+    cands = _catalog_candidates(query, limit=20)
+
+    picked: List[str] = []
+    evidence: Dict[str, Any] = {
+        "policy": "catalog",
+        "query": query[:500],
+        "candidates": [],
+    }
+
+    for code, score, ev in cands[:12]:
+        evidence["candidates"].append({"code": code, "score": score, **(ev or {})})
+        if score >= thresh and code not in picked:
+            picked.append(code)
+        if len(picked) >= max_tags:
+            break
+
+    return picked, evidence
+
+def _best_item_tag_from_catalog(item_name: str) -> Tuple[Optional[str], int, Dict[str, Any]]:
+    # item 단독으로도 매칭
+    cands = _catalog_candidates(item_name, limit=5)
+    if not cands:
+        return None, 0, {"policy": "catalog_item", "why": ["no_candidates"]}
+    code, score, ev = cands[0]
+    return code, score, {"policy": "catalog_item", "top": {"code": code, "score": score, **(ev or {})}}
+
+
+# -----------------------------
+# Gemini (optional)
+# -----------------------------
+def _gemini_enabled() -> bool:
+    return (os.environ.get("GEMINI_ENABLED", "true").strip().lower() == "true")
+
+def _gemini_api_key() -> str:
+    return (os.environ.get("GEMINI_API_KEY", "") or "").strip()
+
+def _gemini_model_name() -> str:
+    return (os.environ.get("GEMINI_MODEL_NAME", "") or "").strip() or "gemini-2.5-flash"
+
+def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    # strip ```json fences
+    s = re.sub(r"```(?:json)?", "", s, flags=re.IGNORECASE).strip()
+    s = s.replace("```", "").strip()
+
+    # try direct
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    # find a JSON object substring
+    first = s.find("{")
+    last = s.rfind("}")
+    if first >= 0 and last > first:
+        sub = s[first:last+1]
+        try:
+            obj = json.loads(sub)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    return None
+
+def _gemini_generate_text(prompt: str) -> str:
+    """
+    Best-effort Gemini call.
+    Supports either google-generativeai OR google-genai if installed.
+    Returns "" on any failure.
+    """
+    api_key = _gemini_api_key()
+    if not api_key:
+        return ""
+
+    model_name = _gemini_model_name()
+
+    # 1) google-generativeai (google.generativeai)
+    try:
+        import google.generativeai as genai  # type: ignore
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.1,
+                "max_output_tokens": 700,
+            },
+        )
+        txt = getattr(resp, "text", "") or ""
+        return txt.strip()
+    except Exception:
+        pass
+
+    # 2) google-genai (from google import genai)
+    try:
+        from google import genai as genai2  # type: ignore
+
+        client = genai2.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+        )
+        txt = getattr(resp, "text", "") or ""
+        return txt.strip()
+    except Exception:
+        return ""
+
+def _build_gemini_prompt(
+    *,
+    hospital_name: Optional[str],
+    items: List[Dict[str, Any]],
+    allowed_codes: List[str],
+    catalog_top: List[Tuple[str, int, Dict[str, Any]]],
+) -> str:
+    # item names only (cleaned)
+    names: List[str] = []
+    for it in items[:80]:
+        nm = (it.get("itemName") or it.get("item_name") or "").strip()
+        if not nm:
+            continue
+        if _is_noise_name(nm):
+            continue
+        names.append(nm[:120])
+
+    payload = {
+        "hospitalName": (hospital_name or None),
+        "items": names,
+        "allowedReceiptTagCodes": allowed_codes,
+        "catalogTopCandidates": [{"code": c, "score": s} for (c, s, _ev) in catalog_top[:8]],
+        "outputSchema": {
+            "tags": "string[] (<=6, unique, allowed codes only)",
+            "itemCategoryTags": [
+                {"itemName": "string", "categoryTag": "string|null", "confidence": "number 0..1"}
+            ],
+            "notes": "string(optional)"
+        }
+    }
+
+    # IMPORTANT: force strict JSON output
+    return (
+        "You are a mapping engine for veterinary receipts.\n"
+        "Task: Map receipt line item names to standardized ReceiptTag codes.\n"
+        "Constraints:\n"
+        "- Use ONLY codes from allowedReceiptTagCodes.\n"
+        "- Return STRICT JSON only. No markdown, no extra text.\n"
+        "- tags must be <= 6, unique.\n"
+        "- itemCategoryTags: for each itemName, pick categoryTag or null if unsure.\n"
+        "- If uncertain, prefer null / fewer tags.\n"
+        "- Ignore non-medical/noise lines (customer number, issue date, addresses, phones, tax lines).\n\n"
+        "INPUT_JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}\n"
+    )
+
+def _gemini_map(
+    *,
+    hospital_name: Optional[str],
+    items: List[Dict[str, Any]],
+    catalog_top: List[Tuple[str, int, Dict[str, Any]]],
+) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Returns: (tags, itemCategoryTags, evidence)
+    """
+    allowed = [t["code"] for t in TAG_CATALOG if t.get("code")]
+    prompt = _build_gemini_prompt(
+        hospital_name=hospital_name,
+        items=items,
+        allowed_codes=allowed,
+        catalog_top=catalog_top,
+    )
+
+    raw = _gemini_generate_text(prompt)
+    if not raw:
+        return [], [], {"policy": "gemini", "error": "empty_response"}
+
+    obj = _extract_json_obj(raw)
+    if not obj:
+        return [], [], {"policy": "gemini", "error": "json_parse_failed", "raw": raw[:500]}
+
+    tags = obj.get("tags") or []
+    item_tags = obj.get("itemCategoryTags") or []
+
+    # validate tags
+    allowed_set = set(allowed)
+    cleaned_tags: List[str] = []
+    if isinstance(tags, list):
+        for x in tags:
+            if not isinstance(x, str):
+                continue
+            code = x.strip()
+            if not code or code not in allowed_set:
+                continue
+            if code not in cleaned_tags:
+                cleaned_tags.append(code)
+            if len(cleaned_tags) >= 6:
+                break
+
+    # validate itemCategoryTags
+    cleaned_item_tags: List[Dict[str, Any]] = []
+    if isinstance(item_tags, list):
+        for row in item_tags[:120]:
+            if not isinstance(row, dict):
+                continue
+            nm = (row.get("itemName") or "").strip()
+            ct = row.get("categoryTag")
+            conf = row.get("confidence", None)
+
+            if not nm:
+                continue
+            if _is_noise_name(nm):
+                continue
+
+            if isinstance(ct, str):
+                ct = ct.strip()
+                if ct not in allowed_set:
+                    ct = None
+            else:
+                ct = None
+
+            try:
+                conf_f = float(conf) if conf is not None else None
+                if conf_f is not None:
+                    conf_f = max(0.0, min(1.0, conf_f))
+            except Exception:
+                conf_f = None
+
+            cleaned_item_tags.append({
+                "itemName": nm[:200],
+                "categoryTag": ct,
+                "confidence": conf_f,
+            })
+
+    ev = {
+        "policy": "gemini",
+        "model": _gemini_model_name(),
+        "rawPreview": raw[:300],
+        "notes": obj.get("notes"),
+    }
+    return cleaned_tags, cleaned_item_tags, ev
+
+
+# -----------------------------
+# Public API
+# -----------------------------
 def resolve_record_tags(
     *,
     items: List[Dict[str, Any]],
     hospital_name: Optional[str] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    # build a single query text from items + hospital
-    parts: List[str] = []
-    if hospital_name:
-        parts.append(str(hospital_name))
-    for it in (items or [])[:80]:
-        nm = (it.get("itemName") or it.get("item_name") or "").strip()
-        if nm:
+    """
+    Return shape example:
+      {
+        "tags": ["vaccine_rabies"],
+        "itemCategoryTags": [{"itemName": "...", "categoryTag": "vaccine_rabies", "confidence": 0.92}],
+        "evidence": {...}
+      }
+
+    - Conservative by design. If unsure: returns fewer tags.
+    - Never throws.
+    """
+    try:
+        # 1) clean & build query
+        parts: List[str] = []
+        if hospital_name:
+            parts.append(str(hospital_name))
+
+        cleaned_items: List[Dict[str, Any]] = []
+        for it in (items or [])[:120]:
+            nm = (it.get("itemName") or it.get("item_name") or "").strip()
+            price = it.get("price")
+            if not nm:
+                continue
+            if _is_noise_name(nm):
+                continue
+            if not _is_plausible_amount(price if isinstance(price, int) else None):
+                continue
+
+            cleaned_items.append(it)
             parts.append(nm)
 
-    query = " | ".join(parts)
-    if not query.strip():
-        return {"tags": [], "evidence": {"policy": "catalog", "reason": "empty_query"}}
+        query = " | ".join(parts).strip()
+        if not query:
+            return {"tags": [], "evidence": {"policy": "catalog", "reason": "empty_query"}}
 
-    scored: List[Tuple[str, int, Dict[str, Any]]] = []
-    for tag in TAG_CATALOG:
-        s, ev = _match_score(tag, query)
-        if s > 0:
-            scored.append((tag["code"], s, ev))
+        # 2) catalog baseline
+        catalog_tags, catalog_ev = _pick_from_catalog(query, thresh=135, max_tags=6)
+        catalog_top = _catalog_candidates(query, limit=12)
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+        # 3) per-item category tags (catalog quick pass)
+        #    - 이건 “아이템에 categoryTag를 채워서 UI에서 바로 표준 태그 표시”용
+        item_category_tags: List[Dict[str, Any]] = []
+        for it in cleaned_items[:80]:
+            nm = (it.get("itemName") or it.get("item_name") or "").strip()
+            if not nm:
+                continue
+            best_code, best_score, ev = _best_item_tag_from_catalog(nm)
+            # 아이템 단독은 조금 더 보수적으로
+            if best_code and best_score >= 160:
+                item_category_tags.append({
+                    "itemName": nm[:200],
+                    "categoryTag": best_code,
+                    "confidence": None,
+                    "evidence": ev,
+                })
 
-    # pick top tags with a minimum threshold
-    # (조절 포인트) threshold 낮추면 많이 붙고, 높이면 보수적
-    THRESH = 135
-    picked: List[str] = []
-    evidence: Dict[str, Any] = {"policy": "catalog", "query": query[:400], "candidates": []}
+        # record tags에 아이템 태그를 합치기
+        merged = list(dict.fromkeys(catalog_tags + [r["categoryTag"] for r in item_category_tags if r.get("categoryTag")]))
+        merged = merged[:6]
 
-    for code, score, ev in scored[:12]:
-        evidence["candidates"].append({"code": code, "score": score, **(ev or {})})
-        if score >= THRESH and code not in picked:
-            picked.append(code)
-        if len(picked) >= 6:
-            break
+        # 4) decide gemini
+        #    - catalog가 너무 약하거나(0개) 애매하면 AI로 보정
+        use_ai = _gemini_enabled() and bool(_gemini_api_key())
+        top_score = catalog_top[0][1] if catalog_top else 0
+        need_ai = use_ai and (len(merged) == 0 or top_score < 190)
 
-    return {"tags": picked, "evidence": evidence}
+        if need_ai:
+            ai_tags, ai_item_tags, ai_ev = _gemini_map(
+                hospital_name=hospital_name,
+                items=cleaned_items,
+                catalog_top=catalog_top,
+            )
+
+            # AI tags 우선 + catalog의 아주 강한 것(220+)은 보강
+            strong_catalog = [c for (c, s, _ev) in catalog_top if s >= 220]
+            final_tags = list(dict.fromkeys(ai_tags + strong_catalog))
+            final_tags = final_tags[:6]
+
+            # AI itemCategoryTags를 채택하되, categoryTag 없는 것은 유지(혹은 제거)
+            # 필요하면 catalog item 태그와 합쳐도 됨
+            final_item_tags: List[Dict[str, Any]] = []
+            if ai_item_tags:
+                final_item_tags = ai_item_tags[:120]
+            else:
+                final_item_tags = [{"itemName": r["itemName"], "categoryTag": r.get("categoryTag"), "confidence": r.get("confidence")} for r in item_category_tags]
+
+            return {
+                "tags": final_tags,
+                "itemCategoryTags": final_item_tags,
+                "evidence": {
+                    "policy": "gemini+catalog",
+                    "catalog": catalog_ev,
+                    "gemini": ai_ev,
+                },
+            }
+
+        # 5) catalog only
+        return {
+            "tags": merged,
+            "itemCategoryTags": [{"itemName": r["itemName"], "categoryTag": r.get("categoryTag"), "confidence": r.get("confidence")} for r in item_category_tags],
+            "evidence": catalog_ev,
+        }
+
+    except Exception as e:
+        # never crash
+        return {"tags": [], "evidence": {"policy": "safe_fallback", "error": str(e)[:200]}}
 
 
