@@ -2125,18 +2125,22 @@ def api_receipts_process(
         webp_bytes, parsed, hints = ocr_policy.process_receipt(
     raw,
     google_credentials=settings.GOOGLE_APPLICATION_CREDENTIALS,
-    ocr_timeout_seconds=int(settings.OCR_TIMEOUT_SECONDS),
-    ocr_max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
-    ocr_sema_acquire_timeout_seconds=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
-    receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
-    receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
-    image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
+    ocr_timeout_seconds=settings.OCR_TIMEOUT_SECONDS,
+    ocr_max_concurrency=settings.OCR_MAX_CONCURRENCY,
+    ocr_sema_acquire_timeout_seconds=settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS,
+    receipt_max_width=settings.RECEIPT_MAX_WIDTH,
+    receipt_webp_quality=settings.RECEIPT_WEBP_QUALITY,
+    image_max_pixels=settings.IMAGE_MAX_PIXELS,
 
-    gemini_enabled=bool(settings.GEMINI_ENABLED),
+    # ✅ Gemini 환경변수 기반 강제 주입
+    gemini_enabled=settings.GEMINI_ENABLED,
     gemini_api_key=settings.GEMINI_API_KEY,
     gemini_model_name=settings.GEMINI_MODEL_NAME,
-    gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
+    gemini_timeout_seconds=settings.GEMINI_TIMEOUT_SECONDS,
 )
+
+
+
 
     except HTTPException:
         raise
