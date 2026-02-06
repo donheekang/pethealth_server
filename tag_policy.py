@@ -37,7 +37,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
 
     # --- Vaccines / Preventives ---
     {"code": "vaccine_comprehensive", "group": "vaccine", "aliases": ["dhpp", "dhppi", "dhlpp", "5-in-1", "6-in-1", "fvrcp", "combo vaccine", "종합백신", "혼합백신", "5종", "6종"]},
-    {"code": "vaccine_rabies", "group": "vaccine", "aliases": ["rabies", "광견병", "광견"]},
+    {"code": "vaccine_rabies","rabbies", "group": "vaccine", "aliases": ["rabies", "광견병", "광견"]},
     {"code": "vaccine_kennel", "group": "vaccine", "aliases": ["kennel cough", "bordetella", "켄넬코프", "기관지염백신", "보르데텔라"]},
     {"code": "vaccine_corona", "group": "vaccine", "aliases": ["corona", "coronavirus", "corona enteritis", "코로나", "코로나장염"]},
     {"code": "vaccine_lepto", "group": "vaccine", "aliases": ["lepto", "leptospirosis", "leptospira", "lepto2", "lepto4", "l2", "l4", "렙토", "렙토2", "렙토4"]},
