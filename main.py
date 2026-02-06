@@ -1,16 +1,22 @@
 # main.py (PetHealth+ Server)
 # Firebase Storage + Signed URL + Migration
 # + DB schema aligned with:
-#   - Soft delete SoT (deleted_at => path null/dummy + bytes=0) via triggers
-#   - No undelete
-#   - Quota enforcement via SELECT ... FOR UPDATE on users row (trigger calls fn_guard_quota_for_user)
+#   - Soft delete SoT (deleted_at => path NULL + bytes=0) via DB triggers
+#   - No undelete (enforced by DB)
+#   - Quota enforcement via SELECT ... FOR UPDATE on users row (DB triggers call fn_guard_quota_for_user)
 #   - Accounting via triggers (users.total_storage_bytes, counts)
-#   - Storage delete jobs enqueued by triggers on soft-delete transition
+#   - Storage delete jobs enqueued by DB triggers on soft-delete transition
 #
 # Architecture:
 #   main.py     : API + DB I/O + pipeline wiring
 #   ocr_policy  : OCR + redaction + receipt parsing -> items/meta (NO tag decision)
 #   tag_policy  : items/text -> standard tag codes (SoT is your ReceiptTag codes)
+#
+# Tier policy (DB is source of truth):
+#   membership_tier: 'anonymous' | 'free' | 'pro'
+#   effective_tier : pro only when premium_until > now(), otherwise free/anonymous.
+#   NOTE: Ensure DB function public.get_effective_tier() matches your desired rule
+#         (ex: expired pro -> free, not anonymous) because quota triggers depend on it.
 
 from __future__ import annotations
 
@@ -335,8 +341,8 @@ def _raise_mapped_db_error(e: Exception) -> None:
     if "Candidates not allowed" in msg:
         raise HTTPException(status_code=409, detail=msg)
 
-    if "Direct update of pets.user_uid is not allowed" in msg:
-        raise HTTPException(status_code=409, detail=msg)
+    if "Hard DELETE is blocked" in msg:
+        raise HTTPException(status_code=409, detail="Hard DELETE is blocked. Use soft delete.")
 
     if "violates foreign key constraint" in msg:
         raise HTTPException(status_code=400, detail="Invalid reference (foreign key)")
@@ -352,23 +358,42 @@ def _raise_mapped_db_error(e: Exception) -> None:
 # Auth / membership helpers
 # =========================================================
 def _infer_membership_tier_from_token(decoded: Dict[str, Any]) -> Optional[str]:
+    """
+    anonymous: Firebase Anonymous Auth
+    free     : any non-anonymous provider (google.com, apple.com, password, etc.)
+    pro      : never auto-set here (payments/admin only)
+    """
     fb = decoded.get("firebase") or {}
     if isinstance(fb, dict):
         provider = (fb.get("sign_in_provider") or "").lower()
         if provider == "anonymous":
-            return "guest"
+            return "anonymous"
         if provider:
-            return "member"
+            return "free"
     return None
 
 
 def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict[str, Any]:
+    """
+    users schema:
+      firebase_uid (pk)
+      membership_tier (anonymous/free/pro)
+      premium_until
+      pet_count/record_count/doc_count/total_storage_bytes
+      last_seen_at/updated_at/created_at
+
+    정책:
+      - 기본 anonymous
+      - 자동 업그레이드: desired_tier='free' 이고 현재 tier가 anonymous면 free로 올림
+      - pro는 절대 자동으로 덮어쓰지 않음
+      - write throttle: last_seen_at 갱신은 N초 간격으로만
+    """
     uid = (firebase_uid or "").strip()
     if not uid:
         raise HTTPException(status_code=400, detail="firebase_uid is empty")
 
     desired = (desired_tier or "").strip().lower() if desired_tier else None
-    if desired not in (None, "guest", "member"):
+    if desired not in (None, "anonymous", "free"):
         desired = None
 
     throttle = int(settings.USER_TOUCH_THROTTLE_SECONDS or 300)
@@ -379,7 +404,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
             cur.execute(
                 """
                 INSERT INTO public.users (firebase_uid, membership_tier)
-                VALUES (%s, COALESCE(%s, 'guest'))
+                VALUES (%s, COALESCE(%s, 'anonymous'))
                 ON CONFLICT (firebase_uid) DO UPDATE SET
                     last_seen_at = CASE
                         WHEN COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
@@ -388,12 +413,12 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
                         ELSE public.users.last_seen_at
                     END,
                     membership_tier = CASE
-                        WHEN public.users.membership_tier = 'guest'
-                             AND COALESCE(%s,'guest') = 'member' THEN 'member'
+                        WHEN public.users.membership_tier = 'anonymous'
+                             AND COALESCE(%s,'anonymous') = 'free' THEN 'free'
                         ELSE public.users.membership_tier
                     END
                 WHERE
-                    (public.users.membership_tier = 'guest' AND COALESCE(%s,'guest') = 'member')
+                    (public.users.membership_tier = 'anonymous' AND COALESCE(%s,'anonymous') = 'free')
                     OR (COALESCE(public.users.last_seen_at, 'epoch'::timestamptz)
                         < now() - (%s * INTERVAL '1 second'))
                 RETURNING
@@ -405,6 +430,7 @@ def db_touch_user(firebase_uid: str, desired_tier: Optional[str] = None) -> Dict
             )
             row = cur.fetchone()
 
+            # conflict + WHERE false면 RETURNING이 비어있을 수 있음 -> SELECT로 보정
             if not row:
                 cur.execute(
                     """
@@ -548,6 +574,14 @@ def _load_firebase_service_account() -> Optional[dict]:
 
 
 def init_firebase_admin(*, require_init: bool = False) -> None:
+    """
+    Initialize Firebase Admin SDK.
+
+    ✅ ops-hardening (auth/storage decoupled):
+    - _firebase_initialized는 "실제로 firebase_admin 앱이 존재할 때만" True.
+    - Auth(verify_id_token)에는 Service Account만 필요. (bucket 없어도 초기화 가능)
+    - Storage bucket은 get_bucket()에서 별도로 강제한다.
+    """
     global _firebase_initialized
 
     if settings.STUB_MODE:
@@ -797,6 +831,19 @@ class SignedUrlResponse(BaseModel):
     expiresAt: str
 
 
+class MeSummaryResponse(BaseModel):
+    uid: str
+    membership_tier: str
+    effective_tier: str
+    premium_until: Optional[str]
+    used_bytes: int
+    quota_bytes: int
+    remaining_bytes: int
+    pet_count: int
+    record_count: int
+    doc_count: int
+
+
 class DocumentUploadResponse(BaseModel):
     id: str
     petId: str
@@ -821,7 +868,7 @@ class OCRItemMapDeactivateRequest(BaseModel):
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.2.0-ops")
+app = FastAPI(title="PetHealth+ Server", version="2.2.1-ops")
 
 _origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
 _allow_credentials = bool(settings.CORS_ALLOW_CREDENTIALS)
@@ -879,7 +926,7 @@ def _shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (v2.2.0-ops)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (v2.2.1-ops)"}
 
 
 @app.get("/api/health")
@@ -897,6 +944,7 @@ def health():
                 ("candidates", "public.health_record_hospital_candidates"),
                 ("ocr_item_maps", "public.ocr_item_name_maps"),
                 ("migration_tokens", "public.migration_tokens"),
+                ("storage_delete_jobs", "public.storage_delete_jobs"),
             ]
             missing = []
             for _, reg in checks:
@@ -918,7 +966,7 @@ def health():
 
     return {
         "status": "ok",
-        "version": "2.2.0-ops",
+        "version": "2.2.1-ops",
         "storage": "stub" if settings.STUB_MODE else "firebase",
         "db_enabled": bool(settings.DB_ENABLED),
         "db_configured": bool(settings.DATABASE_URL),
@@ -943,6 +991,57 @@ def me(user: Dict[str, Any] = Depends(get_current_user)):
     except Exception:
         row = None
     return {"uid": uid, "email": user.get("email"), "user": row}
+
+
+@app.get("/api/me/summary", response_model=MeSummaryResponse)
+def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    desired = _infer_membership_tier_from_token(user)
+    # keep user row warm
+    _ = db_touch_user(uid, desired_tier=desired)
+
+    row = db_fetchone(
+        """
+        SELECT
+            firebase_uid,
+            membership_tier,
+            premium_until,
+            pet_count,
+            record_count,
+            doc_count,
+            total_storage_bytes AS used_bytes,
+            public.get_effective_tier(firebase_uid) AS effective_tier,
+            public.get_tier_quota(public.get_effective_tier(firebase_uid)) AS quota_bytes
+        FROM public.users
+        WHERE firebase_uid = %s
+        """,
+        (uid,),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail=_internal_detail("user row missing", kind="DB error"))
+
+    used = int(row.get("used_bytes") or 0)
+    quota = int(row.get("quota_bytes") or 0)
+    remaining = max(0, quota - used)
+
+    pu = row.get("premium_until")
+    premium_until = pu.isoformat() if hasattr(pu, "isoformat") and pu is not None else None
+
+    return {
+        "uid": uid,
+        "membership_tier": str(row.get("membership_tier") or "anonymous"),
+        "effective_tier": str(row.get("effective_tier") or "anonymous"),
+        "premium_until": premium_until,
+        "used_bytes": used,
+        "quota_bytes": quota,
+        "remaining_bytes": int(remaining),
+        "pet_count": int(row.get("pet_count") or 0),
+        "record_count": int(row.get("record_count") or 0),
+        "doc_count": int(row.get("doc_count") or 0),
+    }
 
 
 # =========================================================
@@ -1054,7 +1153,6 @@ def api_pets_list(user: Dict[str, Any] = Depends(get_current_user)):
 
 # =========================================================
 # Hospitals: search + custom create/delete
-# (unchanged conceptually; search SQL can be upgraded later to strict trigger approach)
 # =========================================================
 def _validate_lat_lng(lat: Optional[float], lng: Optional[float]) -> None:
     if lat is not None:
@@ -1403,7 +1501,6 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 )
                 row = cur.fetchone()
                 if not row:
-                    # could be "record soft-deleted" or ownership mismatch
                     exists = db_fetchone("SELECT id FROM public.health_records WHERE id=%s", (record_uuid,))
                     if exists:
                         raise HTTPException(status_code=409, detail="record is deleted or not editable")
@@ -1648,7 +1745,7 @@ def api_record_delete(
             "ok": True,
             "recordId": str(record_uuid),
             "softDeleted": True,
-            "oldReceiptPath": old_path,  # 참고용
+            "oldReceiptPath": old_path,
             "storageDeletion": "queued_by_trigger",
         }
 
@@ -1805,7 +1902,6 @@ def api_receipts_process(
     recordId: Optional[str] = Form(None),
     hospitalMgmtNo: Optional[str] = Form(None),
     replaceItems: bool = Form(True),
-    # optional future: replaceTags: bool = Form(False),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
     user: Dict[str, Any] = Depends(get_current_user),
@@ -1839,7 +1935,7 @@ def api_receipts_process(
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
-       # 1) OCR + minimal redaction + parse (module)
+    # 1) OCR + minimal redaction + parse (module)
     _require_module(ocr_policy, "ocr_policy")
     try:
         webp_bytes, parsed, hints = ocr_policy.process_receipt(  # type: ignore
@@ -1855,27 +1951,16 @@ def api_receipts_process(
     except HTTPException:
         raise
     except Exception as e:
-        eid = _new_error_id()
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
 
-        # ✅ stack trace까지 찍히게
-        logger.exception(
-            "[ERR:%s] ocr_policy.process_receipt failed (ct=%s size=%d bytes)",
-            eid,
-            getattr(upload, "content_type", None),
-            len(raw),
-        )
-
-        # ✅ 클라이언트에 “타입” 정도는 보여주기 (민감정보 없이)
-        # (EXPOSE_ERROR_DETAILS=true면 메시지까지 보여주게)
-        if settings.EXPOSE_ERROR_DETAILS:
-            detail = f"Receipt processing failed: {type(e).__name__}: {e} (errorId={eid})"
-        else:
-            detail = f"Receipt processing failed ({type(e).__name__}) (errorId={eid})"
-
-        raise HTTPException(status_code=500, detail=detail)
-
-
-
+    # 2) upload redacted webp to storage
+    receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
+    try:
+        upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     file_size_bytes = int(len(webp_bytes))
 
@@ -1920,12 +2005,10 @@ def api_receipts_process(
         tag_result = tag_policy.resolve_record_tags(  # type: ignore
             items=safe_items,
             hospital_name=hn,
-            # future: allow passing raw text / extra hints
         )
         resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
         tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
     except Exception as e:
-        # Tagging failure shouldn't block receipt saving; degrade gracefully
         resolved_tags = []
         tag_evidence = None
         logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
@@ -1984,7 +2067,7 @@ def api_receipts_process(
                 ta_final = int(existing_total) if existing_total is not None and int(existing_total) > 0 else int(ta_candidate)
                 w_final = existing_weight if existing_weight is not None else pet_weight_kg
 
-                # ✅ tags policy:
+                # tags policy:
                 # - if user already has tags, keep them (do not override)
                 # - else apply resolved tags
                 tags_final = existing_tags if len(existing_tags) > 0 else resolved_tags
@@ -2042,7 +2125,7 @@ def api_receipts_process(
                             (record_uuid, it["itemName"], it.get("price"), it.get("categoryTag")),
                         )
 
-                # hospital candidates (only if record not confirmed)
+                # hospital candidates (best-effort; never block receipt save)
                 candidates_out: List[Dict[str, Any]] = []
                 record_confirmed = row.get("hospital_mgmt_no") is not None
                 if not record_confirmed:
@@ -2052,57 +2135,71 @@ def api_receipts_process(
                     name_for_match = hn or ""
                     addr_for_match = addr_hint or ""
                     if (name_for_match.strip() != "") or (addr_for_match.strip() != ""):
-                        cur.execute(
-                            "DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s",
-                            (record_uuid,),
-                        )
-                        cur.execute(
-                            """
-                            SELECT
-                                c.hospital_mgmt_no,
-                                c.name,
-                                c.road_address,
-                                c.jibun_address,
-                                c.lat,
-                                c.lng,
-                                c.score,
-                                h.is_custom_entry
-                            FROM public.find_hospital_candidates_weighted(%s, %s, %s, %s) c
-                            JOIN public.hospitals h
-                              ON h.hospital_mgmt_no = c.hospital_mgmt_no
-                            """,
-                            (uid, name_for_match, addr_for_match, limit_n),
-                        )
-                        cand_rows = cur.fetchall() or []
-
-                        for idx, c in enumerate(cand_rows, start=1):
+                        # Some deployments may not have the candidates table/function yet.
+                        # We isolate this step with a SAVEPOINT so a failure does not abort the whole transaction.
+                        cur.execute("SAVEPOINT cand_sp")
+                        try:
+                            cur.execute(
+                                "DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s",
+                                (record_uuid,),
+                            )
                             cur.execute(
                                 """
-                                INSERT INTO public.health_record_hospital_candidates
-                                    (record_id, hospital_mgmt_no, rank, score)
-                                VALUES
-                                    (%s, %s, %s, %s)
-                                ON CONFLICT (record_id, hospital_mgmt_no) DO UPDATE SET
-                                    rank = EXCLUDED.rank,
-                                    score = EXCLUDED.score
+                                SELECT
+                                    c.hospital_mgmt_no,
+                                    c.name,
+                                    c.road_address,
+                                    c.jibun_address,
+                                    c.lat,
+                                    c.lng,
+                                    c.score,
+                                    h.is_custom_entry
+                                FROM public.find_hospital_candidates_weighted(%s, %s, %s, %s) c
+                                JOIN public.hospitals h
+                                  ON h.hospital_mgmt_no = c.hospital_mgmt_no
                                 """,
-                                (record_uuid, c["hospital_mgmt_no"], idx, c.get("score")),
+                                (uid, name_for_match, addr_for_match, limit_n),
                             )
+                            cand_rows = cur.fetchall() or []
 
-                            candidates_out.append(
-                                {
-                                    "rank": idx,
-                                    "score": float(c["score"]) if c.get("score") is not None else None,
-                                    "hospitalMgmtNo": c["hospital_mgmt_no"],
-                                    "name": c["name"],
-                                    "roadAddress": c.get("road_address"),
-                                    "jibunAddress": c.get("jibun_address"),
-                                    "lat": c.get("lat"),
-                                    "lng": c.get("lng"),
-                                    "isCustomEntry": bool(c.get("is_custom_entry")),
-                                }
-                            )
+                            for idx, c in enumerate(cand_rows, start=1):
+                                cur.execute(
+                                    """
+                                    INSERT INTO public.health_record_hospital_candidates
+                                        (record_id, hospital_mgmt_no, rank, score)
+                                    VALUES
+                                        (%s, %s, %s, %s)
+                                    ON CONFLICT (record_id, hospital_mgmt_no) DO UPDATE SET
+                                        rank = EXCLUDED.rank,
+                                        score = EXCLUDED.score
+                                    """,
+                                    (record_uuid, c["hospital_mgmt_no"], idx, c.get("score")),
+                                )
 
+                                candidates_out.append(
+                                    {
+                                        "rank": idx,
+                                        "score": float(c["score"]) if c.get("score") is not None else None,
+                                        "hospitalMgmtNo": c["hospital_mgmt_no"],
+                                        "name": c["name"],
+                                        "roadAddress": c.get("road_address"),
+                                        "jibunAddress": c.get("jibun_address"),
+                                        "lat": c.get("lat"),
+                                        "lng": c.get("lng"),
+                                        "isCustomEntry": bool(c.get("is_custom_entry")),
+                                    }
+                                )
+
+                            cur.execute("RELEASE SAVEPOINT cand_sp")
+                        except Exception as e:
+                            # clear failed sub-transaction and continue
+                            try:
+                                cur.execute("ROLLBACK TO SAVEPOINT cand_sp")
+                                cur.execute("RELEASE SAVEPOINT cand_sp")
+                            except Exception:
+                                pass
+                            candidates_out = []
+                            logger.warning("[Candidates] generation failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
                 cur.execute(
                     """
                     SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
@@ -2123,7 +2220,6 @@ def api_receipts_process(
                 return jsonable_encoder(payload)
 
     except HTTPException as he:
-        # DB 실패 시 업로드 파일 정리 시도(즉시)
         try:
             delete_storage_object_if_exists(receipt_path)
         except Exception:
@@ -2312,7 +2408,7 @@ def delete_pdf_document(
     ✅ Soft delete only.
     - sets deleted_at=now()
     - trigger enqueues storage delete job using OLD path
-    - trigger sets bytes=0 and path dummy/null per schema policy
+    - trigger sets bytes=0 and path NULL per schema policy
     """
     uid = (user.get("uid") or "").strip()
     doc_uuid = _uuid_or_400(docId, "docId")
@@ -2492,7 +2588,7 @@ def storage_signed_url(
 
 
 # =========================================================
-# Backup endpoints
+# Backup endpoints (Snapshot storage)
 # =========================================================
 @app.post("/api/backup/upload", response_model=BackupUploadResponse)
 def backup_upload(req: BackupUploadRequest = Body(...), user: Dict[str, Any] = Depends(get_current_user)):
@@ -2589,7 +2685,7 @@ def backup_latest(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 # =========================================================
-# Migration tokens + migration execution
+# Migration tokens + migration execution (snapshot fallback)
 # =========================================================
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -2724,6 +2820,7 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
         db_execute("UPDATE public.migration_tokens SET status='failed' WHERE code_hash=%s", (code_hash,))
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage copy failed"))
 
+    # DB-side migration: should handle rollups + path rewrite + job merge safely
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2766,7 +2863,7 @@ def migration_execute(req: MigrationExecuteRequest, user: Dict[str, Any] = Depen
 
 
 # =========================================================
-# OCR ItemName Map APIs (unchanged)
+# OCR ItemName Map APIs
 # =========================================================
 @app.get("/api/ocr/item-maps/list")
 def list_item_maps(
@@ -3101,5 +3198,3 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
         "totalAmountSum_active": int(total_amount["s"]),
         "updatedAt": datetime.utcnow().isoformat() + "Z",
     }
-
-
