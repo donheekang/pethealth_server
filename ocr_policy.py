@@ -722,11 +722,16 @@ def _gemini_parse_receipt_full(
             parts=parts,
             timeout_seconds=timeout_seconds,
         )
+        import logging
+        _glog = logging.getLogger("ocr_policy")
+        _glog.info(f"[Gemini-call] raw_out_len={len(out) if out else 0}, preview={repr((out or '')[:300])}")
         j = _extract_json_from_model_text(out)
+        _glog.info(f"[Gemini-call] parsed_json={'ok' if isinstance(j, dict) else 'FAIL'}, type={type(j).__name__}")
         if isinstance(j, dict):
             return j
-    except Exception:
-        pass
+    except Exception as e:
+        import logging
+        logging.getLogger("ocr_policy").error(f"[Gemini-call] EXCEPTION: {type(e).__name__}: {e}")
     return None
 
 
