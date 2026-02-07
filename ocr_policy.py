@@ -594,21 +594,95 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
   "visitDate": "YYYY-MM-DD" or null,
   "totalAmount": integer or null,
   "items": [
-    {"itemName": "진료항목명", "price": integer_or_null, "categoryTag": "tag_or_null"}
+    {
+      "itemName": "진료항목명",
+      "price": integer_or_null,
+      "categoryTag": "standard_tag_code_or_null",
+      "standardName": "한글 표준명 or null"
+    }
   ],
-  "tags": ["tag1", "tag2"]
+  "tags": ["tag_code1", "tag_code2"]
 }
 
 RULES:
 1. items = ONLY real medical treatments, vaccines, medicines, tests, procedures.
 2. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
-3. categoryTag per item must be one of: vaccine, surgery, dental, checkup, lab, medicine, hospitalization, emergency, or null.
-4. tags = list of unique categoryTags found across all items.
-5. Normalize: "Rabbies"/"RA"/"R/A"/"광견병" → "Rabies" (categoryTag: "vaccine")
-6. Normalize: "x ray"/"X Ray" → "X-ray" (categoryTag: "lab")
-7. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
-8. If a price looks like just "115" on a Korean receipt, it likely means 115원 (not 115,000).
-9. Be precise with prices — copy exact amounts from the receipt.
+3. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
+4. Be precise with prices — copy exact amounts from the receipt.
+
+STANDARD TAG CODES (use these exact codes for categoryTag):
+검사:
+  exam_blood = 혈액검사 (CBC, chemistry, biochem, blood test, 혈검, 피검)
+  exam_xray = X-ray (엑스레이, radiograph, 방사선)
+  exam_ultrasound = 초음파 (ultrasound, sono, 복부초음파, 심장초음파)
+  exam_lab_panel = 종합검사 (종합검진, lab panel, screening)
+  exam_urine = 소변검사 (urinalysis, UA, urine test)
+  exam_fecal = 대변검사 (fecal, stool test, 분변검사)
+  exam_fecal_pcr = 대변 PCR (fecal PCR, GI PCR)
+  exam_allergy = 알러지 검사 (allergy test, IgE)
+  exam_heart = 심장검사 (ECG, EKG, echo, 심전도, 심초음파)
+  exam_eye = 안과검사 (schirmer, fluorescein, IOP, 안압)
+  exam_skin = 피부검사 (skin scraping, cytology, 진균)
+  exam_sdma = SDMA (신장마커, renal SDMA)
+  exam_probnp = proBNP (심장마커, NT-proBNP, BNP)
+  exam_fructosamine = 당화알부민 (fructosamine, glycated albumin)
+  exam_glucose_curve = 혈당곡선 (glucose curve)
+  exam_blood_gas = 혈액가스 (blood gas, BGA, i-stat)
+  exam_general = 정밀검사/검진 (기본검사, 초진, 재진, 진찰, consult)
+
+예방접종:
+  vaccine_rabies = 광견병 백신 (rabies, rabbies, RA, R/A, 광견)
+  vaccine_comprehensive = 종합백신 (DHPP, DHPPI, DHLPP, FVRCP, 5종, 6종, 혼합백신)
+  vaccine_corona = 코로나 백신 (corona, coronavirus, 코로나장염)
+  vaccine_kennel = 켄넬코프 (kennel cough, bordetella)
+  vaccine_fip = FIP (전염성복막염)
+  vaccine_parainfluenza = 파라인플루엔자 (parainfluenza, CPiV)
+  vaccine_lepto = 렙토 (lepto, leptospirosis, L2, L4)
+
+예방약/구충:
+  prevent_heartworm = 심장사상충 (heartworm, heartgard, 하트가드, 넥스가드스펙트라)
+  prevent_external = 외부기생충 (flea, tick, bravecto, nexgard, frontline, 벼룩, 진드기)
+  prevent_deworming = 구충 (deworm, drontal, milbemax, 회충, 내부기생충)
+
+처방약:
+  drug_antibiotic = 항생제 (antibiotic, amoxicillin, cephalexin, convenia, doxycycline, metronidazole, baytril)
+  drug_pain_antiinflammatory = 진통/소염 NSAID (meloxicam, carprofen, rimadyl, galliprant, 진통제, 소염제)
+  drug_steroid = 스테로이드 (steroid, prednisone, prednisolone, dexamethasone)
+  drug_gi = 위장약 (famotidine, omeprazole, cerenia, 구토, 설사, 장염)
+  drug_allergy = 알러지약 (apoquel, cytopoint, cetirizine, 가려움)
+  drug_eye = 안약 (eye drop, tobramycin, 점안)
+  drug_ear = 귀약 (otic, otomax, surolan, 외이염)
+  drug_skin = 피부약 (chlorhexidine, ketoconazole, 피부염)
+  drug_general = 약/처방 (일반 약품, medication, Rx)
+
+처치/진료:
+  care_injection = 주사 (injection, SC, IM, IV)
+  care_procedure_fee = 처치료 (procedure fee, treatment fee, 시술료)
+  care_dressing = 드레싱 (bandage, gauze, 소독, 붕대)
+  care_e_collar = 넥카라 (e-collar, cone)
+  care_prescription_diet = 처방식 (prescription diet, Hill's k/d, Royal Canin, 처방사료)
+
+수술/치과/기타:
+  surgery_general = 수술 (surgery, spay, neuter, 중성화, 마취, 봉합)
+  dental_scaling = 스케일링 (scaling, dental cleaning, 치석)
+  dental_extraction = 발치 (extraction)
+  hospitalization = 입원 (hospitalization, ICU, 입원비)
+  grooming = 미용 (grooming, bath, trim)
+  checkup_general = 기본진료 (checkup, consult, 초진, 재진)
+  etc_other = 기타
+
+MAPPING RULES:
+- Use the EXACT tag code from above for categoryTag.
+- standardName = the Korean standard name shown after "=" in the tag list.
+- Examples:
+  "Rabies" → categoryTag: "vaccine_rabies", standardName: "광견병 백신"
+  "X-ray" → categoryTag: "exam_xray", standardName: "X-ray"
+  "DHPP" → categoryTag: "vaccine_comprehensive", standardName: "종합백신"
+  "CBC" → categoryTag: "exam_blood", standardName: "혈액검사"
+  "스케일링" → categoryTag: "dental_scaling", standardName: "스케일링"
+  "넥스가드" → categoryTag: "prevent_external", standardName: "외부기생충"
+- tags = list of unique categoryTag codes found across all items.
+- If you cannot determine the tag, set categoryTag: null, standardName: null.
 """
 
 
@@ -656,6 +730,39 @@ def _gemini_parse_receipt_full(
     return None
 
 
+# Valid standard tag codes (matching iOS ReceiptTag enum)
+_VALID_TAG_CODES: set = {
+    # 검사
+    "exam_blood", "exam_xray", "exam_ultrasound", "exam_lab_panel",
+    "exam_urine", "exam_fecal", "exam_fecal_pcr", "exam_allergy",
+    "exam_heart", "exam_eye", "exam_skin", "exam_sdma", "exam_probnp",
+    "exam_fructosamine", "exam_glucose_curve", "exam_blood_gas", "exam_general",
+    # 예방접종
+    "vaccine_rabies", "vaccine_comprehensive", "vaccine_corona",
+    "vaccine_kennel", "vaccine_fip", "vaccine_parainfluenza", "vaccine_lepto",
+    # 예방약/구충
+    "prevent_heartworm", "prevent_external", "prevent_deworming",
+    # 처방약
+    "drug_antibiotic", "drug_pain_antiinflammatory", "drug_steroid",
+    "drug_gi", "drug_allergy", "drug_eye", "drug_ear", "drug_skin", "drug_general",
+    # 처치/진료
+    "care_injection", "care_procedure_fee", "care_dressing",
+    "care_e_collar", "care_prescription_diet",
+    # 수술/치과/기타
+    "surgery_general", "dental_scaling", "dental_extraction",
+    "hospitalization", "grooming", "checkup_general", "etc_other",
+    # iOS ReceiptTag enum aliases (medicine_ prefix)
+    "medicine_antibiotic", "medicine_anti_inflammatory", "medicine_allergy",
+    "medicine_gi", "medicine_ear", "medicine_skin", "medicine_eye",
+    "medicine_painkiller", "medicine_steroid",
+    # iOS additional
+    "ortho_patella", "ortho_arthritis", "grooming_basic",
+    # Legacy broad categories (backward compat)
+    "vaccine", "surgery", "dental", "checkup", "lab", "medicine",
+    "hospitalization", "emergency",
+}
+
+
 def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """Normalize Gemini-first result into (parsed, tags)."""
     parsed: Dict[str, Any] = {
@@ -695,13 +802,23 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             pr = _coerce_int_amount(it.get("price"))
             if pr is not None and pr < 0:
                 pr = None
-            ct = (it.get("categoryTag") or "").strip().lower() or None
-            if ct and ct not in ("vaccine", "surgery", "dental", "checkup", "lab",
-                                  "medicine", "hospitalization", "emergency"):
+
+            ct = (it.get("categoryTag") or "").strip() or None
+            sn = (it.get("standardName") or "").strip() or None
+
+            # Validate tag code against known standard codes
+            if ct and ct.lower() not in _VALID_TAG_CODES:
                 ct = None
             if ct:
+                ct = ct.lower()
                 tags_set.add(ct)
-            cleaned.append({"itemName": nm, "price": pr, "categoryTag": ct})
+
+            cleaned.append({
+                "itemName": nm,
+                "price": pr,
+                "categoryTag": ct,
+                "standardName": sn,
+            })
 
     parsed["items"] = cleaned
 
@@ -710,7 +827,7 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
     if isinstance(raw_tags, list):
         for t in raw_tags:
             ts = str(t).strip().lower()
-            if ts:
+            if ts and ts in _VALID_TAG_CODES:
                 tags_set.add(ts)
 
     return parsed, list(tags_set)[:10]
@@ -942,6 +1059,8 @@ def process_receipt_image(
         items_for_main.append({
             "name": it.get("itemName") or "",
             "price": it.get("price"),
+            "categoryTag": it.get("categoryTag"),
+            "standardName": it.get("standardName"),
         })
 
     meta = {
