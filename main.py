@@ -1948,15 +1948,6 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
 #   - DELETE /api/receipts/draft/delete   : cancel draft (delete draft object)
 # =========================================================
 
-import os
-import re
-import uuid
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
-
-from fastapi import Depends, File, Form, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field
-
 # -----------------------------
 # Draft path helper
 # -----------------------------
