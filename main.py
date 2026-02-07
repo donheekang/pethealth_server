@@ -720,7 +720,13 @@ def _backup_prefix(uid: str) -> str:
 
 
 def _receipt_path(uid: str, pet_id: str, record_id: str) -> str:
+    """마스킹본 경로 (앱 표시용, 기본)"""
     return f"{_user_prefix(uid, pet_id)}/receipts/{record_id}.webp"
+
+
+def _receipt_original_path(uid: str, pet_id: str, record_id: str) -> str:
+    """원본 경로 (보험 청구 PDF용)"""
+    return f"{_user_prefix(uid, pet_id)}/receipts/{record_id}_original.webp"
 
 
 def _doc_pdf_path(uid: str, pet_id: str, doc_type: str, doc_id: str) -> str:
@@ -1710,7 +1716,8 @@ def process_receipt(
     ocr_text = result.get("ocr_text") or ""
     items_raw = result.get("items") or []
     meta = result.get("meta") or {}
-    webp_bytes = result.get("webp_bytes") or raw
+    webp_bytes = result.get("webp_bytes") or raw          # 마스킹본
+    original_webp = result.get("original_webp_bytes")      # 원본
     content_type = result.get("content_type") or "image/webp"
 
     ocr_hospital_name_raw = meta.get("hospital_name") or ""
@@ -1813,7 +1820,12 @@ def process_receipt(
     file_size = int(len(webp_bytes))
 
     try:
+        # 마스킹본 (앱 표시용)
         upload_bytes_to_storage(file_path, webp_bytes, content_type)
+        # 원본 (보험 청구 PDF용)
+        if original_webp:
+            orig_path = _receipt_original_path(uid, str(pet_uuid), str(record_uuid))
+            upload_bytes_to_storage(orig_path, original_webp, content_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
