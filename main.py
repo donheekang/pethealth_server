@@ -2256,7 +2256,7 @@ def api_receipts_process(
 
         safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-       # 3) resolve record tags (module, your standard codes)
+# 3) resolve record tags (module, your standard codes)
 _require_module(tag_policy, "tag_policy")
 
 tag_result: Dict[str, Any] = {}
@@ -2302,9 +2302,6 @@ for it in safe_items:
         ct2 = item_tag_map.get(_norm_key(it.get("itemName") or ""))
         if ct2:
             it["categoryTag"] = ct2
-
-
-
 
     # ✅ 가격이 하나도 없으면: (1) 항목 1개면 그 항목에 total을 넣고, (2) 항목이 없으면 fallback 추가
     has_any_price = any(isinstance(x.get("price"), int) and int(x.get("price")) > 0 for x in safe_items)
