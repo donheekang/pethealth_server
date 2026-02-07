@@ -1017,9 +1017,12 @@ def process_receipt(
             except Exception:
                 pass
 
-    # ── 4) Redact image (best-effort with Vision tokens) ──
+    # ── 4) Create both original + redacted webp ──
+    original_webp = _to_webp_bytes(img, quality=int(receipt_webp_quality or 85))
     redacted = _redact_image_with_vision_tokens(img.copy(), vision_resp)
-    webp_bytes = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
+    redacted_webp = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
+    # webp_bytes = redacted for backward compat (앱 표시용)
+    webp_bytes = redacted_webp
 
     # ── 5) Build final parsed result ──
     if gemini_parsed and gemini_parsed.get("items"):
@@ -1056,7 +1059,7 @@ def process_receipt(
     # Attach tags to hints for main.py
     hints["tags"] = gemini_tags if gemini_tags else []
 
-    return webp_bytes, parsed, hints
+    return webp_bytes, original_webp, parsed, hints
 
 
 # =========================================================
@@ -1090,7 +1093,7 @@ def process_receipt_image(
         raise OCRImageError("empty raw bytes")
 
     try:
-        webp_bytes, parsed, hints = process_receipt(
+        webp_bytes, original_webp, parsed, hints = process_receipt(
             raw_bytes,
             google_credentials="",
             ocr_timeout_seconds=timeout,
@@ -1146,6 +1149,7 @@ def process_receipt_image(
         "items": items_for_main,
         "meta": meta,
         "webp_bytes": webp_bytes,
+        "original_webp_bytes": original_webp,
         "content_type": "image/webp",
     }
 
