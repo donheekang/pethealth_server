@@ -903,6 +903,10 @@ def process_receipt(
     gemini_parsed = None
     gemini_tags: List[str] = []
 
+    import logging
+    _log = logging.getLogger("ocr_policy")
+    _log.info(f"[Gemini] enabled={g_enabled}, key_present={bool(g_key.strip())}, model={g_model}")
+
     if g_enabled and g_key.strip():
         try:
             gj = _gemini_parse_receipt_full(
@@ -911,12 +915,17 @@ def process_receipt(
                 model=g_model,
                 timeout_seconds=g_timeout,
             )
+            _log.info(f"[Gemini] raw result type={type(gj).__name__}, keys={list(gj.keys()) if isinstance(gj, dict) else 'N/A'}")
             if isinstance(gj, dict):
                 gemini_parsed, gemini_tags = _normalize_gemini_full_result(gj)
                 hints["geminiUsed"] = True
                 hints["ocrEngine"] = f"gemini:{g_model}"
+                _log.info(f"[Gemini] items={len(gemini_parsed.get('items', []))}, tags={gemini_tags}")
         except Exception as e:
+            _log.error(f"[Gemini] ERROR: {e}")
             hints["geminiError"] = str(e)[:200]
+    else:
+        _log.warning(f"[Gemini] SKIPPED: enabled={g_enabled}, key_present={bool(g_key.strip())}")
 
     # ── 3) Vision OCR (for redaction + fallback text) ──
     ocr_text = ""
