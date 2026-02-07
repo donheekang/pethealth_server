@@ -1626,11 +1626,11 @@ def process_receipt(
             gemini_model_name=str(settings.GEMINI_MODEL_NAME),
             gemini_timeout=int(settings.GEMINI_TIMEOUT_SECONDS),
         )
-    except ocr_policy.OCRTimeoutError as e:
+    except getattr(ocr_policy, "OCRTimeoutError", type(None)) as e:
         raise HTTPException(status_code=504, detail=f"OCR timeout: {e}")
-    except ocr_policy.OCRConcurrencyError as e:
+    except getattr(ocr_policy, "OCRConcurrencyError", type(None)) as e:
         raise HTTPException(status_code=429, detail=f"OCR busy: {e}")
-    except ocr_policy.OCRImageError as e:
+    except getattr(ocr_policy, "OCRImageError", type(None)) as e:
         raise HTTPException(status_code=400, detail=f"Image error: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="OCR error"))
@@ -1782,12 +1782,58 @@ def process_receipt(
                             except Exception as ce:
                                 logger.info("[DB] candidate insert failed (ignored): %s", _sanitize_for_log(_pg_message(ce)))
 
-                payload = dict(rec_row)
-                payload["items"] = [dict(x) for x in items_rows]
-                payload["ocrText"] = ocr_text[:2000]
-                payload["ocrMeta"] = meta
+                # Build hospital candidates list for response
+                resp_candidates = []
+                if hosp_name and not hosp_mgmt:
+                    cur.execute(
+                        "SELECT c.rank, c.score, h.hospital_mgmt_no, h.name, h.road_address, h.jibun_address, h.lat, h.lng, h.is_custom_entry FROM public.health_record_hospital_candidates c JOIN public.hospitals h ON h.hospital_mgmt_no = c.hospital_mgmt_no WHERE c.record_id = %s ORDER BY c.rank ASC",
+                        (record_uuid,),
+                    )
+                    cand_rows = cur.fetchall() or []
+                    for cr in cand_rows:
+                        resp_candidates.append({
+                            "rank": int(cr["rank"]),
+                            "score": float(cr["score"]) if cr.get("score") is not None else None,
+                            "hospitalMgmtNo": cr["hospital_mgmt_no"],
+                            "name": cr["name"],
+                            "roadAddress": cr.get("road_address"),
+                            "jibunAddress": cr.get("jibun_address"),
+                            "lat": cr.get("lat"),
+                            "lng": cr.get("lng"),
+                            "isCustomEntry": bool(cr.get("is_custom_entry")),
+                        })
 
-                return jsonable_encoder(payload)
+                # ── Response: iOS ReceiptDraftResponseDTO 포맷 ──
+                resp_items = []
+                for x in items_rows:
+                    resp_items.append({
+                        "itemName": x.get("item_name") or "",
+                        "price": x.get("price"),
+                        "categoryTag": x.get("category_tag"),
+                    })
+
+                draft_response = {
+                    "mode": "direct",
+                    "draftId": str(rec_row["id"]),
+                    "petId": str(rec_row["pet_id"]),
+                    "draftReceiptPath": rec_row.get("receipt_image_path") or file_path,
+                    "fileSizeBytes": int(rec_row.get("file_size_bytes") or file_size),
+                    "visitDate": rec_row["visit_date"].isoformat() if hasattr(rec_row.get("visit_date"), "isoformat") else str(rec_row.get("visit_date") or vd),
+                    "hospitalName": rec_row.get("hospital_name"),
+                    "hospitalMgmtNo": rec_row.get("hospital_mgmt_no"),
+                    "totalAmount": int(rec_row.get("total_amount") or 0),
+                    "petWeightAtVisit": float(rec_row["pet_weight_at_visit"]) if rec_row.get("pet_weight_at_visit") is not None else None,
+                    "tags": rec_row.get("tags") or [],
+                    "items": resp_items,
+                    "hospitalCandidates": resp_candidates if resp_candidates else None,
+                    "hospitalCandidateCount": len(resp_candidates) if resp_candidates else 0,
+                    "hospitalConfirmed": bool(rec_row.get("hospital_mgmt_no")),
+                    "tagEvidence": None,
+                    "ocrText": ocr_text[:2000],
+                    "ocrMeta": meta,
+                }
+
+                return draft_response
 
     except HTTPException:
         raise
