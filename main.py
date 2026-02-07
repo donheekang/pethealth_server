@@ -1943,159 +1943,19 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
         raise
 
 
-# =========================================================
-# Receipts: OCR draft + Commit (NO schema changes)
-#   - /api/receipts/process : OCR only + store draft receipt in storage (NO DB write)
-#   - /api/receipts/commit  : create DB record + move draft receipt to final path + items + candidates
-#   - /api/receipts/draft/delete : cancel draft (delete draft object)
-# =========================================================
-
-# -----------------------------
-# Draft path helpers
-# -----------------------------
-def _draft_receipt_path(uid: str, pet_id: str, draft_id: str) -> str:
-    return f"{_user_prefix(uid, pet_id)}/draft_receipts/{draft_id}.webp"
-
-
-def download_bytes_from_storage(path: str) -> bytes:
-    b = get_bucket()
-    blob = b.blob(path)
-    if not blob.exists():
-        raise HTTPException(status_code=404, detail="draft object not found in storage")
-    return blob.download_as_bytes()
-
-
-def copy_storage_object(src_path: str, dst_path: str) -> None:
-    b = get_bucket()
-    src = b.blob(src_path)
-    if not src.exists():
-        raise HTTPException(status_code=404, detail="source object not found in storage")
-
-    dst = b.blob(dst_path)
-    if dst.exists():
-        return
-
-    try:
-        b.copy_blob(src, b, dst_path)
-    except Exception:
-        data = src.download_as_bytes()
-        dst.upload_from_string(data, content_type="application/octet-stream")
-
-
-def move_storage_object(src_path: str, dst_path: str) -> None:
-    copy_storage_object(src_path, dst_path)
-    try:
-        delete_storage_object_if_exists(src_path)
-    except Exception:
-        pass
-
-
-# -----------------------------
-# DTOs
-# -----------------------------
-class ReceiptDraftItemDTO(BaseModel):
-    itemName: str
-    price: Optional[int] = None
-    categoryTag: Optional[str] = None
-
-
-class ReceiptDraftHospitalCandidateDTO(BaseModel):
-    rank: int
-    score: Optional[float] = None
-    hospitalMgmtNo: str
-    name: str
-    roadAddress: Optional[str] = None
-    jibunAddress: Optional[str] = None
-    lat: Optional[float] = None
-    lng: Optional[float] = None
-    isCustomEntry: bool
-
-
-class ReceiptDraftResponseDTO(BaseModel):
-    mode: str = "draft"
-    draftId: str
-    petId: str
-    draftReceiptPath: str
-    fileSizeBytes: int
-
-    visitDate: str
-    hospitalName: Optional[str] = None
-    hospitalMgmtNo: Optional[str] = None
-    totalAmount: int = 0
-    petWeightAtVisit: Optional[float] = None
-
-    tags: List[str] = Field(default_factory=list)
-    items: List[ReceiptDraftItemDTO] = Field(default_factory=list)
-
-    hospitalCandidates: List[ReceiptDraftHospitalCandidateDTO] = Field(default_factory=list)
-    hospitalCandidateCount: int = 0
-    hospitalConfirmed: bool = False
-
-    tagEvidence: Optional[Any] = None
-
-
-class ReceiptCommitRequestDTO(BaseModel):
-    petId: str
-    draftReceiptPath: str
-
-    visitDate: str
-    hospitalName: Optional[str] = None
-    hospitalMgmtNo: Optional[str] = None
-    totalAmount: Optional[int] = None
-    petWeightAtVisit: Optional[float] = None
-
-    tags: List[str] = Field(default_factory=list)
-    items: List[ReceiptDraftItemDTO] = Field(default_factory=list)
-
-    replaceItems: bool = True
-
-
-class ReceiptCommitResponseDTO(BaseModel):
-    id: str
-    pet_id: str
-
-    hospital_mgmt_no: Optional[str] = None
-    hospital_name: Optional[str] = None
-
-    visit_date: str
-    total_amount: int
-    pet_weight_at_visit: Optional[float] = None
-    tags: List[str] = Field(default_factory=list)
-
-    receipt_image_path: Optional[str] = None
-    file_size_bytes: int = 0
-
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
-    items: Optional[List[Dict[str, Any]]] = None
-
-    hospitalCandidates: Optional[List[Dict[str, Any]]] = None
-    hospitalCandidateCount: Optional[int] = None
-    hospitalConfirmed: Optional[bool] = None
-
-    tagEvidence: Optional[Any] = None
-
-
-class DraftDeleteResponseDTO(BaseModel):
-    ok: bool
-    deleted: bool
-    draftReceiptPath: str
-
-
-# =========================================================
-# POST /api/receipts/process  (OCR only + draft storage) ✅ NO DB WRITE
-# =========================================================
-@app.post("/api/receipts/process", response_model=ReceiptDraftResponseDTO)
+@app.post("/api/receipts/process")
 def api_receipts_process(
     petId: str = Form(...),
+    recordId: Optional[str] = Form(None),
     hospitalMgmtNo: Optional[str] = Form(None),
+    replaceItems: bool = Form(True),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
+    # ---- local helpers (copy/paste safe) ----
     _AMOUNT_RE = re.compile(r"([0-9][0-9,]*)")
-    _MONEY_TOKEN_RE = re.compile(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,}")
+    _MONEY_TOKEN_RE = re.compile(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,}")  # 30,000 or 30000+
     _DATE_RE = re.compile(r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b")
 
     _NOISE_TOKENS = [
@@ -2110,7 +1970,7 @@ def api_receipts_process(
     def _coerce_amount_int(v: Any) -> Optional[int]:
         if v is None:
             return None
-        if isinstance(v, bool):
+        if isinstance(v, bool):  # bool is subclass of int
             return None
         if isinstance(v, int):
             return int(v)
@@ -2141,14 +2001,22 @@ def api_receipts_process(
         if not n:
             return True
         low = n.lower()
+
+        # 날짜만 있는 라인 등 제거 (OCR 전체 텍스트 fallback에서 중요)
         if _DATE_RE.search(n):
+            # "날짜: 2025-11-28" 같은 건 토큰으로 걸러지지만
+            # "2025-11-28" 단독 라인 같은 것 방지
             if len(_norm_key(n)) <= 10:
                 return True
+
+        # 너무 짧은 단어는 제외 (오탐 방지)
         if len(_norm_key(n)) < 2:
             return True
+
         for t in _NOISE_TOKENS:
             if t in n or t in low:
                 return True
+
         return False
 
     def _extract_item_name(it: Dict[str, Any]) -> str:
@@ -2162,18 +2030,25 @@ def api_receipts_process(
         s = (line or "").strip()
         if not s:
             return ""
+        # 앞쪽 불릿/별 제거
         s = re.sub(r"^[\*\-\•\·\+]+", "", s).strip()
+
+        # "Rabbies 30,000 1 30,000" 같은 테이블 로우는
+        # 첫 '금액처럼 보이는' 토큰 앞까지만 이름으로 사용
         m = _MONEY_TOKEN_RE.search(s)
         if m:
             left = s[:m.start()].strip()
             if len(_norm_key(left)) >= 2:
                 s = left
+
         return s.strip()
 
     def _guess_price_from_text(line: str) -> Optional[int]:
         s = (line or "").strip()
         if not s:
             return None
+
+        # 1) "30,000원" 우선
         m_won = re.findall(r"([0-9][0-9,]*)\s*원", s)
         cand = []
         for x in m_won:
@@ -2183,6 +2058,7 @@ def api_receipts_process(
         if cand:
             return max(cand)
 
+        # 2) 그 외 숫자들 중 '금액처럼 보이는' 최대값
         m_all = _AMOUNT_RE.findall(s)
         nums: List[int] = []
         for x in m_all:
@@ -2216,6 +2092,7 @@ def api_receipts_process(
             return v
         return None
 
+    # ---- original logic ----
     upload = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail="file/image is required")
@@ -2228,6 +2105,8 @@ def api_receipts_process(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(petId, "petId")
+    record_uuid = _uuid_or_new(recordId, "recordId")
+
     pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
@@ -2243,7 +2122,7 @@ def api_receipts_process(
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
-    _require_module(ocr_policy, "ocr_policy")
+        _require_module(ocr_policy, "ocr_policy")
     try:
         webp_bytes, parsed, hints = ocr_policy.process_receipt(
             raw,
@@ -2262,32 +2141,35 @@ def api_receipts_process(
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
 
+    # ✅ downstream 안전장치
     if not isinstance(parsed, dict):
         parsed = {}
     if not isinstance(hints, dict):
         hints = {}
-
-    draft_id = str(uuid.uuid4())
-    draft_path = _draft_receipt_path(uid, str(pet_uuid), draft_id)
-
+    receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
-        upload_bytes_to_storage(draft_path, webp_bytes, "image/webp")
+        upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     file_size_bytes = int(len(webp_bytes))
 
+    # ✅ parsed 키/중첩 구조가 달라도 최대한 살려서 읽기
     visit_date_raw = None
     hospital_name_raw = None
     total_amount_raw = None
     items_raw = None
     ocr_text = None
 
-    roots: List[Dict[str, Any]] = [parsed]
-    for k in ("parsed", "receipt", "data", "result"):
-        v = parsed.get(k)
-        if isinstance(v, dict):
-            roots.append(v)
+    roots: List[Dict[str, Any]] = []
+    if isinstance(parsed, dict):
+        roots.append(parsed)
+        for k in ("parsed", "receipt", "data", "result"):
+            v = parsed.get(k)
+            if isinstance(v, dict):
+                roots.append(v)
 
     for r in roots:
         if visit_date_raw is None:
@@ -2302,22 +2184,32 @@ def api_receipts_process(
             ocr_text = _pick_first(r, ["text", "fullText", "rawText", "ocrText", "redactedText", "receiptText"])
 
     extracted_items: List[Any] = items_raw if isinstance(items_raw, list) else []
+
+    # ✅ items가 없으면 lines류라도 잡아보기
     if not extracted_items:
         for r in roots:
             lines_raw = _pick_first(r, ["lines", "textLines", "ocrLines", "rawLines", "lineTexts"])
             if isinstance(lines_raw, list) and lines_raw:
                 extracted_items = lines_raw
                 break
+
+    # ✅ 그것도 없으면 OCR 전체 텍스트를 라인으로 쪼개서 후보로 사용
     if (not extracted_items) and isinstance(ocr_text, str) and ocr_text.strip():
         extracted_items = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
 
-    vd_from_ocr: Optional[date] = _parse_date_flex(visit_date_raw) if isinstance(visit_date_raw, str) else None
+    vd_from_ocr: Optional[date] = None
+    if isinstance(visit_date_raw, str):
+        vd_from_ocr = _parse_date_flex(visit_date_raw)
+
     hn = hospital_name_raw.strip() if isinstance(hospital_name_raw, str) and hospital_name_raw.strip() else None
 
     ta_from_ocr: Optional[int] = _coerce_amount_int(total_amount_raw)
     if ta_from_ocr is not None and ta_from_ocr <= 0:
         ta_from_ocr = None
 
+    mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
+
+    # ✅ normalize items: dict + str 둘 다 지원
     safe_items: List[Dict[str, Any]] = []
     for it in extracted_items[:250]:
         nm = ""
@@ -2326,279 +2218,164 @@ def api_receipts_process(
 
         if isinstance(it, dict):
             nm = _extract_item_name(it)
-            raw_price = it.get("price") or it.get("amount") or it.get("value") or it.get("total")
-            ct = it.get("categoryTag") or it.get("category_tag")
+            raw_price = it.get("price")
+            if raw_price is None:
+                raw_price = it.get("amount") or it.get("value") or it.get("total")
+            ct = it.get("categoryTag")
+            if ct is None:
+                ct = it.get("category_tag")
+
         elif isinstance(it, str):
             nm = it.strip()
+
         else:
             continue
 
         if not nm:
             continue
+
+        # str 라인은 "Rabbies 30,000 1 30,000" 같은 경우가 많으니 이름만 정리
         nm_clean = _clean_item_name_from_line(nm)
-        if not nm_clean or _is_noise_line(nm_clean):
+        if not nm_clean:
+            continue
+
+        if _is_noise_line(nm_clean):
             continue
 
         pr = _coerce_amount_int(raw_price)
         if pr is None:
+            # 라인에서 직접 가격 추측
             pr = _guess_price_from_text(nm)
 
+        if pr is not None and pr < 0:
+            pr = None
+
+        # 너무 작은 금액 제거 (9원/58원 등 OCR 쓰레기)
         if pr is not None and pr < 100:
             continue
 
         safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-    _require_module(tag_policy, "tag_policy")
-    ocr_text_for_tag = ocr_text if isinstance(ocr_text, str) else str(parsed.get("ocrText") or parsed.get("text") or "")
+       # 3) resolve record tags (module, your standard codes)
+_require_module(tag_policy, "tag_policy")
 
-    tag_result: Dict[str, Any] = {"tags": [], "itemCategoryTags": [], "evidence": None}
-    try:
-        tr = tag_policy.resolve_record_tags(  # type: ignore
-            items=safe_items,
-            hospital_name=hn,
-            ocr_text=ocr_text_for_tag or "",
-            record_thresh=int(settings.TAG_RECORD_THRESHOLD),
-            item_thresh=int(settings.TAG_ITEM_THRESHOLD),
-            gemini_enabled=bool(settings.GEMINI_ENABLED),
-            gemini_api_key=str(settings.GEMINI_API_KEY or ""),
-            gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),
-            gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
-        )
-        if isinstance(tr, dict):
-            tag_result = tr
-    except Exception as e:
-        logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
+tag_result: Dict[str, Any] = {}
+resolved_tags: List[str] = []
+tag_evidence: Any = None
+item_tag_map: Dict[str, str] = {}   # ✅ 무조건 먼저 선언
 
-    resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
-    tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
+try:
+    tag_result = tag_policy.resolve_record_tags(  # type: ignore
+        items=safe_items,
+        hospital_name=hn,
+        ocr_text=str((hints.get("ocrText") or hints.get("ocrTextPreview") or "") if isinstance(hints, dict) else ""),
+        record_thresh=int(settings.TAG_RECORD_THRESHOLD),
+        item_thresh=int(settings.TAG_ITEM_THRESHOLD),
+        gemini_enabled=bool(settings.GEMINI_ENABLED),
+        gemini_api_key=str(settings.GEMINI_API_KEY or ""),
+        gemini_model_name=str(settings.GEMINI_MODEL_NAME or "gemini-2.5-flash"),
+        gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
+    )
+    if isinstance(tag_result, dict):
+        resolved_tags = _clean_tags(tag_result.get("tags"))
+        tag_evidence = tag_result.get("evidence")
 
-    # idx-based categoryTag fill (best-effort)
-    try:
-        by_idx: Dict[int, str] = {}
-        rows = tag_result.get("itemCategoryTags") if isinstance(tag_result, dict) else None
+        rows = tag_result.get("itemCategoryTags")
         if isinstance(rows, list):
             for r in rows:
-                if isinstance(r, dict) and isinstance(r.get("idx"), int) and isinstance(r.get("categoryTag"), str):
-                    ct = r["categoryTag"].strip()
-                    if ct:
-                        by_idx[int(r["idx"])] = ct
-        for i, it in enumerate(safe_items):
-            if not it.get("categoryTag") and i in by_idx:
-                it["categoryTag"] = by_idx[i]
-    except Exception:
-        pass
+                if not isinstance(r, dict):
+                    continue
+                nm2 = (r.get("itemName") or "").strip()
+                ct2 = (r.get("categoryTag") or "").strip()
+                if nm2 and ct2:
+                    item_tag_map[_norm_key(nm2)] = ct2
 
-    items_sum = 0
-    for it in safe_items:
-        pr = it.get("price")
-        if isinstance(pr, int) and pr > 0:
-            items_sum += pr
+except Exception as e:
+    resolved_tags = []
+    tag_evidence = None
+    item_tag_map = {}
+    logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
 
-    ta_candidate = int(ta_from_ocr) if ta_from_ocr is not None and int(ta_from_ocr) > 0 else (items_sum if items_sum > 0 else 0)
+# ✅ tag_policy itemCategoryTags → safe_items.categoryTag 반영
+for it in safe_items:
+    if not it.get("categoryTag"):
+        ct2 = item_tag_map.get(_norm_key(it.get("itemName") or ""))
+        if ct2:
+            it["categoryTag"] = ct2
 
-    mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
-    if mgmt_input is not None:
-        hosp = db_fetchone(
-            """
-            SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
-            FROM public.hospitals
-            WHERE hospital_mgmt_no=%s
-            """,
-            (mgmt_input,),
-        )
-        if not hosp:
-            raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
-        if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
-            raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
 
-    candidates_out: List[Dict[str, Any]] = []
-    try:
-        limit_n = max(1, min(int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3), 10))
-        name_for_match = hn or ""
-        addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
-        addr_for_match = addr_hint if isinstance(addr_hint, str) else ""
-        if (name_for_match.strip() != "") or (addr_for_match.strip() != ""):
-            rows = db_fetchall(
-                """
-                SELECT
-                    c.hospital_mgmt_no,
-                    c.name,
-                    c.road_address,
-                    c.jibun_address,
-                    c.lat,
-                    c.lng,
-                    c.score,
-                    h.is_custom_entry
-                FROM public.find_hospital_candidates_weighted(%s, %s, %s, %s) c
-                JOIN public.hospitals h
-                  ON h.hospital_mgmt_no = c.hospital_mgmt_no
-                """,
-                (uid, name_for_match, addr_for_match, limit_n),
+
+
+    # ✅ 가격이 하나도 없으면: (1) 항목 1개면 그 항목에 total을 넣고, (2) 항목이 없으면 fallback 추가
+    has_any_price = any(isinstance(x.get("price"), int) and int(x.get("price")) > 0 for x in safe_items)
+    if (not has_any_price) and (ta_from_ocr is not None) and (ta_from_ocr >= 100):
+        if len(safe_items) == 1 and safe_items[0].get("price") is None:
+            safe_items[0]["price"] = int(ta_from_ocr)
+        elif len(safe_items) == 0:
+            safe_items.append(
+                {
+                    "itemName": "진료비",
+                    "price": int(ta_from_ocr),
+                    "categoryTag": (resolved_tags[0] if resolved_tags else "checkup_general"),
+                }
             )
-            for idx, c in enumerate(rows, start=1):
-                candidates_out.append(
-                    {
-                        "rank": idx,
-                        "score": float(c["score"]) if c.get("score") is not None else None,
-                        "hospitalMgmtNo": c["hospital_mgmt_no"],
-                        "name": c["name"],
-                        "roadAddress": c.get("road_address"),
-                        "jibunAddress": c.get("jibun_address"),
-                        "lat": c.get("lat"),
-                        "lng": c.get("lng"),
-                        "isCustomEntry": bool(c.get("is_custom_entry")),
-                    }
-                )
-    except Exception as e:
-        logger.warning("[Candidates] draft generation failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
-        candidates_out = []
 
-    vd_final = (vd_from_ocr or date.today()).isoformat()
-
-    return {
-        "mode": "draft",
-        "draftId": draft_id,
-        "petId": str(pet_uuid),
-        "draftReceiptPath": draft_path,
-        "fileSizeBytes": int(file_size_bytes),
-        "visitDate": vd_final,
-        "hospitalName": hn,
-        "hospitalMgmtNo": mgmt_input,
-        "totalAmount": int(ta_candidate),
-        "petWeightAtVisit": pet_weight_kg,
-        "tags": resolved_tags,
-        "items": safe_items,
-        "hospitalCandidates": candidates_out,
-        "hospitalCandidateCount": len(candidates_out),
-        "hospitalConfirmed": bool(mgmt_input),
-        "tagEvidence": tag_evidence,
-    }
-
-
-# =========================================================
-# DELETE /api/receipts/draft/delete  (cancel before save)
-# =========================================================
-@app.delete("/api/receipts/draft/delete", response_model=DraftDeleteResponseDTO)
-def api_receipts_draft_delete(
-    draftReceiptPath: str = Query(...),
-    user: Dict[str, Any] = Depends(get_current_user),
-):
-    uid = (user.get("uid") or "").strip()
-    if not uid:
-        raise HTTPException(status_code=401, detail="missing uid")
-
-    p = (draftReceiptPath or "").strip().lstrip("/")
-    if not p:
-        raise HTTPException(status_code=400, detail="draftReceiptPath is required")
-    if not p.startswith(f"users/{uid}/"):
-        raise HTTPException(status_code=403, detail="path is not under your user prefix")
-
-    deleted = False
-    try:
-        deleted = delete_storage_object_if_exists(p)
-    except Exception:
-        deleted = False
-
-    return {"ok": True, "deleted": bool(deleted), "draftReceiptPath": p}
-
-
-# =========================================================
-# POST /api/receipts/commit  (SAVE to DB + move receipt to final path)
-# =========================================================
-@app.post("/api/receipts/commit", response_model=ReceiptCommitResponseDTO)
-def api_receipts_commit(
-    req: ReceiptCommitRequestDTO,
-    user: Dict[str, Any] = Depends(get_current_user),
-):
-    uid = (user.get("uid") or "").strip()
-    if not uid:
-        raise HTTPException(status_code=401, detail="missing uid")
-
-    desired = _infer_membership_tier_from_token(user)
-    db_touch_user(uid, desired_tier=desired)
-
-    pet_uuid = _uuid_or_400(req.petId, "petId")
-    pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
-    if not pet:
-        raise HTTPException(status_code=404, detail="pet not found")
-
-    try:
-        visit_date = datetime.strptime(req.visitDate, "%Y-%m-%d").date()
-    except Exception:
-        raise HTTPException(status_code=400, detail="visitDate must be YYYY-MM-DD")
-
-    hospital_name = (req.hospitalName or "").strip() or None
-    hospital_mgmt_no = (req.hospitalMgmtNo or "").strip() or None
-
-    if hospital_mgmt_no is not None:
-        hosp = db_fetchone(
-            """
-            SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
-            FROM public.hospitals
-            WHERE hospital_mgmt_no=%s
-            """,
-            (hospital_mgmt_no,),
-        )
-        if not hosp:
-            raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
-        if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
-            raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
-
-    total_amount = 0
-    if req.totalAmount is not None:
-        try:
-            total_amount = int(req.totalAmount)
-        except Exception:
-            raise HTTPException(status_code=400, detail="totalAmount must be a number")
-    if total_amount < 0:
-        raise HTTPException(status_code=400, detail="totalAmount must be >= 0")
-
-    pet_weight_at_visit = req.petWeightAtVisit
-    if pet_weight_at_visit is not None:
-        try:
-            pet_weight_at_visit = float(pet_weight_at_visit)
-        except Exception:
-            raise HTTPException(status_code=400, detail="petWeightAtVisit must be a number")
-        if pet_weight_at_visit <= 0:
-            pet_weight_at_visit = None
-
-    items = req.items or []
-    items_sum = 0
-    for it in items:
-        if it.price is not None:
-            try:
-                p = int(it.price)
-            except Exception:
-                raise HTTPException(status_code=400, detail="item price must be a number")
-            if p < 0:
-                raise HTTPException(status_code=400, detail="item price must be >= 0")
-            items_sum += p
-
-    if total_amount <= 0 and items_sum > 0:
-        total_amount = items_sum
-
-    tags = _clean_tags(req.tags)
-
-    draft_path = (req.draftReceiptPath or "").strip().lstrip("/")
-    if not draft_path:
-        raise HTTPException(status_code=400, detail="draftReceiptPath is required")
-    if not draft_path.startswith(f"users/{uid}/"):
-        raise HTTPException(status_code=403, detail="draftReceiptPath is not under your user prefix")
-
-    record_uuid = uuid.uuid4()
-    final_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
-
-    raw = download_bytes_from_storage(draft_path)
-    file_size_bytes = int(len(raw))
-
-    try:
-        move_storage_object(draft_path, final_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage move failed"))
+    # hints
+    addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
+    addr_hint = addr_hint if isinstance(addr_hint, str) else None
 
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # mgmt_no scope check
+                if mgmt_input is not None:
+                    cur.execute(
+                        """
+                        SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
+                        FROM public.hospitals
+                        WHERE hospital_mgmt_no=%s
+                        """,
+                        (mgmt_input,),
+                    )
+                    hosp = cur.fetchone()
+                    if not hosp:
+                        raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
+                    if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
+                        raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
+
+                # block attaching to deleted record (no undelete)
+                cur.execute(
+                    """
+                    SELECT r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.deleted_at
+                    FROM public.health_records r
+                    JOIN public.pets p ON p.id = r.pet_id
+                    WHERE p.user_uid = %s AND r.id = %s
+                    """,
+                    (uid, record_uuid),
+                )
+                existing = cur.fetchone() or {}
+                if existing.get("deleted_at") is not None:
+                    raise HTTPException(status_code=409, detail="record is deleted (cannot attach receipt)")
+
+                existing_total = existing.get("total_amount")
+                existing_visit = existing.get("visit_date")
+                existing_weight = existing.get("pet_weight_at_visit")
+                existing_tags = existing.get("tags") if isinstance(existing.get("tags"), list) else []
+
+                items_sum = 0
+                for it in safe_items:
+                    pr = it.get("price")
+                    if isinstance(pr, int) and pr > 0:
+                        items_sum += pr
+
+                ta_candidate = int(ta_from_ocr) if ta_from_ocr is not None and int(ta_from_ocr) > 0 else (items_sum if items_sum > 0 else 0)
+
+                vd_final = existing_visit or vd_from_ocr or date.today()
+                ta_final = int(existing_total) if existing_total is not None and int(existing_total) > 0 else int(ta_candidate)
+                w_final = existing_weight if existing_weight is not None else pet_weight_kg
+
+                tags_final = existing_tags if len(existing_tags) > 0 else resolved_tags
+
                 cur.execute(
                     """
                     INSERT INTO public.health_records
@@ -2607,113 +2384,123 @@ def api_receipts_commit(
                     VALUES
                       (%s, %s, %s, %s, %s, %s, %s, %s,
                        %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                      pet_id = EXCLUDED.pet_id,
+                      hospital_mgmt_no = COALESCE(EXCLUDED.hospital_mgmt_no, public.health_records.hospital_mgmt_no),
+                      hospital_name = COALESCE(public.health_records.hospital_name, EXCLUDED.hospital_name),
+                      pet_weight_at_visit = COALESCE(public.health_records.pet_weight_at_visit, EXCLUDED.pet_weight_at_visit),
+                      visit_date = COALESCE(public.health_records.visit_date, EXCLUDED.visit_date),
+                      total_amount = CASE
+                        WHEN COALESCE(public.health_records.total_amount, 0) > 0 THEN public.health_records.total_amount
+                        ELSE EXCLUDED.total_amount
+                      END,
+                      tags = CASE
+                        WHEN public.health_records.tags IS NOT NULL AND cardinality(public.health_records.tags) > 0
+                          THEN public.health_records.tags
+                        ELSE EXCLUDED.tags
+                      END,
+                      receipt_image_path = EXCLUDED.receipt_image_path,
+                      file_size_bytes = EXCLUDED.file_size_bytes
+                    WHERE
+                      public.health_records.deleted_at IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM public.pets p
+                        WHERE p.id = EXCLUDED.pet_id AND p.user_uid = %s
+                      )
                     RETURNING
                       id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
                       receipt_image_path, file_size_bytes,
                       created_at, updated_at
                     """,
-                    (
-                        record_uuid,
-                        pet_uuid,
-                        hospital_mgmt_no,
-                        hospital_name,
-                        visit_date,
-                        total_amount,
-                        pet_weight_at_visit,
-                        tags,
-                        final_path,
-                        file_size_bytes,
-                    ),
+                    (record_uuid, pet_uuid, mgmt_input, hn, vd_final, ta_final, w_final, tags_final, receipt_path, file_size_bytes, uid),
                 )
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=500, detail=_internal_detail("Failed to insert health_record", kind="DB error"))
+                    raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert health_record", kind="DB error"))
 
-                if bool(req.replaceItems):
+                if replaceItems:
                     cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
-                for it in items:
-                    nm = (it.itemName or "").strip()
-                    if not nm:
-                        continue
-                    pr = it.price
-                    if pr is not None:
-                        pr = int(pr)
-                        if pr < 0:
-                            raise HTTPException(status_code=400, detail="item price must be >= 0")
-                    ct = (it.categoryTag or "").strip() or None
-                    cur.execute(
-                        """
-                        INSERT INTO public.health_items (record_id, item_name, price, category_tag)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (record_uuid, nm[:200], pr, ct),
-                    )
+                    for it in safe_items:
+                        cur.execute(
+                            """
+                            INSERT INTO public.health_items (record_id, item_name, price, category_tag)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (record_uuid, it["itemName"], it.get("price"), it.get("categoryTag")),
+                        )
 
+                # hospital candidates (best-effort; never block receipt save)
                 candidates_out: List[Dict[str, Any]] = []
-                if row.get("hospital_mgmt_no") is None:
-                    try:
-                        limit_n = max(1, min(int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3), 10))
-                        addr_for_match = ""
-                        name_for_match = hospital_name or ""
-                        if name_for_match.strip():
-                            cur.execute("SAVEPOINT cand_sp")
-                            try:
-                                cur.execute("DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s", (record_uuid,))
+                record_confirmed = row.get("hospital_mgmt_no") is not None
+                if not record_confirmed:
+                    limit_n = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
+                    limit_n = max(1, min(limit_n, 10))
+
+                    name_for_match = hn or ""
+                    addr_for_match = addr_hint or ""
+                    if (name_for_match.strip() != "") or (addr_for_match.strip() != ""):
+                        cur.execute("SAVEPOINT cand_sp")
+                        try:
+                            cur.execute(
+                                "DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s",
+                                (record_uuid,),
+                            )
+                            cur.execute(
+                                """
+                                SELECT
+                                    c.hospital_mgmt_no,
+                                    c.name,
+                                    c.road_address,
+                                    c.jibun_address,
+                                    c.lat,
+                                    c.lng,
+                                    c.score,
+                                    h.is_custom_entry
+                                FROM public.find_hospital_candidates_weighted(%s, %s, %s, %s) c
+                                JOIN public.hospitals h
+                                  ON h.hospital_mgmt_no = c.hospital_mgmt_no
+                                """,
+                                (uid, name_for_match, addr_for_match, limit_n),
+                            )
+                            cand_rows = cur.fetchall() or []
+
+                            for idx, c in enumerate(cand_rows, start=1):
                                 cur.execute(
                                     """
-                                    SELECT
-                                        c.hospital_mgmt_no,
-                                        c.name,
-                                        c.road_address,
-                                        c.jibun_address,
-                                        c.lat,
-                                        c.lng,
-                                        c.score,
-                                        h.is_custom_entry
-                                    FROM public.find_hospital_candidates_weighted(%s, %s, %s, %s) c
-                                    JOIN public.hospitals h
-                                      ON h.hospital_mgmt_no = c.hospital_mgmt_no
+                                    INSERT INTO public.health_record_hospital_candidates
+                                        (record_id, hospital_mgmt_no, rank, score)
+                                    VALUES
+                                        (%s, %s, %s, %s)
+                                    ON CONFLICT (record_id, hospital_mgmt_no) DO UPDATE SET
+                                        rank = EXCLUDED.rank,
+                                        score = EXCLUDED.score
                                     """,
-                                    (uid, name_for_match, addr_for_match, limit_n),
+                                    (record_uuid, c["hospital_mgmt_no"], idx, c.get("score")),
                                 )
-                                cand_rows = cur.fetchall() or []
-                                for idx, c in enumerate(cand_rows, start=1):
-                                    cur.execute(
-                                        """
-                                        INSERT INTO public.health_record_hospital_candidates
-                                            (record_id, hospital_mgmt_no, rank, score)
-                                        VALUES
-                                            (%s, %s, %s, %s)
-                                        ON CONFLICT (record_id, hospital_mgmt_no) DO UPDATE SET
-                                            rank = EXCLUDED.rank,
-                                            score = EXCLUDED.score
-                                        """,
-                                        (record_uuid, c["hospital_mgmt_no"], idx, c.get("score")),
-                                    )
-                                    candidates_out.append(
-                                        {
-                                            "rank": idx,
-                                            "score": float(c["score"]) if c.get("score") is not None else None,
-                                            "hospitalMgmtNo": c["hospital_mgmt_no"],
-                                            "name": c["name"],
-                                            "roadAddress": c.get("road_address"),
-                                            "jibunAddress": c.get("jibun_address"),
-                                            "lat": c.get("lat"),
-                                            "lng": c.get("lng"),
-                                            "isCustomEntry": bool(c.get("is_custom_entry")),
-                                        }
-                                    )
+
+                                candidates_out.append(
+                                    {
+                                        "rank": idx,
+                                        "score": float(c["score"]) if c.get("score") is not None else None,
+                                        "hospitalMgmtNo": c["hospital_mgmt_no"],
+                                        "name": c["name"],
+                                        "roadAddress": c.get("road_address"),
+                                        "jibunAddress": c.get("jibun_address"),
+                                        "lat": c.get("lat"),
+                                        "lng": c.get("lng"),
+                                        "isCustomEntry": bool(c.get("is_custom_entry")),
+                                    }
+                                )
+
+                            cur.execute("RELEASE SAVEPOINT cand_sp")
+                        except Exception as e:
+                            try:
+                                cur.execute("ROLLBACK TO SAVEPOINT cand_sp")
                                 cur.execute("RELEASE SAVEPOINT cand_sp")
-                            except Exception as e:
-                                try:
-                                    cur.execute("ROLLBACK TO SAVEPOINT cand_sp")
-                                    cur.execute("RELEASE SAVEPOINT cand_sp")
-                                except Exception:
-                                    pass
-                                candidates_out = []
-                                logger.warning("[Candidates] commit generation failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
-                    except Exception:
-                        candidates_out = []
+                            except Exception:
+                                pass
+                            candidates_out = []
+                            logger.warning("[Candidates] generation failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
 
                 cur.execute(
                     """
@@ -2726,43 +2513,30 @@ def api_receipts_commit(
                 )
                 items_rows = cur.fetchall() or []
 
-                created_at = row["created_at"].isoformat() if row.get("created_at") else None
-                updated_at = row["updated_at"].isoformat() if row.get("updated_at") else None
+                payload = dict(row)
+                payload["items"] = [dict(x) for x in items_rows]
+                payload["hospitalCandidates"] = candidates_out
+                payload["hospitalCandidateCount"] = len(candidates_out)
+                payload["hospitalConfirmed"] = bool(payload.get("hospital_mgmt_no"))
+                payload["tagEvidence"] = tag_evidence
+                return jsonable_encoder(payload)
 
-                return {
-                    "id": str(row["id"]),
-                    "pet_id": str(row["pet_id"]),
-                    "hospital_mgmt_no": row.get("hospital_mgmt_no"),
-                    "hospital_name": row.get("hospital_name"),
-                    "visit_date": row["visit_date"].isoformat() if hasattr(row.get("visit_date"), "isoformat") else str(row.get("visit_date")),
-                    "total_amount": int(row.get("total_amount") or 0),
-                    "pet_weight_at_visit": float(row["pet_weight_at_visit"]) if row.get("pet_weight_at_visit") is not None else None,
-                    "tags": row.get("tags") if isinstance(row.get("tags"), list) else [],
-                    "receipt_image_path": row.get("receipt_image_path"),
-                    "file_size_bytes": int(row.get("file_size_bytes") or 0),
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                    "items": [dict(x) for x in items_rows],
-                    "hospitalCandidates": candidates_out,
-                    "hospitalCandidateCount": len(candidates_out),
-                    "hospitalConfirmed": bool(row.get("hospital_mgmt_no")),
-                    "tagEvidence": None,
-                }
-
-    except HTTPException:
+    except HTTPException as he:
         try:
-            delete_storage_object_if_exists(final_path)
+            delete_storage_object_if_exists(receipt_path)
         except Exception:
             pass
-        raise
+        raise he
+
     except Exception as e:
         try:
-            delete_storage_object_if_exists(final_path)
+            delete_storage_object_if_exists(receipt_path)
         except Exception:
             pass
         _raise_mapped_db_error(e)
         raise
-        
+
+
 # =========================================================
 # Documents (PDF)
 # =========================================================
@@ -3726,3 +3500,5 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
         "totalAmountSum_active": int(total_amount["s"]),
         "updatedAt": datetime.utcnow().isoformat() + "Z",
     }
+
+
