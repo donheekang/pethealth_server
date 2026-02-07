@@ -1,17 +1,14 @@
 # tag_policy.py (PetHealth+)
 # items/text -> ReceiptTag codes (aligned with iOS ReceiptTag.rawValue)
-# Public API: resolve_record_tags(...)
 
 from __future__ import annotations
 
 import re
-import os
-import json
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 # -----------------------------
 # Tag catalog
+# code == ReceiptTag.rawValue
 # -----------------------------
 TAG_CATALOG: List[Dict[str, Any]] = [
     # --- Exams ---
@@ -22,6 +19,11 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "exam_urine", "group": "exam", "aliases": ["urinalysis","ua","urine test","요검사","소변검사"]},
     {"code": "exam_fecal", "group": "exam", "aliases": ["fecal","stool test","대변검사","분변검사","배변검사"]},
     {"code": "exam_fecal_pcr", "group": "exam", "aliases": ["fecal pcr","stool pcr","gi pcr","panel pcr","대변pcr","대변 pcr","분변 pcr","배설물 pcr"]},
+    {"code": "exam_sdma", "group": "exam", "aliases": ["sdma","symmetrical dimethylarginine","idexx sdma","renal sdma","신장마커","신장검사"]},
+    {"code": "exam_probnp", "group": "exam", "aliases": ["probnp","pro bnp","pro-bnp","ntprobnp","nt-probnp","bnp","cardiopet","심장마커","프로비엔피"]},
+    {"code": "exam_fructosamine", "group": "exam", "aliases": ["fructosamine","fru","glycated albumin","ga","프럭토사민","당화알부민"]},
+    {"code": "exam_glucose_curve", "group": "exam", "aliases": ["glucose curve","blood glucose curve","bg curve","혈당곡선","혈당커브","혈당 커브","연속혈당"]},
+    {"code": "exam_blood_gas", "group": "exam", "aliases": ["blood gas","bga","bgas","i-stat","istat","혈액가스","가스분석"]},
 
     {"code": "exam_allergy", "group": "exam", "aliases": ["allergy test","ige","atopy","알러지검사","알레르기검사","알러지","알레르기"]},
     {"code": "exam_heart", "group": "exam", "aliases": ["ecg","ekg","echo","cardiac","heart","심전도","심초음파","심장초음파","심장검사"]},
@@ -30,7 +32,15 @@ TAG_CATALOG: List[Dict[str, Any]] = [
 
     # --- Vaccines / Preventives ---
     {"code": "vaccine_comprehensive", "group": "vaccine", "aliases": ["dhpp","dhppi","dhlpp","5-in-1","6-in-1","fvrcp","combo vaccine","종합백신","혼합백신","5종","6종"]},
-    {"code": "vaccine_rabies", "group": "vaccine", "aliases": ["rabies","rabbies","광견병","광견","ra","rab","rabi","rabb"]},  # ✅ partial도 alias로 포함
+
+    # ✅ 핵심 강화: Rabbies/Rabies/RA/R-A/R/A/광견/광견병/접종/백신
+    {"code": "vaccine_rabies", "group": "vaccine", "aliases": [
+        "rabies", "rabbies", "rabie", "rabis", "rabiess", "rabeis",
+        "rab", "rabi", "ra",
+        "rabies vac", "rab vac", "rabies vacc", "rab vacc", "rabies vaccine",
+        "광견병", "광견", "광견병백신", "광견병 백신", "광견병접종", "광견병 접종", "광견병예방", "광견병 예방", "예방접종",
+    ]},
+
     {"code": "vaccine_kennel", "group": "vaccine", "aliases": ["kennel cough","bordetella","켄넬코프","기관지염백신","보르데텔라"]},
     {"code": "vaccine_corona", "group": "vaccine", "aliases": ["corona","coronavirus","corona enteritis","코로나","코로나장염"]},
     {"code": "vaccine_lepto", "group": "vaccine", "aliases": ["lepto","leptospirosis","leptospira","lepto2","lepto4","l2","l4","렙토","렙토2","렙토4"]},
@@ -52,10 +62,19 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "medicine_skin", "group": "medicine", "aliases": ["dermatitis","chlorhexidine","ketoconazole","miconazole","피부약","피부염"]},
     {"code": "medicine_allergy", "group": "medicine", "aliases": ["apoquel","cytopoint","cetirizine","zyrtec","benadryl","알러지","알레르기","가려움"]},
 
-    # --- Care / procedures ---
+    # --- Care / Procedures / Goods ---
     {"code": "care_injection", "group": "checkup", "aliases": ["inj","injection","shot","sc","im","iv","주사","주사제","피하주사","근육주사","정맥주사","주사료"]},
     {"code": "care_procedure_fee", "group": "checkup", "aliases": ["procedure fee","treatment fee","handling fee","처치료","시술료","처치비","시술비","처치","시술"]},
     {"code": "care_dressing", "group": "checkup", "aliases": ["dressing","bandage","gauze","wrap","disinfection","드레싱","붕대","거즈","소독","세척","상처처치"]},
+    {"code": "care_e_collar", "group": "etc", "aliases": ["e-collar","ecollar","cone","elizabethan collar","넥카라","엘리자베스카라","보호카라"]},
+    {"code": "care_prescription_diet", "group": "etc", "aliases": ["prescription diet","rx diet","therapeutic diet","처방식","처방사료","병원사료","hill's","hills","royal canin","k/d","c/d","i/d","z/d"]},
+
+    # --- Surgery / Dental / Ortho / General ---
+    {"code": "surgery_general", "group": "surgery", "aliases": ["surgery","operation","spay","neuter","castration","수술","중성화","봉합","마취"]},
+    {"code": "dental_scaling", "group": "dental", "aliases": ["scaling","dental cleaning","tartar","스케일링","치석"]},
+    {"code": "dental_extraction", "group": "dental", "aliases": ["extraction","dental extraction","발치"]},
+    {"code": "ortho_patella", "group": "orthopedic", "aliases": ["mpl","lpl","patella","patellar luxation","슬개골탈구","슬탈","파행"]},
+    {"code": "ortho_arthritis", "group": "orthopedic", "aliases": ["arthritis","oa","osteoarthritis","관절염","퇴행성관절"]},
 
     {"code": "checkup_general", "group": "checkup", "aliases": ["checkup","consult","opd","진료","상담","초진","재진","진찰","진료비"]},
     {"code": "grooming_basic", "group": "grooming", "aliases": ["grooming","bath","trim","미용","목욕","클리핑"]},
@@ -63,30 +82,55 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "etc_other", "group": "etc", "aliases": ["기타","etc","other"]},
 ]
 
-# -----------------------------
-# Normalization/token rules
-# -----------------------------
+# ---- Normalization/token rules
+_alnum = re.compile(r"[0-9a-zA-Z가-힣]+")
+
 def _normalize(s: str) -> str:
     s = (s or "").lower()
+    # keep only alnum + korean
     return "".join(ch for ch in s if ch.isalnum() or ("가" <= ch <= "힣"))
-
 
 def _tokenize(s: str) -> List[str]:
     raw = re.findall(r"[0-9a-zA-Z가-힣]+", s or "")
     return [t for t in raw if t]
 
-
 def _is_short_ascii_token(norm: str) -> bool:
-    if len(norm) > 2:
+    if len(norm) > 3:
         return False
     return all(("0" <= c <= "9") or ("a" <= c <= "z") for c in norm)
-
 
 def _is_single_latin_char(s: str) -> bool:
     if len(s) != 1:
         return False
     c = s.lower()
     return "a" <= c <= "z"
+
+# ✅ rabies abbreviation patterns inside longer text
+_RABIES_RA_RE = re.compile(r"(?<![0-9a-z])ra(?![0-9a-z])", re.IGNORECASE)
+_RABIES_R_A_RE = re.compile(r"\br\s*[/\-\._ ]\s*a\b", re.IGNORECASE)
+
+# tag-side noise (for ocr_text injection)
+_TAG_NOISE = [
+    "사업자", "대표", "전화", "주소", "고객", "승인", "카드", "현금",
+    "합계", "총액", "총금액", "청구", "결제", "소계", "vat", "부가세", "면세", "과세",
+    "serial", "sign", "발행", "발행일", "날짜", "일자",
+]
+_TAG_NOISE_N = [_normalize(x) for x in _TAG_NOISE if _normalize(x)]
+
+def _is_noise_textline(line: str) -> bool:
+    t = (line or "").strip()
+    if not t:
+        return True
+    n = _normalize(t)
+    if len(n) < 2:
+        return True
+    # date-only-ish
+    if re.search(r"\b20\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}\b", t):
+        return True
+    for x in _TAG_NOISE_N:
+        if x in n:
+            return True
+    return False
 
 
 def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
@@ -114,6 +158,14 @@ def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
     if code_norm == q_norm:
         return 230, {"why": ["code==query"]}
 
+    # ✅ vaccine_rabies: "ra", "r/a" 같은 축약이 문장/긴 텍스트에 섞여도 잡게
+    if tag.get("code") == "vaccine_rabies":
+        if _RABIES_RA_RE.search(q_raw) or _RABIES_R_A_RE.search(q_raw):
+            best = max(best, 170)
+            hit += 1
+            strong = True
+            why.append("regex:ra_or_r/a")
+
     for alias in tag.get("aliases", []):
         a = str(alias or "").strip()
         if not a:
@@ -122,7 +174,7 @@ def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
         if not a_norm:
             continue
 
-        # ✅ 짧은 약어(us/ua/pi/l2 등)는 contains 오탐이 크니 token/eq만 허용
+        # 짧은 약어(us/ua/pi/l2/ra 등)는 contains 오탐이 크니 token/equality 위주
         if _is_short_ascii_token(a_norm):
             if a_norm == q_norm or a_norm in token_set:
                 best = max(best, 160)
@@ -152,141 +204,49 @@ def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
         best += min(35, hit * (8 if strong else 5))
         why.append(f"bonus:{hit}")
 
-    return best, {"why": why[:8]}
+    return best, {"why": why[:10]}
 
 
 def _build_record_query(items: List[Dict[str, Any]], hospital_name: Optional[str], ocr_text: Optional[str] = None) -> str:
     parts: List[str] = []
     if hospital_name:
         parts.append(str(hospital_name))
-    for it in (items or [])[:120]:
+
+    for it in (items or [])[:200]:
         nm = (it.get("itemName") or it.get("item_name") or "").strip()
         if nm:
             parts.append(nm)
-    # OCR 원문 일부도 보강
-    if isinstance(ocr_text, str) and ocr_text.strip():
-        parts.append((ocr_text or "")[:1200])
-    return " | ".join(parts)
+
+    # ✅ items가 비거나 적으면 ocr_text 일부를 query로 섞어서 "rabies가 text에만 있을 때"도 잡음
+    if ocr_text:
+        ocr_lines = []
+        for ln in (ocr_text or "").splitlines()[:160]:
+            ln = ln.strip()
+            if not ln:
+                continue
+            if _is_noise_textline(ln):
+                continue
+            # 숫자만 잔뜩인 라인은 제외
+            if len(_normalize(re.sub(r"\d+", "", ln))) < 2:
+                continue
+            ocr_lines.append(ln)
+            if len(ocr_lines) >= 40:
+                break
+        if ocr_lines:
+            parts.append(" | ".join(ocr_lines)[:2000])
+
+    return " | ".join(parts)[:4000]
 
 
-# -----------------------------
-# ✅ Rabies force tagging
-# - 요구사항: "ra"만 있어도 rabies로 태깅
-# -----------------------------
-_RABIES_CODE = "vaccine_rabies"
-_RABIES_PARTIAL = {"ra", "rab", "rabi", "rabb"}
-_VACCINE_CONTEXT = {"백신", "접종", "예방", "예방접종", "vaccine", "vacc", "immun", "shot", "inj", "주사"}
-
-
-def _env_bool(name: str) -> bool:
-    v = (os.getenv(name) or "").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-def _has_any_substr(text: str, keys: set) -> bool:
-    t = text or ""
-    low = t.lower()
-    for k in keys:
-        if k in t or k in low:
-            return True
-    return False
-
-
-def _token_norms(text: str) -> List[str]:
-    return [_normalize(t) for t in _tokenize(text or "") if _normalize(t)]
-
-
-def _contains_strong_rabies(text: str) -> bool:
-    if not text:
-        return False
-    low = text.lower()
-    if ("rabies" in low) or ("rabbies" in low):
-        return True
-    if ("광견병" in text) or ("광견" in text):
-        return True
-    return False
-
-
-def _find_partial_rabies_in_text(ocr_text: Optional[str]) -> Tuple[bool, List[str], List[str]]:
-    if not isinstance(ocr_text, str) or not ocr_text.strip():
-        return False, [], []
-
-    toks = set(_token_norms(ocr_text))
-    hit_tokens = sorted(list(toks.intersection(_RABIES_PARTIAL)))
-
-    matched_lines: List[str] = []
-    for ln in (ocr_text or "").splitlines():
-        s = (ln or "").strip()
-        if not s:
-            continue
-        n = _normalize(s)
-        if n in _RABIES_PARTIAL:
-            matched_lines.append(s[:120])
-
-    found = bool(hit_tokens or matched_lines)
-    return found, hit_tokens, matched_lines[:8]
-
-
-def _detect_rabies_force(
-    *,
-    items: List[Dict[str, Any]],
-    hospital_name: Optional[str],
-    ocr_text: Optional[str],
-) -> Dict[str, Any]:
-    combined = " | ".join([
-        (hospital_name or ""),
-        (ocr_text or ""),
-        " ".join([(it.get("itemName") or "") for it in (items or [])[:120]]),
-    ])
-
-    if _contains_strong_rabies(combined):
-        return {"force": True, "confidence": 1.0, "reason": "strong_text"}
-
-    # partial token check (items + ocr_text)
-    item_tokens = set()
-    for it in (items or [])[:200]:
-        nm = (it.get("itemName") or "").strip()
-        if not nm:
-            continue
-        nn = _normalize(nm)  # "r a" -> "ra"
-        if nn in _RABIES_PARTIAL:
-            item_tokens.add(nn)
-        for t in _token_norms(nm):
-            if t in _RABIES_PARTIAL:
-                item_tokens.add(t)
-
-    found_text, text_tokens, _lines = _find_partial_rabies_in_text(ocr_text)
-    union = sorted(list(set(list(item_tokens) + list(text_tokens))))
-
-    if not union:
-        return {"force": False, "confidence": 0.0, "reason": "no_signal"}
-
-    # ✅ ra만 있어도 무조건 True
-    has_ctx = _has_any_substr(combined, _VACCINE_CONTEXT)
-    only_ra = (union == ["ra"])
-
-    if only_ra and not has_ctx:
-        return {"force": True, "confidence": 0.6, "reason": "partial_ra_no_ctx_force_true"}
-    return {"force": True, "confidence": 0.85 if has_ctx else 0.75, "reason": "partial_tokens"}
-
-
-# -----------------------------
-# Main API
-# -----------------------------
 def resolve_record_tags(
     *,
     items: List[Dict[str, Any]],
     hospital_name: Optional[str] = None,
+    ocr_text: Optional[str] = None,
     record_thresh: int = 125,
     item_thresh: int = 140,
     max_tags: int = 6,
     return_item_tags: bool = True,
-    ocr_text: Optional[str] = None,
-    # (선택) gemini 인자들 - 지금은 사용 안 해도 됨 (main에서 넘겨도 무시 가능)
-    gemini_enabled: Optional[bool] = None,
-    gemini_api_key: Optional[str] = None,
-    gemini_model_name: Optional[str] = None,
-    gemini_timeout_seconds: Optional[int] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """
@@ -300,8 +260,6 @@ def resolve_record_tags(
     query = _build_record_query(items or [], hospital_name, ocr_text=ocr_text)
     if not query.strip():
         return {"tags": [], "itemCategoryTags": [], "evidence": {"policy": "catalog", "reason": "empty_query"}}
-
-    rab = _detect_rabies_force(items=items or [], hospital_name=hospital_name, ocr_text=ocr_text)
 
     scored: List[Tuple[str, int, Dict[str, Any]]] = []
     for tag in TAG_CATALOG:
@@ -318,10 +276,9 @@ def resolve_record_tags(
         "recordThresh": int(record_thresh),
         "itemThresh": int(item_thresh),
         "candidates": [],
-        "rabiesForce": rab,
     }
 
-    for code, score, ev in scored[:20]:
+    for code, score, ev in scored[:30]:
         evidence["candidates"].append({"code": code, "score": score, **(ev or {})})
         if score >= int(record_thresh) and code not in picked:
             if code == "etc_other":
@@ -330,20 +287,17 @@ def resolve_record_tags(
         if len(picked) >= int(max_tags):
             break
 
+    # 아무것도 못 잡으면 etc_other를 마지막 fallback
     if not picked:
-        for code, score, _ in scored[:30]:
+        for code, score, _ in scored[:50]:
             if code == "etc_other" and score >= 90:
                 picked.append("etc_other")
                 break
 
-    # ✅ Rabies 강제 적용 (record tags)
-    if rab.get("force") is True and _RABIES_CODE not in picked:
-        picked.insert(0, _RABIES_CODE)
-        picked = picked[: int(max_tags)]
-
+    # item-level tagging
     item_tags: List[Dict[str, Any]] = []
     if return_item_tags:
-        for idx, it in enumerate((items or [])[:200]):
+        for idx, it in enumerate((items or [])[:250]):
             nm = (it.get("itemName") or "").strip()
             if not nm:
                 continue
@@ -359,15 +313,15 @@ def resolve_record_tags(
             if best_code and best_score >= int(item_thresh):
                 if best_code == "etc_other":
                     continue
-                item_tags.append({"idx": idx, "itemName": nm, "categoryTag": best_code, "score": best_score, **(best_ev or {})})
-
-        # Rabies 강제 item override (ra 포함)
-        if rab.get("force") is True:
-            for idx, it in enumerate((items or [])[:200]):
-                nm = (it.get("itemName") or "").strip()
-                nn = _normalize(nm)
-                if _contains_strong_rabies(nm) or (nn in _RABIES_PARTIAL):
-                    item_tags.append({"idx": idx, "itemName": nm, "categoryTag": _RABIES_CODE, "score": 999, "why": [f"forced:{rab.get('reason')}"]})
+                item_tags.append(
+                    {
+                        "idx": idx,
+                        "itemName": nm,
+                        "categoryTag": best_code,
+                        "score": best_score,
+                        **(best_ev or {}),
+                    }
+                )
 
     return {"tags": picked, "itemCategoryTags": item_tags, "evidence": evidence}
 
