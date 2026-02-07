@@ -58,7 +58,20 @@ _NOISE_TOKENS = [
     "입원", "퇴원",
     "항목", "단가", "수량", "금액",
     "동물명", "환자", "환자명", "품종",
+    # address / location noise
+    "경기도", "서울", "인천", "부산", "대구", "대전", "광주", "울산", "세종",
+    "충북", "충남", "전북", "전남", "경북", "경남", "강원", "제주",
 ]
+
+
+# Address pattern: 시/구/동/로/길 + 번지 style
+_ADDRESS_RE = re.compile(
+    r"(경기도|서울|인천|부산|대구|대전|광주|울산|세종|충청|전라|경상|강원|제주)"
+    r"|(\S+시\s+\S+구)"
+    r"|(\S+[시군구]\s+\S+[동읍면로길])"
+    r"|(\d+번지)"
+    r"|(\(\S+동[,\s])"
+)
 
 
 def _norm(s: str) -> str:
@@ -90,6 +103,9 @@ def _is_noise_line(s: str) -> bool:
     if len(k) < 2:
         return True
     if _looks_like_date_line(t):
+        return True
+    # ✅ Address pattern detection
+    if _ADDRESS_RE.search(t):
         return True
     has_letter = any(("a" <= ch.lower() <= "z") or ("가" <= ch <= "힣") for ch in t)
     has_digit = any(ch.isdigit() for ch in t)
@@ -491,9 +507,12 @@ def _gemini_parse_receipt(
         '  hospitalName (string|null), visitDate (YYYY-MM-DD|null), totalAmount (integer|null),\n'
         '  items (array of {itemName:string, price:integer|null}).\n'
         "Rules:\n"
-        "- items must be REAL treatment/vaccine/medicine line-items.\n"
+        "- items must be REAL treatment/vaccine/medicine line-items only.\n"
         "- Do NOT include date lines (e.g. '날짜: 2025-11-28') as items.\n"
         "- Do NOT include totals/taxes/payment lines as items.\n"
+        "- Do NOT include addresses (시/구/동/로/길) as items.\n"
+        "- Do NOT include phone numbers, business registration numbers as items.\n"
+        "- Do NOT include hospital name/address as items.\n"
         "- If you see 'Rabies' but OCR typo like 'Rabbies' or abbreviation 'RA'/'R/A', normalize itemName to 'Rabies'.\n"
         "- If uncertain, best guess.\n"
     )
@@ -564,7 +583,142 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================================
+# Gemini-first receipt parsing prompt (structured)
+# =========================================================
+_GEMINI_RECEIPT_PROMPT = """\
+You are analyzing a Korean veterinary hospital receipt image.
+Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
+
+{
+  "hospitalName": "병원이름" or null,
+  "visitDate": "YYYY-MM-DD" or null,
+  "totalAmount": integer or null,
+  "items": [
+    {"itemName": "진료항목명", "price": integer_or_null, "categoryTag": "tag_or_null"}
+  ],
+  "tags": ["tag1", "tag2"]
+}
+
+RULES:
+1. items = ONLY real medical treatments, vaccines, medicines, tests, procedures.
+2. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
+3. categoryTag per item must be one of: vaccine, surgery, dental, checkup, lab, medicine, hospitalization, emergency, or null.
+4. tags = list of unique categoryTags found across all items.
+5. Normalize: "Rabbies"/"RA"/"R/A"/"광견병" → "Rabies" (categoryTag: "vaccine")
+6. Normalize: "x ray"/"X Ray" → "X-ray" (categoryTag: "lab")
+7. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
+8. If a price looks like just "115" on a Korean receipt, it likely means 115원 (not 115,000).
+9. Be precise with prices — copy exact amounts from the receipt.
+"""
+
+
+def _gemini_parse_receipt_full(
+    *,
+    image_bytes: bytes,
+    api_key: str,
+    model: str,
+    timeout_seconds: int = 15,
+) -> Optional[Dict[str, Any]]:
+    """Gemini-first: send image directly, get structured JSON."""
+    api_key = (api_key or "").strip()
+    model = (model or "gemini-2.5-flash").strip()
+    if not api_key or not model:
+        return None
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    # Detect mime type
+    mime = "image/png"
+    if image_bytes[:4] == b"RIFF":
+        mime = "image/webp"
+    elif image_bytes[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+
+    parts = [
+        {"text": _GEMINI_RECEIPT_PROMPT},
+        {"inline_data": {"mime_type": mime, "data": b64}},
+    ]
+
+    try:
+        out = _call_gemini_generate_content(
+            api_key=api_key,
+            model=model,
+            parts=parts,
+            timeout_seconds=timeout_seconds,
+        )
+        j = _extract_json_from_model_text(out)
+        if isinstance(j, dict):
+            return j
+    except Exception:
+        pass
+    return None
+
+
+def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Normalize Gemini-first result into (parsed, tags)."""
+    parsed: Dict[str, Any] = {
+        "hospitalName": None,
+        "visitDate": None,
+        "totalAmount": None,
+        "items": [],
+        "ocrText": "",
+    }
+
+    hn = j.get("hospitalName")
+    if isinstance(hn, str) and hn.strip():
+        parsed["hospitalName"] = hn.strip()[:80]
+
+    vd = j.get("visitDate")
+    if isinstance(vd, str) and vd.strip():
+        d = _parse_date_from_text(vd.strip())
+        parsed["visitDate"] = d.isoformat() if d else vd.strip()[:20]
+
+    ta = _coerce_int_amount(j.get("totalAmount"))
+    parsed["totalAmount"] = ta if ta and ta > 0 else None
+
+    items = j.get("items")
+    tags_set: set = set()
+    cleaned: List[Dict[str, Any]] = []
+
+    if isinstance(items, list):
+        for it in items[:120]:
+            if not isinstance(it, dict):
+                continue
+            nm = str(it.get("itemName") or "").strip()
+            if not nm:
+                continue
+            nm = _canonicalize_item_name(_clean_item_name(nm))
+            if not nm or _is_noise_line(nm):
+                continue
+            pr = _coerce_int_amount(it.get("price"))
+            if pr is not None and pr < 0:
+                pr = None
+            ct = (it.get("categoryTag") or "").strip().lower() or None
+            if ct and ct not in ("vaccine", "surgery", "dental", "checkup", "lab",
+                                  "medicine", "hospitalization", "emergency"):
+                ct = None
+            if ct:
+                tags_set.add(ct)
+            cleaned.append({"itemName": nm, "price": pr, "categoryTag": ct})
+
+    parsed["items"] = cleaned
+
+    # Tags from response or from items
+    raw_tags = j.get("tags")
+    if isinstance(raw_tags, list):
+        for t in raw_tags:
+            ts = str(t).strip().lower()
+            if ts:
+                tags_set.add(ts)
+
+    return parsed, list(tags_set)[:10]
+
+
+# =========================================================
 # Core function: process_receipt
+# Architecture: Gemini-first → Vision OCR fallback → regex fallback
 # =========================================================
 def process_receipt(
     raw_bytes: bytes,
@@ -583,17 +737,22 @@ def process_receipt(
     **kwargs,
 ) -> Tuple[bytes, Dict[str, Any], Dict[str, Any]]:
     """
+    Gemini-first receipt processing pipeline.
+
+    1. Image prep (resize, convert)
+    2. Gemini: image → structured JSON (primary)
+    3. Vision OCR: image → text (for redaction + fallback)
+    4. If Gemini failed: regex parse from OCR text (fallback)
+
     Returns:
-      webp_bytes: redacted (best-effort) WEBP bytes for storage
-      parsed: {hospitalName, visitDate(YYYY-MM-DD), totalAmount(int), items:[{itemName, price, categoryTag}], ocrText}
-      hints: {addressHint, ocrTextPreview, ocrEngine, geminiUsed, ...}
+      webp_bytes, parsed, hints
     """
     if not raw_bytes:
         raise ValueError("empty raw bytes")
 
     Image, ImageOps, ImageDraw = _load_pil()
 
-    # 0) load image
+    # ── 0) Load & prep image ──
     img = Image.open(io.BytesIO(raw_bytes))
     img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB", "RGBA"):
@@ -603,100 +762,103 @@ def process_receipt(
         bg.paste(img, mask=img.split()[-1])
         img = bg
 
-    # 1) resize/harden
     img = _ensure_max_pixels(img, int(image_max_pixels or 0))
     img = _resize_to_width(img, int(receipt_max_width or 0))
 
+    # PNG for OCR, WEBP for storage
     ocr_buf = io.BytesIO()
     img.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
 
-    # 2) OCR with concurrency guard
-    ocr_text = ""
-    vision_resp = None
-    ocr_engine = "none"
-    ocr_error = None
-
-    sema = _get_sema(int(ocr_max_concurrency or 4))
-    acquired = sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
-    if not acquired:
-        raise OCRConcurrencyError("OCR is busy (semaphore acquire timeout)")
-
-    try:
-        try:
-            ocr_text, vision_resp = _vision_ocr(
-                ocr_image_bytes,
-                google_credentials=google_credentials,
-                timeout_seconds=int(ocr_timeout_seconds or 12),
-            )
-            ocr_engine = "google_vision"
-        except Exception as e:
-            ocr_error = str(e)[:200]
-            ocr_text = ""
-            vision_resp = None
-            ocr_engine = "none"
-    finally:
-        try:
-            sema.release()
-        except Exception:
-            pass
-
-    # 3) redact image (best-effort)
-    redacted = _redact_image_with_vision_tokens(img.copy(), vision_resp)
-    webp_bytes = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
-
-    # 4) parse from OCR text
-    parsed, hints = _parse_receipt_from_text(ocr_text or "")
-    hints["ocrEngine"] = ocr_engine
-    hints["geminiUsed"] = False
-    if ocr_error:
-        hints["ocrError"] = ocr_error
-
-    # 5) Gemini assist
+    # ── 1) Gemini settings ──
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
     g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
     g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")) or "gemini-2.5-flash"
-    g_timeout = int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "10") or "10"))
+    g_timeout = int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "15") or "15"))
 
-    need_ai = False
-    items_now = parsed.get("items") if isinstance(parsed.get("items"), list) else []
-    if not ocr_text.strip():
-        need_ai = True
-    if _is_items_suspicious(items_now):
-        need_ai = True
-    if parsed.get("hospitalName") is None:
-        need_ai = True
-    if parsed.get("totalAmount") is None:
-        need_ai = True
+    hints: Dict[str, Any] = {
+        "ocrEngine": "none",
+        "geminiUsed": False,
+        "pipeline": "gemini_first",
+    }
 
-    if g_enabled and g_key.strip() and need_ai:
+    # ── 2) Gemini-first: image → structured JSON ──
+    gemini_parsed = None
+    gemini_tags: List[str] = []
+
+    if g_enabled and g_key.strip():
         try:
-            gj = _gemini_parse_receipt(
-                image_bytes=webp_bytes,
-                ocr_text=ocr_text or "",
+            gj = _gemini_parse_receipt_full(
+                image_bytes=ocr_image_bytes,
                 api_key=g_key,
                 model=g_model,
                 timeout_seconds=g_timeout,
             )
             if isinstance(gj, dict):
-                gparsed = _normalize_gemini_parsed(gj)
-                g_items = gparsed.get("items") if isinstance(gparsed.get("items"), list) else []
-                if g_items and (_is_items_suspicious(items_now)):
-                    parsed["items"] = g_items
-                    hints["geminiUsed"] = True
-                if not parsed.get("hospitalName") and gparsed.get("hospitalName"):
-                    parsed["hospitalName"] = gparsed["hospitalName"]
-                    hints["geminiUsed"] = True
-                if not parsed.get("visitDate") and gparsed.get("visitDate"):
-                    parsed["visitDate"] = gparsed["visitDate"]
-                    hints["geminiUsed"] = True
-                if (not parsed.get("totalAmount")) and gparsed.get("totalAmount"):
-                    parsed["totalAmount"] = gparsed["totalAmount"]
-                    hints["geminiUsed"] = True
+                gemini_parsed, gemini_tags = _normalize_gemini_full_result(gj)
+                hints["geminiUsed"] = True
+                hints["ocrEngine"] = f"gemini:{g_model}"
         except Exception as e:
             hints["geminiError"] = str(e)[:200]
 
-    # final sanitize
+    # ── 3) Vision OCR (for redaction + fallback text) ──
+    ocr_text = ""
+    vision_resp = None
+
+    sema = _get_sema(int(ocr_max_concurrency or 4))
+    acquired = sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
+    if not acquired:
+        # If Gemini already succeeded, don't fail hard
+        if gemini_parsed:
+            hints["ocrSkipped"] = "semaphore_busy_but_gemini_ok"
+        else:
+            raise OCRConcurrencyError("OCR is busy (semaphore acquire timeout)")
+    else:
+        try:
+            try:
+                ocr_text, vision_resp = _vision_ocr(
+                    ocr_image_bytes,
+                    google_credentials=google_credentials,
+                    timeout_seconds=int(ocr_timeout_seconds or 12),
+                )
+                if hints["ocrEngine"] == "none":
+                    hints["ocrEngine"] = "google_vision"
+            except Exception as e:
+                hints["visionError"] = str(e)[:200]
+                ocr_text = ""
+                vision_resp = None
+        finally:
+            try:
+                sema.release()
+            except Exception:
+                pass
+
+    # ── 4) Redact image (best-effort with Vision tokens) ──
+    redacted = _redact_image_with_vision_tokens(img.copy(), vision_resp)
+    webp_bytes = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
+
+    # ── 5) Build final parsed result ──
+    if gemini_parsed and gemini_parsed.get("items"):
+        # Gemini succeeded → use as primary
+        parsed = gemini_parsed
+        parsed["ocrText"] = (ocr_text or "")[:8000]
+        hints["pipeline"] = "gemini_primary"
+    else:
+        # Fallback to regex parsing from OCR text
+        parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
+        hints.update(regex_hints)
+        hints["pipeline"] = "vision_regex_fallback"
+
+        # If Gemini partially succeeded, merge missing fields
+        if gemini_parsed:
+            if not parsed.get("hospitalName") and gemini_parsed.get("hospitalName"):
+                parsed["hospitalName"] = gemini_parsed["hospitalName"]
+            if not parsed.get("visitDate") and gemini_parsed.get("visitDate"):
+                parsed["visitDate"] = gemini_parsed["visitDate"]
+            if not parsed.get("totalAmount") and gemini_parsed.get("totalAmount"):
+                parsed["totalAmount"] = gemini_parsed["totalAmount"]
+
+    # Final sanitize
     if not isinstance(parsed.get("items"), list):
         parsed["items"] = []
     parsed["items"] = parsed["items"][:120]
@@ -706,6 +868,9 @@ def process_receipt(
         except Exception:
             parsed["totalAmount"] = None
     parsed["ocrText"] = (ocr_text or "")[:8000]
+
+    # Attach tags to hints for main.py
+    hints["tags"] = gemini_tags if gemini_tags else []
 
     return webp_bytes, parsed, hints
 
@@ -786,6 +951,8 @@ def process_receipt_image(
         "address_hint": (hints or {}).get("addressHint"),
         "ocr_engine": (hints or {}).get("ocrEngine"),
         "gemini_used": (hints or {}).get("geminiUsed", False),
+        "pipeline": (hints or {}).get("pipeline", "unknown"),
+        "tags": (hints or {}).get("tags", []),
     }
 
     return {
