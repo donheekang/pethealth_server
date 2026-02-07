@@ -2256,53 +2256,49 @@ def api_receipts_process(
 
         safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-       # 3) resolve record tags
+          # 3) resolve record tags (module, your standard codes)
     _require_module(tag_policy, "tag_policy")
 
-    # ocr_text는 위에서 roots로 뽑아둔 ocr_text 변수를 쓰는 게 안전함
-    ocr_text_for_tag = ""
-    if isinstance(ocr_text, str) and ocr_text.strip():
-        ocr_text_for_tag = ocr_text
-    elif isinstance(parsed, dict):
-        ocr_text_for_tag = str(parsed.get("ocrText") or parsed.get("text") or "")
+    tag_result: Dict[str, Any] = {}
+    resolved_tags: List[str] = []
+    tag_evidence = None
+    item_tag_map: Dict[str, str] = {}   # ✅ 무조건 기본값 먼저!
 
-    tag_result: Dict[str, Any] = {"tags": [], "itemCategoryTags": [], "evidence": None}
     try:
-        tr = tag_policy.resolve_record_tags(  # type: ignore
+        tag_result = tag_policy.resolve_record_tags(  # type: ignore
             items=safe_items,
             hospital_name=hn,
-            ocr_text=ocr_text_for_tag,
+            ocr_text=str(ocr_text or ""),   # 위에서 뽑은 ocr_text 변수 사용
             record_thresh=int(settings.TAG_RECORD_THRESHOLD),
             item_thresh=int(settings.TAG_ITEM_THRESHOLD),
+            max_tags=6,
+            return_item_tags=True,
+
+            # (선택) Gemini
             gemini_enabled=bool(settings.GEMINI_ENABLED),
             gemini_api_key=str(settings.GEMINI_API_KEY or ""),
             gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),
             gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
         )
-        if isinstance(tr, dict):
-            tag_result = tr
+        resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
+        tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
     except Exception as e:
+        resolved_tags = []
+        tag_evidence = None
         logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
 
-    resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
-    tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
-
-    # ✅ itemCategoryTags를 idx 기반으로 매핑 (이게 제일 안전)
+    # ✅ tag_policy의 itemCategoryTags를 safe_items.categoryTag에 반영 (DB 저장용)
     try:
-        by_idx: Dict[int, str] = {}
-        rows = tag_result.get("itemCategoryTags") if isinstance(tag_result, dict) else None
-        if isinstance(rows, list):
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                idx = r.get("idx")
-                ct = r.get("categoryTag")
-                if isinstance(idx, int) and isinstance(ct, str) and ct.strip():
-                    by_idx[idx] = ct.strip()
-
-        for i, it in enumerate(safe_items):
-            if not it.get("categoryTag") and i in by_idx:
-                it["categoryTag"] = by_idx[i]
+        if isinstance(tag_result, dict):
+            rows = tag_result.get("itemCategoryTags")
+            if isinstance(rows, list):
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    nm2 = (r.get("itemName") or "").strip()
+                    ct2 = (r.get("categoryTag") or "").strip()
+                    if nm2 and ct2:
+                        item_tag_map[_norm_key(nm2)] = ct2
     except Exception:
         item_tag_map = {}
 
@@ -2311,6 +2307,9 @@ def api_receipts_process(
             ct2 = item_tag_map.get(_norm_key(it.get("itemName") or ""))
             if ct2:
                 it["categoryTag"] = ct2
+
+
+
 
     # ✅ 가격이 하나도 없으면: (1) 항목 1개면 그 항목에 total을 넣고, (2) 항목이 없으면 fallback 추가
     has_any_price = any(isinstance(x.get("price"), int) and int(x.get("price")) > 0 for x in safe_items)
