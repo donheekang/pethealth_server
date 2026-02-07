@@ -141,20 +141,24 @@ settings = Settings()
 
 
 # Optional policy modules (separated files)
+ocr_policy = None
+ocr_policy_import_error: str | None = None
 try:
     import ocr_policy  # type: ignore
 except Exception as e:
+    ocr_policy_import_error = repr(e)
     logger.exception("[Import] ocr_policy import failed: %r", e)
     ocr_policy = None
 
+tag_policy = None
+tag_policy_import_error: str | None = None
 try:
     import tag_policy  # type: ignore
 except Exception as e:
+    tag_policy_import_error = repr(e)
     logger.exception("[Import] tag_policy import failed: %r", e)
     tag_policy = None
-
-
-
+    
 def _require_module(mod, name: str):
     if mod is None:
         raise HTTPException(
@@ -1016,9 +1020,11 @@ def health():
         "firebase": fb_check,
         "cors": {"origins": _origins, "allowCredentials": _allow_credentials},
         "modules": {
-            "ocr_policy": bool(ocr_policy is not None),
-            "tag_policy": bool(tag_policy is not None),
-        },
+    "ocr_policy": bool(ocr_policy is not None),
+    "tag_policy": bool(tag_policy is not None),
+    "ocr_policy_error": (ocr_policy_import_error if settings.EXPOSE_ERROR_DETAILS else None),
+    "tag_policy_error": (tag_policy_import_error if settings.EXPOSE_ERROR_DETAILS else None),
+},
     }
 
 
@@ -2116,33 +2122,30 @@ def api_receipts_process(
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
-    _require_module(ocr_policy, "ocr_policy")
+        _require_module(ocr_policy, "ocr_policy")
     try:
-       webp_bytes, parsed, hints = ocr_policy.process_receipt(
-    raw,
-    google_credentials=settings.GOOGLE_APPLICATION_CREDENTIALS,
-    ocr_timeout_seconds=int(settings.OCR_TIMEOUT_SECONDS),
-    ocr_max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
-    ocr_sema_acquire_timeout_seconds=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
-    receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
-    receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
-    image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
-    gemini_enabled=bool(settings.GEMINI_ENABLED),              # ✅ 추가
-    gemini_api_key=str(settings.GEMINI_API_KEY or ""),         # ✅ 추가
-    gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),   # ✅ 추가
-    gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
-)
-
-
-
-
-
-
-    except HTTPException:
-        raise
+        webp_bytes, parsed, hints = ocr_policy.process_receipt(
+            raw,
+            google_credentials=settings.GOOGLE_APPLICATION_CREDENTIALS,
+            ocr_timeout_seconds=int(settings.OCR_TIMEOUT_SECONDS),
+            ocr_max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
+            ocr_sema_acquire_timeout_seconds=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
+            receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
+            receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
+            image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
+            gemini_enabled=bool(settings.GEMINI_ENABLED),
+            gemini_api_key=str(settings.GEMINI_API_KEY or ""),
+            gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),
+            gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Receipt processing failed"))
 
+    # ✅ downstream 안전장치
+    if not isinstance(parsed, dict):
+        parsed = {}
+    if not isinstance(hints, dict):
+        hints = {}
     receipt_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
         upload_bytes_to_storage(receipt_path, webp_bytes, "image/webp")
@@ -2253,44 +2256,53 @@ def api_receipts_process(
 
         safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-   # 3) resolve record tags (module, your standard codes)
-_require_module(tag_policy, "tag_policy")
-try:
-    tag_result = tag_policy.resolve_record_tags(  # type: ignore
-        items=safe_items,
-        hospital_name=hn,
-        ocr_text=(parsed.get("ocrText") or parsed.get("text") or ""),   # ✅ 추가
-        record_thresh=int(settings.TAG_RECORD_THRESHOLD),              # ✅ 추가
-        item_thresh=int(settings.TAG_ITEM_THRESHOLD),                  # ✅ 추가
-        gemini_enabled=bool(settings.GEMINI_ENABLED),                  # ✅ 추가(선택)
-        gemini_api_key=str(settings.GEMINI_API_KEY or ""),             # ✅ 추가(선택)
-        gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),       # ✅ 추가(선택)
-        gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),   # ✅ 추가(선택)
-    )
-    resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
-    tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
-except Exception as e:
+       # 3) resolve record tags
+    _require_module(tag_policy, "tag_policy")
 
-        resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
-        tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
+    # ocr_text는 위에서 roots로 뽑아둔 ocr_text 변수를 쓰는 게 안전함
+    ocr_text_for_tag = ""
+    if isinstance(ocr_text, str) and ocr_text.strip():
+        ocr_text_for_tag = ocr_text
+    elif isinstance(parsed, dict):
+        ocr_text_for_tag = str(parsed.get("ocrText") or parsed.get("text") or "")
+
+    tag_result: Dict[str, Any] = {"tags": [], "itemCategoryTags": [], "evidence": None}
+    try:
+        tr = tag_policy.resolve_record_tags(  # type: ignore
+            items=safe_items,
+            hospital_name=hn,
+            ocr_text=ocr_text_for_tag,
+            record_thresh=int(settings.TAG_RECORD_THRESHOLD),
+            item_thresh=int(settings.TAG_ITEM_THRESHOLD),
+            gemini_enabled=bool(settings.GEMINI_ENABLED),
+            gemini_api_key=str(settings.GEMINI_API_KEY or ""),
+            gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),
+            gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
+        )
+        if isinstance(tr, dict):
+            tag_result = tr
     except Exception as e:
-        resolved_tags = []
-        tag_evidence = None
         logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
 
-    # ✅ tag_policy의 itemCategoryTags를 safe_items.categoryTag에 반영 (DB 저장용)
-    item_tag_map: Dict[str, str] = {}
+    resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
+    tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
+
+    # ✅ itemCategoryTags를 idx 기반으로 매핑 (이게 제일 안전)
     try:
-        if isinstance(tag_result, dict):
-            rows = tag_result.get("itemCategoryTags")
-            if isinstance(rows, list):
-                for r in rows:
-                    if not isinstance(r, dict):
-                        continue
-                    nm2 = (r.get("itemName") or "").strip()
-                    ct2 = (r.get("categoryTag") or "").strip()
-                    if nm2 and ct2:
-                        item_tag_map[_norm_key(nm2)] = ct2
+        by_idx: Dict[int, str] = {}
+        rows = tag_result.get("itemCategoryTags") if isinstance(tag_result, dict) else None
+        if isinstance(rows, list):
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                idx = r.get("idx")
+                ct = r.get("categoryTag")
+                if isinstance(idx, int) and isinstance(ct, str) and ct.strip():
+                    by_idx[idx] = ct.strip()
+
+        for i, it in enumerate(safe_items):
+            if not it.get("categoryTag") and i in by_idx:
+                it["categoryTag"] = by_idx[i]
     except Exception:
         item_tag_map = {}
 
