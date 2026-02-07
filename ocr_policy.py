@@ -36,6 +36,14 @@ _HOSP_RE = re.compile(r"(병원\s*명|원\s*명)\s*[:：]?\s*(.+)$")
 _PHONE_RE = re.compile(r"\b\d{2,3}-\d{3,4}-\d{4}\b")
 _BIZ_RE = re.compile(r"\b\d{3}-\d{2}-\d{5}\b")
 _CARD_RE = re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b")
+# 한글 이름 2~4자 (성+이름): 단독 토큰으로 나올 때 매칭
+_KOREAN_NAME_RE = re.compile(r"^[가-힣]{2,4}$")
+# 이름 라벨 키워드: 이 키워드 뒤에 오는 한글 이름을 마스킹
+_NAME_LABEL_KEYWORDS = {
+    "고객명", "고객이름", "고객 이름", "보호자", "보호자명",
+    "이름", "성명", "수신인", "수납자", "환자명",
+    "대표자", "대표", "원장",
+}
 _RABIES_RE = re.compile(
     r"(rabies|rabbies|rabie|rabis|rabiess|rables|rabeis|ra\b|r\s*[/\-\._ ]\s*a\b|광견병|광견)",
     re.IGNORECASE,
@@ -273,32 +281,77 @@ def _redact_image_with_vision_tokens(img, vision_response) -> Any:
         if not anns or len(anns) <= 1:
             return img
         draw = ImageDraw.Draw(img)
+
+        # ── Pass 1: 전화번호/사업자번호/카드번호 마스킹 ──
         for a in anns[1:]:
             desc = str(getattr(a, "description", "") or "")
             if not desc:
                 continue
             if not (_PHONE_RE.search(desc) or _BIZ_RE.search(desc) or _CARD_RE.search(desc)):
                 continue
-            poly = getattr(a, "bounding_poly", None)
-            if not poly or not getattr(poly, "vertices", None):
+            _fill_rect(draw, a)
+
+        # ── Pass 2: 이름 라벨 근처 한글 이름 마스킹 ──
+        # Vision OCR anns[1:]은 단어별 토큰. "고객" "이름" ":" "황지희" 순서로 옴.
+        # 라벨 키워드를 찾으면 뒤따르는 한글 2~4자 토큰을 마스킹.
+        tokens = list(anns[1:])  # word-level annotations
+        label_indices: set = set()
+
+        for i, a in enumerate(tokens):
+            desc = str(getattr(a, "description", "") or "").strip()
+            desc_clean = desc.replace(" ", "")
+            # 단일 토큰이 라벨 키워드와 일치
+            if desc_clean in _NAME_LABEL_KEYWORDS or desc_clean.rstrip(":：") in _NAME_LABEL_KEYWORDS:
+                label_indices.add(i)
                 continue
-            xs: List[int] = []
-            ys: List[int] = []
-            for v in poly.vertices:
-                x = getattr(v, "x", None)
-                y = getattr(v, "y", None)
-                if x is None or y is None:
+            # "고객" + "이름" 같이 2토큰으로 분리된 경우
+            if i > 0:
+                prev = str(getattr(tokens[i - 1], "description", "") or "").strip()
+                combo = (prev + desc).replace(" ", "")
+                if combo in _NAME_LABEL_KEYWORDS or combo.rstrip(":：") in _NAME_LABEL_KEYWORDS:
+                    label_indices.add(i)
+
+        for li in label_indices:
+            # 라벨 뒤 최대 3토큰 이내에서 한글 이름 찾기
+            for offset in range(1, 4):
+                ni = li + offset
+                if ni >= len(tokens):
+                    break
+                nd = str(getattr(tokens[ni], "description", "") or "").strip()
+                # 콜론/구분자는 건너뜀
+                if nd in (":", "：", "-", ")", "(", "/", "·"):
                     continue
-                xs.append(int(x))
-                ys.append(int(y))
-            if not xs or not ys:
-                continue
-            x0, x1 = max(0, min(xs)), max(xs)
-            y0, y1 = max(0, min(ys)), max(ys)
-            draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
+                # 한글 2~4자면 이름으로 판단 → 마스킹
+                if _KOREAN_NAME_RE.match(nd):
+                    _fill_rect(draw, tokens[ni])
+                    break  # 이름 하나만 마스킹
+                # 한글이 아닌 다른 토큰이 나오면 중단
+                break
+
         return img
     except Exception:
         return img
+
+
+def _fill_rect(draw, annotation) -> None:
+    """어노테이션의 bounding_poly를 흰색으로 채우기."""
+    poly = getattr(annotation, "bounding_poly", None)
+    if not poly or not getattr(poly, "vertices", None):
+        return
+    xs: List[int] = []
+    ys: List[int] = []
+    for v in poly.vertices:
+        x = getattr(v, "x", None)
+        y = getattr(v, "y", None)
+        if x is None or y is None:
+            continue
+        xs.append(int(x))
+        ys.append(int(y))
+    if not xs or not ys:
+        return
+    x0, x1 = max(0, min(xs)), max(xs)
+    y0, y1 = max(0, min(ys)), max(ys)
+    draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
 
 
 # -----------------------------
