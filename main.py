@@ -733,6 +733,11 @@ def _doc_pdf_path(uid: str, pet_id: str, doc_type: str, doc_id: str) -> str:
     return f"{_user_prefix(uid, pet_id)}/{doc_type}/{doc_id}.pdf"
 
 
+def _doc_file_path(uid: str, pet_id: str, doc_type: str, doc_id: str, ext: str) -> str:
+    """확장자를 지정할 수 있는 문서 경로 (pdf, jpg, png, webp 등)"""
+    return f"{_user_prefix(uid, pet_id)}/{doc_type}/{doc_id}.{ext}"
+
+
 def _read_upload_limited(upload: UploadFile, max_bytes: int) -> bytes:
     try:
         upload.file.seek(0)
@@ -1960,20 +1965,38 @@ def process_receipt(
 
 
 # =========================================================
-# Documents (PDF) — v2.3.0: diagnosis support + meta update
+# Documents (PDF / Image) — v2.3.0: diagnosis support + image upload
 # =========================================================
 def _is_pdf_bytes(data: bytes) -> bool:
     return bool(data) and data[:5] == b"%PDF-"
 
 
-@app.post("/api/docs/upload-pdf", response_model=DocumentUploadResponse)
-def upload_pdf_document(
+def _is_image_bytes(data: bytes) -> Optional[str]:
+    """Return mime type if recognized image, else None."""
+    if not data:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _image_ext(mime: str) -> str:
+    return {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
+
+
+@app.post("/api/docs/upload", response_model=DocumentUploadResponse)
+def upload_document(
     petId: str = Form(...),
     docType: str = Form(...),
     displayName: Optional[str] = Form(None),
     file: UploadFile = File(...),
     user: Dict[str, Any] = Depends(get_current_user),
 ):
+    """Upload PDF or image (jpg/png/webp) document."""
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
@@ -1988,17 +2011,27 @@ def upload_pdf_document(
         raise HTTPException(status_code=404, detail="pet not found")
     data = _read_upload_limited(file, int(settings.MAX_PDF_BYTES))
     if not data:
-        raise HTTPException(status_code=400, detail="empty pdf")
-    if not _is_pdf_bytes(data):
-        raise HTTPException(status_code=400, detail="file is not a valid PDF")
+        raise HTTPException(status_code=400, detail="empty file")
+
+    # Detect file type: PDF or image
     doc_uuid = uuid.uuid4()
+    if _is_pdf_bytes(data):
+        content_type = "application/pdf"
+        file_path = _doc_file_path(uid, str(pet_uuid), dt, str(doc_uuid), "pdf")
+    else:
+        img_mime = _is_image_bytes(data)
+        if not img_mime:
+            raise HTTPException(status_code=400, detail="file must be PDF or image (jpg/png/webp)")
+        content_type = img_mime
+        ext = _image_ext(img_mime)
+        file_path = _doc_file_path(uid, str(pet_uuid), dt, str(doc_uuid), ext)
+
     name = (displayName or "").strip()
     if not name:
-        name = (file.filename or "").strip() or ("lab.pdf" if dt == "lab" else "cert.pdf" if dt == "cert" else "diagnosis.pdf")
-    file_path = _doc_pdf_path(uid, str(pet_uuid), dt, str(doc_uuid))
+        name = (file.filename or "").strip() or f"{dt}.{'pdf' if content_type == 'application/pdf' else _image_ext(content_type)}"
     file_size_bytes = int(len(data))
     try:
-        upload_bytes_to_storage(file_path, data, "application/pdf")
+        upload_bytes_to_storage(file_path, data, content_type)
     except HTTPException:
         raise
     except Exception as e:
@@ -2030,6 +2063,19 @@ def upload_pdf_document(
             pass
         _raise_mapped_db_error(e)
         raise
+
+
+# Legacy alias: keep old endpoint working
+@app.post("/api/docs/upload-pdf", response_model=DocumentUploadResponse)
+def upload_pdf_document(
+    petId: str = Form(...),
+    docType: str = Form(...),
+    displayName: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Legacy endpoint — delegates to new /api/docs/upload."""
+    return upload_document(petId=petId, docType=docType, displayName=displayName, file=file, user=user)
 
 
 @app.get("/api/docs/list")
