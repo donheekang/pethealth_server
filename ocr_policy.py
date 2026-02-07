@@ -456,7 +456,7 @@ def _call_gemini_generate_content(
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512},
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048},
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
