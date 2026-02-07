@@ -1579,6 +1579,78 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
 
 
 # =========================================================
+# Fallback tag classification (when tag_policy.py is not available)
+# =========================================================
+_TAG_KEYWORDS: Dict[str, List[str]] = {
+    "vaccine": ["백신", "vaccination", "vaccine", "접종", "rabies", "광견병", "dhppl", "dhlpp",
+                 "종합백신", "코로나장염", "켄넬코프", "인플루엔자", "보르데텔라"],
+    "surgery": ["수술", "surgery", "중성화", "거세", "spay", "neuter", "마취", "절개",
+                "봉합", "발치", "슬개골", "십자인대", "종양제거"],
+    "dental": ["치석", "스케일링", "dental", "scaling", "치과", "치아", "발치", "치주",
+               "구강", "잇몸"],
+    "checkup": ["건강검진", "종합검진", "checkup", "check-up", "신체검사", "정기검진",
+                "혈액검사", "혈검", "blood test", "cbc"],
+    "lab": ["혈액", "blood", "소변", "urine", "x-ray", "xray", "초음파", "ultrasound",
+            "방사선", "ct", "mri", "내시경", "심전도", "검사", "분석", "배양"],
+    "medicine": ["약", "처방", "prescription", "drug", "medicine", "항생제", "소염제",
+                 "진통제", "위장약", "심장사상충", "구충제", "외구충", "내구충",
+                 "넥스가드", "브라벡토", "레볼루션", "하트가드", "프론트라인"],
+    "hospitalization": ["입원", "hospitalization", "icu", "중환자"],
+    "emergency": ["응급", "emergency", "야간진료"],
+}
+
+
+def _fallback_classify_item(item_name: str) -> Optional[str]:
+    """Keyword-based item classification fallback."""
+    if not item_name:
+        return None
+    low = item_name.lower()
+    for tag, keywords in _TAG_KEYWORDS.items():
+        for kw in keywords:
+            if kw in low:
+                return tag
+    return None
+
+
+def _fallback_classify_record(items: List[Dict[str, Any]], ocr_text: str) -> List[str]:
+    """Keyword-based record tag classification fallback."""
+    tags: List[str] = []
+    seen: set = set()
+
+    # From items' categoryTags
+    for it in (items or []):
+        ct = (it.get("categoryTag") or "").strip()
+        if ct and ct not in seen:
+            seen.add(ct)
+            tags.append(ct)
+
+    # From item names
+    for it in (items or []):
+        nm = (it.get("itemName") or "").lower()
+        for tag, keywords in _TAG_KEYWORDS.items():
+            if tag in seen:
+                continue
+            for kw in keywords:
+                if kw in nm:
+                    seen.add(tag)
+                    tags.append(tag)
+                    break
+
+    # From OCR text
+    text_low = (ocr_text or "").lower()
+    for tag, keywords in _TAG_KEYWORDS.items():
+        if tag in seen:
+            continue
+        for kw in keywords:
+            if kw in text_low:
+                seen.add(tag)
+                tags.append(tag)
+                break
+
+    return tags[:10]
+
+
+# =========================================================
 # Receipt processing
 # =========================================================
 @app.post("/api/receipts/process")
@@ -1644,7 +1716,10 @@ def process_receipt(
     ocr_hospital_name_raw = meta.get("hospital_name") or ""
     ocr_visit_date_raw = meta.get("visit_date") or ""
 
-    # --- Apply tag_policy ---
+    # Gemini may have already provided tags via ocr_policy
+    gemini_tags: List[str] = meta.get("tags") or []
+
+    # --- Apply tag_policy / item mapping ---
     record_tags: List[str] = []
     final_items: List[Dict[str, Any]] = []
 
@@ -1668,9 +1743,14 @@ def process_receipt(
                 cat_tag = tag_policy.classify_item(mapped, threshold=int(settings.TAG_ITEM_THRESHOLD))
             except Exception:
                 pass
+        if cat_tag is None:
+            cat_tag = _fallback_classify_item(mapped)
         final_items.append({"itemName": mapped, "price": price, "categoryTag": cat_tag})
 
-    if tag_policy is not None:
+    # Tag priority: Gemini tags → tag_policy → fallback
+    if gemini_tags:
+        record_tags = gemini_tags
+    elif tag_policy is not None:
         try:
             record_tags = tag_policy.classify_record(
                 items=[{"name": fi["itemName"], "price": fi.get("price")} for fi in final_items],
@@ -1679,6 +1759,9 @@ def process_receipt(
             )
         except Exception:
             record_tags = []
+
+    if not record_tags:
+        record_tags = _fallback_classify_record(final_items, ocr_text)
 
     # --- parse visit date ---
     vd: Optional[date] = None
