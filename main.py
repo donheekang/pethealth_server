@@ -1737,15 +1737,27 @@ def process_receipt(
         name_raw = (it.get("name") or "").strip()
         price = it.get("price")
         mapped = canon_map.get(name_raw.lower(), name_raw)
-        cat_tag = None
-        if tag_policy is not None:
-            try:
-                cat_tag = tag_policy.classify_item(mapped, threshold=int(settings.TAG_ITEM_THRESHOLD))
-            except Exception:
-                pass
-        if cat_tag is None:
+
+        # Gemini may have already provided standard tag code + Korean name
+        cat_tag = (it.get("categoryTag") or "").strip() or None
+        std_name = (it.get("standardName") or "").strip() or None
+
+        # Fallback chain if Gemini didn't provide
+        if not cat_tag:
+            if tag_policy is not None:
+                try:
+                    cat_tag = tag_policy.classify_item(mapped, threshold=int(settings.TAG_ITEM_THRESHOLD))
+                except Exception:
+                    pass
+        if not cat_tag:
             cat_tag = _fallback_classify_item(mapped)
-        final_items.append({"itemName": mapped, "price": price, "categoryTag": cat_tag})
+
+        final_items.append({
+            "itemName": mapped,
+            "price": price,
+            "categoryTag": cat_tag,
+            "standardName": std_name,
+        })
 
     # Tag priority: Gemini tags → tag_policy → fallback
     if gemini_tags:
@@ -1887,12 +1899,22 @@ def process_receipt(
                         })
 
                 # ── Response: iOS ReceiptDraftResponseDTO 포맷 ──
+                # Build standardName lookup from final_items
+                std_name_map: Dict[str, str] = {}
+                for fi in final_items:
+                    fn = (fi.get("itemName") or "").strip().lower()
+                    sn = fi.get("standardName") or ""
+                    if fn and sn:
+                        std_name_map[fn] = sn
+
                 resp_items = []
                 for x in items_rows:
+                    iname = (x.get("item_name") or "").strip()
                     resp_items.append({
-                        "itemName": x.get("item_name") or "",
+                        "itemName": iname,
                         "price": x.get("price"),
                         "categoryTag": x.get("category_tag"),
+                        "standardName": std_name_map.get(iname.lower()),
                     })
 
                 draft_response = {
