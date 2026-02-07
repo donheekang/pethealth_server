@@ -103,6 +103,16 @@ class Settings(BaseSettings):
     # OCR hospital candidates
     OCR_HOSPITAL_CANDIDATE_LIMIT: int = 3
 
+    # --- ✅ Gemini (AI assist) ---
+    GEMINI_ENABLED: bool = False
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SECONDS: int = 10
+
+    # --- ✅ Tag thresholds (문장형 itemName 인식률 개선) ---
+    TAG_RECORD_THRESHOLD: int = 125
+    TAG_ITEM_THRESHOLD: int = 140
+
     # --- Postgres ---
     DB_ENABLED: bool = True
     DATABASE_URL: str = ""
@@ -123,18 +133,6 @@ class Settings(BaseSettings):
     # --- Admin ---
     ADMIN_UIDS: str = ""
 
-    # =========================================================
-    # ✅ Gemini (AI enrichment for receipt understanding)
-    # =========================================================
-    GEMINI_ENABLED: bool = False
-    GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
-    GEMINI_TIMEOUT_SECONDS: int = 8
-
-    # (옵션) GCP 위치/프로젝트를 쓰는 코드가 있다면 대비용
-    GCP_PROJECT_ID: str = ""
-    GCP_LOCATION: str = ""
-
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
@@ -142,21 +140,19 @@ settings = Settings()
 
 
 
-
-# =========================================================
 # Optional policy modules (separated files)
-# =========================================================
 try:
     import ocr_policy  # type: ignore
 except Exception as e:
-    ocr_policy = None
     logger.exception("[Import] ocr_policy import failed: %r", e)
+    ocr_policy = None
 
 try:
     import tag_policy  # type: ignore
 except Exception as e:
-    tag_policy = None
     logger.exception("[Import] tag_policy import failed: %r", e)
+    tag_policy = None
+
 
 
 def _require_module(mod, name: str):
@@ -2122,22 +2118,22 @@ def api_receipts_process(
 
     _require_module(ocr_policy, "ocr_policy")
     try:
-        webp_bytes, parsed, hints = ocr_policy.process_receipt(
+       webp_bytes, parsed, hints = ocr_policy.process_receipt(
     raw,
     google_credentials=settings.GOOGLE_APPLICATION_CREDENTIALS,
-    ocr_timeout_seconds=settings.OCR_TIMEOUT_SECONDS,
-    ocr_max_concurrency=settings.OCR_MAX_CONCURRENCY,
-    ocr_sema_acquire_timeout_seconds=settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS,
-    receipt_max_width=settings.RECEIPT_MAX_WIDTH,
-    receipt_webp_quality=settings.RECEIPT_WEBP_QUALITY,
-    image_max_pixels=settings.IMAGE_MAX_PIXELS,
-
-    # ✅ Gemini 환경변수 기반 강제 주입
-    gemini_enabled=settings.GEMINI_ENABLED,
-    gemini_api_key=settings.GEMINI_API_KEY,
-    gemini_model_name=settings.GEMINI_MODEL_NAME,
-    gemini_timeout_seconds=settings.GEMINI_TIMEOUT_SECONDS,
+    ocr_timeout_seconds=int(settings.OCR_TIMEOUT_SECONDS),
+    ocr_max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
+    ocr_sema_acquire_timeout_seconds=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
+    receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
+    receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
+    image_max_pixels=int(settings.IMAGE_MAX_PIXELS),
+    gemini_enabled=bool(settings.GEMINI_ENABLED),              # ✅ 추가
+    gemini_api_key=str(settings.GEMINI_API_KEY or ""),         # ✅ 추가
+    gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),   # ✅ 추가
+    gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),
 )
+
+
 
 
 
@@ -2257,15 +2253,24 @@ def api_receipts_process(
 
         safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-    # 3) resolve record tags
-    _require_module(tag_policy, "tag_policy")
-    try:
-        # ✅ ocr_text도 넘겨두면(tag_policy가 원하면 사용) items가 빈 케이스에 도움됨
-        tag_result = tag_policy.resolve_record_tags(  # type: ignore
-            items=safe_items,
-            hospital_name=hn,
-            ocr_text=(ocr_text[:4000] if isinstance(ocr_text, str) else None),
-        )
+   # 3) resolve record tags (module, your standard codes)
+_require_module(tag_policy, "tag_policy")
+try:
+    tag_result = tag_policy.resolve_record_tags(  # type: ignore
+        items=safe_items,
+        hospital_name=hn,
+        ocr_text=(parsed.get("ocrText") or parsed.get("text") or ""),   # ✅ 추가
+        record_thresh=int(settings.TAG_RECORD_THRESHOLD),              # ✅ 추가
+        item_thresh=int(settings.TAG_ITEM_THRESHOLD),                  # ✅ 추가
+        gemini_enabled=bool(settings.GEMINI_ENABLED),                  # ✅ 추가(선택)
+        gemini_api_key=str(settings.GEMINI_API_KEY or ""),             # ✅ 추가(선택)
+        gemini_model_name=str(settings.GEMINI_MODEL_NAME or ""),       # ✅ 추가(선택)
+        gemini_timeout_seconds=int(settings.GEMINI_TIMEOUT_SECONDS),   # ✅ 추가(선택)
+    )
+    resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
+    tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
+except Exception as e:
+
         resolved_tags = _clean_tags(tag_result.get("tags") if isinstance(tag_result, dict) else [])
         tag_evidence = tag_result.get("evidence") if isinstance(tag_result, dict) else None
     except Exception as e:
