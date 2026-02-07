@@ -1943,17 +1943,17 @@ def api_record_confirm_hospital(req: HealthRecordConfirmHospitalRequest, user: D
         raise
 # =========================================================
 # Receipts: OCR draft + Commit (NO schema changes)
-#   - POST   /api/receipts/process        : OCR only + store DRAFT in storage (NO DB write)
-#   - POST   /api/receipts/commit         : DB write + attach receipt (draft -> final)
-#   - DELETE /api/receipts/draft/delete   : cancel draft (delete draft object)
+#   - /api/receipts/process : OCR only + store draft receipt in storage (NO DB write)
+#   - /api/receipts/commit  : create/update DB record + move draft -> final + items + candidates write
+#   - /api/receipts/draft/delete : cancel draft (delete draft object)
 # =========================================================
 
 # -----------------------------
-# Draft path helper
+# Draft path helpers
 # -----------------------------
-def _draft_receipt_path(uid: str, pet_id: str, draft_id: str) -> str:
-    # keep under user prefix (same ACL assumption as receipts)
-    return f"users/{uid}/pets/{pet_id}/draft_receipts/{draft_id}.webp"
+def _draft_receipt_path(uid: str, pet_id: str, record_id: str) -> str:
+    # Draft is stored under a separate prefix so it does NOT create DB rows.
+    return f"{_user_prefix(uid, pet_id)}/draft_receipts/{record_id}.webp"
 
 
 def download_bytes_from_storage(path: str) -> bytes:
@@ -1964,43 +1964,38 @@ def download_bytes_from_storage(path: str) -> bytes:
     return blob.download_as_bytes()
 
 
-# -----------------------------
-# Tag evidence exposure control
-# -----------------------------
-def _expose_tag_evidence() -> bool:
-    v = (os.getenv("EXPOSE_TAG_EVIDENCE") or "").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-def _sanitize_tag_evidence(ev: Any, *, max_candidates: int = 8) -> Optional[Dict[str, Any]]:
+def _sanitize_tag_evidence_public(ev: Any) -> Optional[Dict[str, Any]]:
     """
-    iOS에서 팝업으로 그대로 노출되는 걸 방지:
-    - query(= OCR/주소/전화 섞일 수 있음) 제거
-    - candidates 갯수 제한
+    ✅ IMPORTANT:
+    - 절대 OCR 원문(query) 전체를 클라로 보내지 않기(개인정보/주소/전화 포함될 수 있음)
+    - candidates도 너무 길면 top 몇 개만
     """
     if not isinstance(ev, dict):
         return None
-    out = dict(ev)
 
-    # ✅ 가장 길고 민감한 query 제거
-    if "query" in out:
-        out["query"] = "[redacted]"
+    out: Dict[str, Any] = {
+        "policy": ev.get("policy"),
+        "recordThresh": ev.get("recordThresh"),
+        "itemThresh": ev.get("itemThresh"),
+    }
 
-    # candidates 길이 제한
-    c = out.get("candidates")
-    if isinstance(c, list):
-        out["candidates"] = c[:max_candidates]
+    cands = ev.get("candidates")
+    if isinstance(cands, list):
+        top = []
+        for c in cands[:5]:
+            if not isinstance(c, dict):
+                continue
+            top.append(
+                {
+                    "code": c.get("code"),
+                    "score": c.get("score"),
+                    # why도 너무 길면 UI가 터짐 -> 최대 3개
+                    "why": (c.get("why")[:3] if isinstance(c.get("why"), list) else None),
+                }
+            )
+        out["topCandidates"] = top
 
-    # rabiesForce도 너무 길면 일부만
-    rf = out.get("rabiesForce")
-    if isinstance(rf, dict):
-        rf2 = dict(rf)
-        # 텍스트 라인 같은 것 있으면 제거
-        for k in ("textLines", "lines", "ocrLines"):
-            if k in rf2:
-                rf2[k] = ["[redacted]"]
-        out["rabiesForce"] = rf2
-
+    # ✅ query/ocrText 같은 원문은 절대 포함하지 않는다.
     return out
 
 
@@ -2027,10 +2022,8 @@ class ReceiptDraftHospitalCandidateDTO(BaseModel):
 
 class ReceiptDraftResponseDTO(BaseModel):
     mode: str = "draft"
-    draftId: str
+    recordId: str
     petId: str
-    recordId: Optional[str] = None
-
     draftReceiptPath: str
     fileSizeBytes: int
 
@@ -2047,16 +2040,17 @@ class ReceiptDraftResponseDTO(BaseModel):
     hospitalCandidateCount: int = 0
     hospitalConfirmed: bool = False
 
+    # ✅ 기본은 "축약/안전" evidence만 내려줌 (원문 금지)
     tagEvidence: Optional[Any] = None
 
 
 class ReceiptCommitRequestDTO(BaseModel):
+    recordId: str
     petId: str
-    recordId: Optional[str] = None
     draftReceiptPath: str
 
     # user editable
-    visitDate: str
+    visitDate: str  # YYYY-MM-DD
     hospitalName: Optional[str] = None
     hospitalMgmtNo: Optional[str] = None
     totalAmount: Optional[int] = None
@@ -2069,7 +2063,7 @@ class ReceiptCommitRequestDTO(BaseModel):
 
 
 class ReceiptCommitResponseDTO(BaseModel):
-    # iOS HealthRecordRowDTO(snake_case) compatible
+    # HealthRecordRowDTO(snake_case) compatible
     id: str
     pet_id: str
 
@@ -2093,6 +2087,7 @@ class ReceiptCommitResponseDTO(BaseModel):
     hospitalCandidateCount: Optional[int] = None
     hospitalConfirmed: Optional[bool] = None
 
+    # ✅ commit 응답엔 기본적으로 evidence 안 내려도 됨 (필요하면 나중에 별도 디버그 API로)
     tagEvidence: Optional[Any] = None
 
 
@@ -2108,18 +2103,21 @@ class DraftDeleteResponseDTO(BaseModel):
 @app.post("/api/receipts/process", response_model=ReceiptDraftResponseDTO)
 def api_receipts_process(
     petId: str = Form(...),
-    recordId: Optional[str] = Form(None),                 # ✅ 편집 화면 대응
+    recordId: Optional[str] = Form(None),              # ✅ 미리 recordId 만들어서 draftId 없이 처리
     hospitalMgmtNo: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     image: Optional[UploadFile] = File(None),
+
+    # ✅ true일 때만 full evidence를 내려주고 싶다면(디버그용) 사용
+    #    기본 false: 축약 evidence만 내려감
+    debugEvidence: bool = Form(False),
+
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     # ---- local helpers (copy/paste safe) ----
     _AMOUNT_RE = re.compile(r"([0-9][0-9,]*)")
     _MONEY_TOKEN_RE = re.compile(r"[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,}")  # 30,000 or 30000+
     _DATE_RE = re.compile(r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b")
-    _PHONE_RE = re.compile(r"\b\d{2,3}-\d{3,4}-\d{4}\b")
-    _BIZ_RE = re.compile(r"\b\d{3}-\d{2}-\d{5}\b")
 
     _NOISE_TOKENS = [
         "고객", "고객번호", "고객 번호",
@@ -2128,8 +2126,9 @@ def api_receipts_process(
         "serial", "sign", "승인", "카드", "현금",
         "부가세", "vat", "면세", "과세", "공급가",
         "소계", "합계", "총액", "총 금액", "총금액", "청구", "결제",
+        # ✅ 날짜 라인도 noise에 넣어 오탐(2025=>2025원) 방지
+        "날짜", "일자", "방문일", "진료일",
     ]
-    _ADDR_TOKENS = ["특별시","광역시","도","시","군","구","동","읍","면","리","로","길","번지","호","층","빌딩","아파트","프라자"]
 
     def _coerce_amount_int(v: Any) -> Optional[int]:
         if v is None:
@@ -2160,38 +2159,16 @@ def api_receipts_process(
     def _norm_key(s: str) -> str:
         return re.sub(r"[^0-9a-zA-Z가-힣]", "", (s or "").lower())
 
-    def _looks_like_address_line(s: str) -> bool:
-        t = (s or "").strip()
-        if not t:
-            return True
-        # 금액 표시가 있으면 주소로 보지 않음
-        if "원" in t or "₩" in t:
-            return False
-        has_digit = any(ch.isdigit() for ch in t)
-        if not has_digit:
-            return False
-        for tok in _ADDR_TOKENS:
-            if tok and tok in t:
-                return True
-        return False
-
     def _is_noise_line(name: str) -> bool:
         n = (name or "").strip()
         if not n:
             return True
         low = n.lower()
 
-        # 날짜만 있는 라인 제거
-        if _DATE_RE.search(n) and len(_norm_key(n)) <= 10:
-            return True
-
-        # 사업자/전화 같은 라인 제거
-        if _PHONE_RE.search(n) or _BIZ_RE.search(n):
-            return True
-
-        # 주소 라인 제거 (도당로 115 같은 케이스)
-        if _looks_like_address_line(n):
-            return True
+        # ✅ 날짜 라인 방어
+        if _DATE_RE.search(n):
+            if len(_norm_key(n)) <= 12:
+                return True
 
         if len(_norm_key(n)) < 2:
             return True
@@ -2224,10 +2201,8 @@ def api_receipts_process(
         s = (line or "").strip()
         if not s:
             return None
-
-        # "30,000원" 우선
         m_won = re.findall(r"([0-9][0-9,]*)\s*원", s)
-        cand: List[int] = []
+        cand = []
         for x in m_won:
             n = _coerce_amount_int(x)
             if isinstance(n, int) and n >= 100:
@@ -2235,7 +2210,6 @@ def api_receipts_process(
         if cand:
             return max(cand)
 
-        # 그 외 숫자 중 큰 값
         m_all = _AMOUNT_RE.findall(s)
         nums: List[int] = []
         for x in m_all:
@@ -2282,9 +2256,6 @@ def api_receipts_process(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(petId, "petId")
-    record_uuid: Optional[str] = None
-    if isinstance(recordId, str) and recordId.strip():
-        record_uuid = str(_uuid_or_400(recordId, "recordId"))
 
     pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
@@ -2297,12 +2268,14 @@ def api_receipts_process(
     except Exception:
         pet_weight_kg = None
 
+    # ✅ recordId를 미리 발급 (draftId 필요 없음)
+    record_uuid = _uuid_or_new(recordId, "recordId")
+
     raw = _read_upload_limited(upload, int(settings.MAX_RECEIPT_IMAGE_BYTES))
     if not raw:
         raise HTTPException(status_code=400, detail="empty file")
 
     _require_module(ocr_policy, "ocr_policy")
-
     try:
         webp_bytes, parsed, hints = ocr_policy.process_receipt(
             raw,
@@ -2327,17 +2300,15 @@ def api_receipts_process(
         hints = {}
 
     # ---- store DRAFT receipt (NO DB) ----
-    draft_id = str(uuid.uuid4())
-    draft_path = _draft_receipt_path(uid, str(pet_uuid), draft_id)
-
+    draft_path = _draft_receipt_path(uid, str(pet_uuid), str(record_uuid))
     try:
-        upload_bytes_to_storage(draft_path, webp_bytes, "image/webp")
+        upload_bytes_to_storage(draft_path, webp_bytes, "image/webp")  # overwrite ok
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
     file_size_bytes = int(len(webp_bytes))
 
-    # ---- extract parsed fields ----
+    # ---- parsed extract ----
     visit_date_raw = None
     hospital_name_raw = None
     total_amount_raw = None
@@ -2365,13 +2336,6 @@ def api_receipts_process(
 
     extracted_items: List[Any] = items_raw if isinstance(items_raw, list) else []
 
-    # items가 없으면 lines류 -> 마지막에 ocr_text 라인 split (주소/전화는 위에서 걸러짐)
-    if not extracted_items:
-        for r in roots:
-            lines_raw = _pick_first(r, ["lines", "textLines", "ocrLines", "rawLines", "lineTexts"])
-            if isinstance(lines_raw, list) and lines_raw:
-                extracted_items = lines_raw
-                break
     if (not extracted_items) and isinstance(ocr_text, str) and ocr_text.strip():
         extracted_items = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
 
@@ -2387,22 +2351,7 @@ def api_receipts_process(
 
     mgmt_input = hospitalMgmtNo.strip() if isinstance(hospitalMgmtNo, str) and hospitalMgmtNo.strip() else None
 
-    # (optional) mgmt scope check early
-    if mgmt_input is not None:
-        hosp = db_fetchone(
-            """
-            SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
-            FROM public.hospitals
-            WHERE hospital_mgmt_no=%s
-            """,
-            (mgmt_input,),
-        )
-        if not hosp:
-            raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
-        if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
-            raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
-
-    # ---- normalize items: dict + str 둘 다 지원 ----
+    # ---- normalize items ----
     safe_items: List[Dict[str, Any]] = []
     for it in extracted_items[:250]:
         nm = ""
@@ -2414,9 +2363,7 @@ def api_receipts_process(
             raw_price = it.get("price")
             if raw_price is None:
                 raw_price = it.get("amount") or it.get("value") or it.get("total")
-            ct = it.get("categoryTag")
-            if ct is None:
-                ct = it.get("category_tag")
+            ct = it.get("categoryTag") or it.get("category_tag")
         elif isinstance(it, str):
             nm = it.strip()
         else:
@@ -2426,7 +2373,9 @@ def api_receipts_process(
             continue
 
         nm_clean = _clean_item_name_from_line(nm)
-        if not nm_clean or _is_noise_line(nm_clean):
+        if not nm_clean:
+            continue
+        if _is_noise_line(nm_clean):
             continue
 
         pr = _coerce_amount_int(raw_price)
@@ -2440,7 +2389,7 @@ def api_receipts_process(
 
         safe_items.append({"itemName": nm_clean[:200], "price": pr, "categoryTag": ct})
 
-    # ---- resolve tags ----
+    # ---- tags (NO DB write) ----
     _require_module(tag_policy, "tag_policy")
 
     tag_result: Dict[str, Any] = {}
@@ -2469,7 +2418,7 @@ def api_receipts_process(
         tag_evidence = None
         logger.warning("[TagPolicy] resolve failed (ignored): %s", _sanitize_for_log(repr(e)))
 
-    # itemCategoryTags 반영
+    # itemCategoryTags -> safe_items.categoryTag
     try:
         if isinstance(tag_result, dict):
             rows = tag_result.get("itemCategoryTags")
@@ -2490,22 +2439,22 @@ def api_receipts_process(
             if ct2:
                 it["categoryTag"] = ct2
 
-    # price fallback: 가격이 하나도 없으면 total을 채워넣기
-    has_any_price = any(isinstance(x.get("price"), int) and int(x.get("price")) > 0 for x in safe_items)
-    if (not has_any_price) and (ta_from_ocr is not None) and (ta_from_ocr >= 100):
-        if len(safe_items) == 1 and safe_items[0].get("price") is None:
-            safe_items[0]["price"] = int(ta_from_ocr)
-        elif len(safe_items) == 0:
-            safe_items.append(
-                {"itemName": "진료비", "price": int(ta_from_ocr), "categoryTag": (resolved_tags[0] if resolved_tags else "checkup_general")}
-            )
+    # ---- totals ----
+    items_sum = 0
+    for it in safe_items:
+        pr = it.get("price")
+        if isinstance(pr, int) and pr > 0:
+            items_sum += pr
+    ta_candidate = int(ta_from_ocr) if ta_from_ocr is not None and int(ta_from_ocr) > 0 else (items_sum if items_sum > 0 else 0)
 
-    # hospital candidates (preview only; NO table write)
-    addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
-    addr_hint = addr_hint if isinstance(addr_hint, str) else None
+    vd_final = (vd_from_ocr or date.today()).isoformat()
 
+    # ---- candidates (preview only; NO write) ----
     candidates_out: List[Dict[str, Any]] = []
     try:
+        addr_hint = hints.get("addressHint") if isinstance(hints, dict) else None
+        addr_hint = addr_hint if isinstance(addr_hint, str) else ""
+
         limit_n = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
         limit_n = max(1, min(limit_n, 10))
 
@@ -2548,24 +2497,33 @@ def api_receipts_process(
         logger.warning("[Candidates] draft generation failed (ignored): %s", _sanitize_for_log(_pg_message(e)))
         candidates_out = []
 
-    # totals
-    items_sum = 0
-    for it in safe_items:
-        pr = it.get("price")
-        if isinstance(pr, int) and pr > 0:
-            items_sum += pr
-    ta_candidate = int(ta_from_ocr) if ta_from_ocr is not None and int(ta_from_ocr) > 0 else (items_sum if items_sum > 0 else 0)
+    # ---- mgmt scope check (optional) ----
+    if mgmt_input is not None:
+        hosp = db_fetchone(
+            """
+            SELECT hospital_mgmt_no, is_custom_entry, created_by_uid
+            FROM public.hospitals
+            WHERE hospital_mgmt_no=%s
+            """,
+            (mgmt_input,),
+        )
+        if not hosp:
+            raise HTTPException(status_code=400, detail="Invalid hospitalMgmtNo")
+        if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
+            raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
 
-    vd_final = (vd_from_ocr or date.today()).isoformat()
-
-    # ✅ tagEvidence는 기본적으로 내려주지 않기 (팝업 방지)
-    tag_evidence_out = _sanitize_tag_evidence(tag_evidence) if _expose_tag_evidence() else None
+    # ✅ tagEvidence는 "축약본"만 내려준다 (사진처럼 원문 전체 뜨는 문제 해결)
+    evidence_out = None
+    if debugEvidence and settings.EXPOSE_ERROR_DETAILS:
+        # 정말 디버그가 필요할 때만(서버에서 노출 허용일 때만)
+        evidence_out = tag_evidence
+    else:
+        evidence_out = _sanitize_tag_evidence_public(tag_evidence)
 
     return {
         "mode": "draft",
-        "draftId": draft_id,
+        "recordId": str(record_uuid),
         "petId": str(pet_uuid),
-        "recordId": record_uuid,
         "draftReceiptPath": draft_path,
         "fileSizeBytes": int(file_size_bytes),
         "visitDate": vd_final,
@@ -2578,7 +2536,7 @@ def api_receipts_process(
         "hospitalCandidates": candidates_out,
         "hospitalCandidateCount": len(candidates_out),
         "hospitalConfirmed": bool(mgmt_input),
-        "tagEvidence": tag_evidence_out,
+        "tagEvidence": evidence_out,
     }
 
 
@@ -2610,8 +2568,7 @@ def api_receipts_draft_delete(
 
 
 # =========================================================
-# POST /api/receipts/commit  (SAVE to DB + attach receipt)
-#   - draft는 성공 시에만 삭제
+# POST /api/receipts/commit  (SAVE to DB + draft -> final)
 # =========================================================
 @app.post("/api/receipts/commit", response_model=ReceiptCommitResponseDTO)
 def api_receipts_commit(
@@ -2626,7 +2583,9 @@ def api_receipts_commit(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(req.petId, "petId")
-    pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+    record_uuid = _uuid_or_400(req.recordId, "recordId")
+
+    pet = db_fetchone("SELECT id FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
 
@@ -2654,42 +2613,7 @@ def api_receipts_commit(
         if hosp.get("is_custom_entry") and (hosp.get("created_by_uid") or "") != uid:
             raise HTTPException(status_code=403, detail="custom hospital belongs to another user")
 
-    # record id (optional: edit flow)
-    record_uuid = _uuid_or_400(req.recordId, "recordId") if (req.recordId and req.recordId.strip()) else uuid.uuid4()
-
-    # draft path validation
-    draft_path = (req.draftReceiptPath or "").strip().lstrip("/")
-    if not draft_path:
-        raise HTTPException(status_code=400, detail="draftReceiptPath is required")
-    if not draft_path.startswith(f"users/{uid}/"):
-        raise HTTPException(status_code=403, detail="draftReceiptPath is not under your user prefix")
-
-    # final receipt path
-    final_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
-
-    # fetch draft bytes (also file size)
-    raw = download_bytes_from_storage(draft_path)
-    file_size_bytes = int(len(raw))
-
-    # upload to final first (so DB always points to something)
-    try:
-        upload_bytes_to_storage(final_path, raw, "image/webp")  # overwrite OK
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage upload failed"))
-
-    # items / tags
-    items = req.items or []
-    items_sum = 0
-    for it in items:
-        if it.price is not None:
-            try:
-                p = int(it.price)
-            except Exception:
-                raise HTTPException(status_code=400, detail="item price must be a number")
-            if p < 0:
-                raise HTTPException(status_code=400, detail="item price must be >= 0")
-            items_sum += p
-
+    # total amount
     total_amount = 0
     if req.totalAmount is not None:
         try:
@@ -2697,10 +2621,7 @@ def api_receipts_commit(
         except Exception:
             raise HTTPException(status_code=400, detail="totalAmount must be a number")
     if total_amount < 0:
-        raise HTTPException(status_code=400, detail "totalAmount must be >= 0")
-
-    if total_amount <= 0 and items_sum > 0:
-        total_amount = items_sum
+        raise HTTPException(status_code=400, detail="totalAmount must be >= 0")
 
     pet_weight_at_visit = req.petWeightAtVisit
     if pet_weight_at_visit is not None:
@@ -2711,53 +2632,96 @@ def api_receipts_commit(
         if pet_weight_at_visit <= 0:
             pet_weight_at_visit = None
 
+    # items
+    items_in = req.items or []
+    items_sum = 0
+    for it in items_in:
+        if it.price is not None:
+            try:
+                p = int(it.price)
+            except Exception:
+                raise HTTPException(status_code=400, detail="item price must be a number")
+            if p < 0:
+                raise HTTPException(status_code=400, detail="item price must be >= 0")
+            items_sum += p
+
+    if total_amount <= 0 and items_sum > 0:
+        total_amount = items_sum
+
     tags = _clean_tags(req.tags)
 
-    # DB upsert + items insert
+    # draft path validation (must match expected exact path)
+    draft_path = (req.draftReceiptPath or "").strip().lstrip("/")
+    expected_draft = _draft_receipt_path(uid, str(pet_uuid), str(record_uuid))
+    if draft_path != expected_draft:
+        raise HTTPException(status_code=403, detail="draftReceiptPath mismatch")
+
+    # move/overwrite to final path
+    final_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
+
+    raw = download_bytes_from_storage(draft_path)
+    file_size_bytes = int(len(raw))
+    if file_size_bytes <= 0:
+        raise HTTPException(status_code=400, detail="draft receipt is empty")
+
+    try:
+        # overwrite ok
+        upload_bytes_to_storage(final_path, raw, "image/webp")
+        delete_storage_object_if_exists(draft_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage move failed"))
+
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # ensure record not deleted if exists
+                # If record exists, must belong to this user and same pet (avoid moving record across pets)
                 cur.execute(
                     """
-                    SELECT r.deleted_at
+                    SELECT r.id, r.pet_id, r.deleted_at
                     FROM public.health_records r
                     JOIN public.pets p ON p.id = r.pet_id
-                    WHERE p.user_uid=%s AND r.id=%s
+                    WHERE r.id=%s AND p.user_uid=%s
                     """,
-                    (uid, record_uuid),
+                    (record_uuid, uid),
                 )
-                ex = cur.fetchone()
-                if ex and ex.get("deleted_at") is not None:
-                    raise HTTPException(status_code=409, detail="record is deleted (cannot attach receipt)")
+                existing = cur.fetchone()
+                if existing and existing.get("deleted_at") is not None:
+                    raise HTTPException(status_code=409, detail="record is deleted (cannot commit receipt)")
+                if existing and str(existing.get("pet_id")) != str(pet_uuid):
+                    raise HTTPException(status_code=409, detail="record belongs to different pet")
 
-                # upsert record
+                # Upsert record (commit values)
                 cur.execute(
                     """
                     INSERT INTO public.health_records
-                        (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
-                         receipt_image_path, file_size_bytes)
+                      (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                       receipt_image_path, file_size_bytes)
                     VALUES
-                        (%s, %s, %s, %s, %s, %s, %s, %s,
-                         %s, %s)
+                      (%s, %s, %s, %s, %s, %s, %s, %s,
+                       %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
-                        pet_id = EXCLUDED.pet_id,
-                        hospital_mgmt_no = COALESCE(EXCLUDED.hospital_mgmt_no, public.health_records.hospital_mgmt_no),
-                        hospital_name   = COALESCE(EXCLUDED.hospital_name,   public.health_records.hospital_name),
-                        visit_date      = EXCLUDED.visit_date,
-                        total_amount    = CASE WHEN EXCLUDED.total_amount > 0 THEN EXCLUDED.total_amount ELSE COALESCE(public.health_records.total_amount, 0) END,
-                        pet_weight_at_visit = COALESCE(EXCLUDED.pet_weight_at_visit, public.health_records.pet_weight_at_visit),
-                        tags            = CASE WHEN EXCLUDED.tags IS NOT NULL AND cardinality(EXCLUDED.tags) > 0 THEN EXCLUDED.tags ELSE public.health_records.tags END,
-                        receipt_image_path = EXCLUDED.receipt_image_path,
-                        file_size_bytes    = EXCLUDED.file_size_bytes
-                    WHERE public.health_records.deleted_at IS NULL
+                      hospital_mgmt_no = COALESCE(EXCLUDED.hospital_mgmt_no, public.health_records.hospital_mgmt_no),
+                      hospital_name = COALESCE(EXCLUDED.hospital_name, public.health_records.hospital_name),
+                      visit_date = EXCLUDED.visit_date,
+                      total_amount = EXCLUDED.total_amount,
+                      pet_weight_at_visit = COALESCE(EXCLUDED.pet_weight_at_visit, public.health_records.pet_weight_at_visit),
+                      tags = CASE
+                        WHEN (EXCLUDED.tags IS NOT NULL AND cardinality(EXCLUDED.tags) > 0)
+                          THEN EXCLUDED.tags
+                        ELSE public.health_records.tags
+                      END,
+                      receipt_image_path = EXCLUDED.receipt_image_path,
+                      file_size_bytes = EXCLUDED.file_size_bytes
+                    WHERE
+                      public.health_records.deleted_at IS NULL
                       AND EXISTS (
                         SELECT 1 FROM public.pets p
-                        WHERE p.id = EXCLUDED.pet_id AND p.user_uid = %s
+                        WHERE p.id = public.health_records.pet_id AND p.user_uid = %s
                       )
                     RETURNING
-                        id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
-                        receipt_image_path, file_size_bytes, created_at, updated_at
+                      id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                      receipt_image_path, file_size_bytes,
+                      created_at, updated_at
                     """,
                     (
                         record_uuid,
@@ -2780,23 +2744,23 @@ def api_receipts_commit(
                 # items
                 if bool(req.replaceItems):
                     cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
-                for it in items:
-                    nm = (it.itemName or "").strip()
-                    if not nm:
-                        continue
-                    pr = it.price
-                    if pr is not None:
-                        pr = int(pr)
-                        if pr < 0:
-                            raise HTTPException(status_code=400, detail="item price must be >= 0")
-                    ct = (it.categoryTag or "").strip() or None
-                    cur.execute(
-                        """
-                        INSERT INTO public.health_items (record_id, item_name, price, category_tag)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (record_uuid, nm[:200], pr, ct),
-                    )
+                    for it in items_in:
+                        nm = (it.itemName or "").strip()
+                        if not nm:
+                            continue
+                        pr = it.price
+                        if pr is not None:
+                            pr = int(pr)
+                            if pr < 0:
+                                raise HTTPException(status_code=400, detail="item price must be >= 0")
+                        ct = (it.categoryTag or "").strip() or None
+                        cur.execute(
+                            """
+                            INSERT INTO public.health_items (record_id, item_name, price, category_tag)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (record_uuid, nm[:200], pr, ct),
+                        )
 
                 # candidates table write (only if not confirmed)
                 candidates_out: List[Dict[str, Any]] = []
@@ -2805,10 +2769,10 @@ def api_receipts_commit(
                         limit_n = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
                         limit_n = max(1, min(limit_n, 10))
 
-                        name_for_match = hospital_name or ""
-                        addr_for_match = ""
+                        name_for_match = (hospital_name or "").strip()
+                        addr_for_match = ""  # commit 단계에선 주소 힌트 없으면 비움
 
-                        if name_for_match.strip():
+                        if name_for_match:
                             cur.execute("SAVEPOINT cand_sp")
                             try:
                                 cur.execute("DELETE FROM public.health_record_hospital_candidates WHERE record_id=%s", (record_uuid,))
@@ -2844,6 +2808,7 @@ def api_receipts_commit(
                                         """,
                                         (record_uuid, c["hospital_mgmt_no"], idx, c.get("score")),
                                     )
+
                                     candidates_out.append(
                                         {
                                             "rank": idx,
@@ -2870,7 +2835,7 @@ def api_receipts_commit(
                     except Exception:
                         candidates_out = []
 
-                # return items rows
+                # return items
                 cur.execute(
                     """
                     SELECT id, record_id, item_name, price, category_tag, created_at, updated_at
@@ -2881,12 +2846,6 @@ def api_receipts_commit(
                     (record_uuid,),
                 )
                 items_rows = cur.fetchall() or []
-
-                # ✅ commit 성공했으니 draft 삭제
-                try:
-                    delete_storage_object_if_exists(draft_path)
-                except Exception:
-                    pass
 
                 created_at = row["created_at"].isoformat() if row.get("created_at") else None
                 updated_at = row["updated_at"].isoformat() if row.get("updated_at") else None
@@ -2908,17 +2867,24 @@ def api_receipts_commit(
                     "hospitalCandidates": candidates_out,
                     "hospitalCandidateCount": len(candidates_out),
                     "hospitalConfirmed": bool(row.get("hospital_mgmt_no")),
-                    # ✅ tagEvidence는 내려주지 않음 (팝업 방지)
                     "tagEvidence": None,
                 }
 
-    except HTTPException as he:
-        # DB 실패면 draft는 남겨두는 게 안전(사용자가 다시 commit 가능)
-        raise he
-    except Exception as e:
-        _raise_mapped_db_error(e)
+    except HTTPException:
+        # DB 실패 시 final_path 삭제해서 고아파일 방지
+        try:
+            delete_storage_object_if_exists(final_path)
+        except Exception:
+            pass
         raise
-        
+    except Exception as e:
+        try:
+            delete_storage_object_if_exists(final_path)
+        except Exception:
+            pass
+        _raise_mapped_db_error(e)
+        raise  # ✅ (중요) 'Raise' 오타 절대 금지
+
 # =========================================================
 # Documents (PDF)
 # =========================================================
