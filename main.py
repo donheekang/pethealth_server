@@ -2953,29 +2953,55 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     # ── JSON 파싱 ──
     import re as _re
 
-    cleaned = txt
-    cleaned = _re.sub(r"^```(?:json)?\s*", "", cleaned, flags=_re.IGNORECASE)
-    cleaned = _re.sub(r"\s*```$", "", cleaned)
+    logger.info("[AI Care] Gemini raw text (first 800): %s", txt[:800])
 
+    # 1) 마크다운 코드블록 제거 (멀티라인)
+    cleaned = _re.sub(r"```(?:json)?\s*\n?", "", txt, flags=_re.IGNORECASE)
+    cleaned = _re.sub(r"\n?\s*```", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # 2) JSON 객체 추출 (첫 번째 { ~ 마지막 })
     i = cleaned.find("{")
     k = cleaned.rfind("}")
     if i >= 0 and k > i:
         cleaned = cleaned[i : k + 1]
+    else:
+        logger.error("[AI Care] No JSON object found in: %s", cleaned[:500])
+        cleaned = ""
 
-    try:
-        result = json.loads(cleaned)
-    except json.JSONDecodeError:
-        logger.error("[AI Care] JSON parse failed: %s", cleaned[:500])
+    # 3) 파싱
+    result = None
+    if cleaned:
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError as je:
+            logger.error("[AI Care] JSON parse failed: %s | raw: %s", je, cleaned[:500])
+
+    # 4) 파싱 실패 시 summary만이라도 추출
+    if not result or not isinstance(result, dict):
+        # summary 필드만이라도 regex로 추출 시도
+        m = _re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}]', txt, flags=_re.DOTALL)
+        fallback_summary = m.group(1).replace('\\"', '"').replace("\\n", "\n") if m else ""
+        if not fallback_summary:
+            fallback_summary = "AI 분석 결과를 파싱하지 못했어요. 다시 시도해 주세요."
+
         result = {
-            "summary": txt[:500] if txt else "AI 분석 결과를 파싱하지 못했어요.",
+            "summary": fallback_summary,
             "tags": [],
             "period_stats": {},
             "care_guide": {},
         }
 
     # ── 응답 정규화 ──
+    summary_val = result.get("summary", "")
+    # summary에 JSON이 통째로 들어간 경우 방어
+    if summary_val.strip().startswith("{") or summary_val.strip().startswith("```"):
+        m2 = _re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}]', txt, flags=_re.DOTALL)
+        if m2:
+            summary_val = m2.group(1).replace('\\"', '"').replace("\\n", "\n")
+
     return {
-        "summary": result.get("summary", ""),
+        "summary": summary_val,
         "tags": result.get("tags", []),
         "period_stats": result.get("period_stats", {}),
         "care_guide": result.get("care_guide", {}),
