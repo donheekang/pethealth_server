@@ -1824,12 +1824,18 @@ def process_receipt(
     file_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
     file_size = int(len(webp_bytes))
 
+    logger.info("[receipt] original_webp present=%s, size=%s, webp_bytes size=%s",
+                original_webp is not None,
+                len(original_webp) if original_webp else 0,
+                len(webp_bytes))
+
     try:
         # 마스킹본 (앱 표시용)
         upload_bytes_to_storage(file_path, webp_bytes, content_type)
         # 원본 (보험 청구 PDF용)
         if original_webp:
             orig_path = _receipt_original_path(uid, str(pet_uuid), str(record_uuid))
+            logger.info("[receipt] uploading original to %s (%d bytes)", orig_path, len(original_webp))
             upload_bytes_to_storage(orig_path, original_webp, content_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
