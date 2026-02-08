@@ -2232,9 +2232,16 @@ def _validate_storage_path(path: str, uid: str) -> str:
 def _assert_path_owned(uid: str, path: str) -> Dict[str, Any]:
     if path.startswith(f"users/{uid}/backups/") and path.endswith(".json"):
         return {"kind": "backup"}
+    # Check exact match first
     rec = db_fetchone("SELECT 1 FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.deleted_at IS NULL AND r.receipt_image_path=%s LIMIT 1", (uid, path))
     if rec:
         return {"kind": "receipt"}
+    # ✅ _original.webp → 마스킹본 경로로 변환하여 소유권 확인
+    if "_original.webp" in path:
+        base_path = path.replace("_original.webp", ".webp")
+        rec2 = db_fetchone("SELECT 1 FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.deleted_at IS NULL AND r.receipt_image_path=%s LIMIT 1", (uid, base_path))
+        if rec2:
+            return {"kind": "receipt_original"}
     doc = db_fetchone("SELECT 1 FROM public.pet_documents d JOIN public.pets p ON p.id = d.pet_id WHERE p.user_uid=%s AND d.deleted_at IS NULL AND d.file_path=%s LIMIT 1", (uid, path))
     if doc:
         return {"kind": "document"}
