@@ -2819,19 +2819,7 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
 
-    # ── 티어 체크: premium만 허용 ──
-    row = db_fetchone(
-        "SELECT membership_tier, premium_until FROM public.users WHERE firebase_uid = %s",
-        (uid,),
-    )
-    if not row:
-        raise HTTPException(status_code=403, detail="AI_CARE_TIER_REQUIRED:premium")
-
-    effective = _effective_tier_from_row(
-        row.get("membership_tier"), row.get("premium_until")
-    )
-    if effective != "premium":
-        raise HTTPException(status_code=403, detail="AI_CARE_TIER_REQUIRED:premium")
+    # ── AI 분석: 로그인 사용자 전체 무료 ──
 
     # ── Gemini 설정 확인 ──
     if not settings.GEMINI_ENABLED or not settings.GEMINI_API_KEY:
