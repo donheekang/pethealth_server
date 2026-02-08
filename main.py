@@ -2837,6 +2837,19 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     if not settings.GEMINI_ENABLED or not settings.GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="AI analysis is not available (Gemini not configured)")
 
+    # ── condition_tags 로드 ──
+    tag_codes_info = ""
+    try:
+        from condition_tags import CONDITION_TAGS as _CT
+        tag_lines = []
+        for code, cfg in _CT.items():
+            if code != cfg.code:
+                continue  # alias 건너뜀
+            tag_lines.append(f"  - {cfg.code}: {cfg.label} (group={cfg.group})")
+        tag_codes_info = "\n".join(tag_lines[:80])  # 상위 80개
+    except Exception:
+        tag_codes_info = "(태그 목록 로드 실패)"
+
     # ── 프롬프트 구성 ──
     profile = req.profile or {}
     weights = req.recent_weights or []
@@ -2844,7 +2857,8 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     scheds = req.schedules or []
 
     prompt_lines = [
-        "너는 반려동물 건강 분석 AI야. 아래 정보를 바탕으로 건강 인사이트를 JSON으로 응답해.",
+        "너는 반려동물 건강 분석 전문 AI야.",
+        "아래 정보를 분석해서 **순수 JSON만** 응답해. 마크다운(```), 설명, 인사말 절대 금지.",
         "",
         f"## 프로필",
         f"- 이름: {profile.get('name', '?')}",
@@ -2879,15 +2893,17 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         prompt_lines.append("")
 
     prompt_lines.extend([
-        "## 응답 형식 (JSON만, 마크다운 금지)",
-        "{",
-        '  "summary": "종합 건강 인사이트 (한국어, 3~5문장)",',
-        '  "tags": [',
-        '    {"tag": "condition_code", "label": "한글 라벨", "count": 횟수, "recent_dates": ["yyyy-MM-dd"]}',
-        '  ],',
-        '  "period_stats": {"1m": {"tag": count}, "3m": {...}, "1y": {...}},',
-        '  "care_guide": {"condition_code": ["가이드 문장1", "가이드 문장2"]}',
-        "}",
+        "## 사용 가능한 태그 코드 (tag 필드에 아래 코드만 사용할 것)",
+        tag_codes_info,
+        "",
+        "## 응답 규칙",
+        "1. 순수 JSON만 출력. ```json 같은 마크다운 절대 금지.",
+        "2. summary는 한국어 3~5문장, 친절한 말투(~해요 체)로 작성.",
+        "3. tags의 tag 필드는 위 태그 코드 중에서만 선택.",
+        "4. 진료 이력이 없으면 tags=[], period_stats={}, care_guide={}로 비워.",
+        "5. care_guide의 value는 한국어 가이드 문장 리스트.",
+        "",
+        '{"summary":"...","tags":[{"tag":"코드","label":"한글","count":N,"recent_dates":["yyyy-MM-dd"]}],"period_stats":{"1m":{},"3m":{},"1y":{}},"care_guide":{"코드":["가이드1","가이드2"]}}',
     ])
 
     prompt = "\n".join(prompt_lines)
@@ -2897,12 +2913,16 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
 
     api_key = settings.GEMINI_API_KEY
     model = settings.GEMINI_MODEL_NAME or "gemini-2.5-flash"
-    timeout = settings.GEMINI_TIMEOUT_SECONDS or 30
+    timeout = max(settings.GEMINI_TIMEOUT_SECONDS or 30, 30)
 
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     gemini_payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 2048,
+            "responseMimeType": "application/json",
+        },
     }
     gemini_body = json.dumps(gemini_payload).encode("utf-8")
     gemini_req = _ureq.Request(
