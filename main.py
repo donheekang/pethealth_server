@@ -1836,7 +1836,15 @@ def process_receipt(
         if original_webp:
             orig_path = _receipt_original_path(uid, str(pet_uuid), str(record_uuid))
             logger.info("[receipt] uploading original to %s (%d bytes)", orig_path, len(original_webp))
-            upload_bytes_to_storage(orig_path, original_webp, content_type)
+            try:
+                upload_bytes_to_storage(orig_path, original_webp, content_type)
+                # verify upload
+                b = get_bucket()
+                blob = b.blob(orig_path)
+                exists = blob.exists()
+                logger.info("[receipt] original upload verify: exists=%s, path=%s", exists, orig_path)
+            except Exception as orig_err:
+                logger.error("[receipt] original upload FAILED: %s", orig_err)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
 
