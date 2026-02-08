@@ -2797,6 +2797,171 @@ def api_schedule_delete(scheduleId: str = Query(...), user: Dict[str, Any] = Dep
 # =========================================================
 # Admin overview
 # =========================================================
+
+
+# =========================================================
+# AI Care Analysis (v2.3.0) — premium only
+# =========================================================
+class AICareAnalyzeRequest(BaseModel):
+    request_date: Optional[str] = None
+    profile: Optional[Dict[str, Any]] = None
+    recent_weights: Optional[List[Dict[str, Any]]] = Field(default=None, alias="recentWeights")
+    medical_history: Optional[List[Dict[str, Any]]] = Field(default=None, alias="medicalHistory")
+    schedules: Optional[List[Dict[str, Any]]] = None
+
+    class Config:
+        populate_by_name = True
+
+
+@app.post("/api/ai/analyze")
+def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get_current_user)):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    # ── 티어 체크: premium만 허용 ──
+    row = db_fetchone(
+        "SELECT membership_tier, premium_until FROM public.users WHERE firebase_uid = %s",
+        (uid,),
+    )
+    if not row:
+        raise HTTPException(status_code=403, detail="AI_CARE_TIER_REQUIRED:premium")
+
+    effective = _effective_tier_from_row(
+        row.get("membership_tier"), row.get("premium_until")
+    )
+    if effective != "premium":
+        raise HTTPException(status_code=403, detail="AI_CARE_TIER_REQUIRED:premium")
+
+    # ── Gemini 설정 확인 ──
+    if not settings.GEMINI_ENABLED or not settings.GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="AI analysis is not available (Gemini not configured)")
+
+    # ── 프롬프트 구성 ──
+    profile = req.profile or {}
+    weights = req.recent_weights or []
+    history = req.medical_history or []
+    scheds = req.schedules or []
+
+    prompt_lines = [
+        "너는 반려동물 건강 분석 AI야. 아래 정보를 바탕으로 건강 인사이트를 JSON으로 응답해.",
+        "",
+        f"## 프로필",
+        f"- 이름: {profile.get('name', '?')}",
+        f"- 종: {profile.get('species', '?')}",
+        f"- 나이: {profile.get('age_text', '?')}",
+        f"- 현재 체중: {profile.get('weight_current', '?')}kg",
+        f"- 알레르기: {', '.join(profile.get('allergies', []) or ['없음'])}",
+        "",
+    ]
+
+    if weights:
+        prompt_lines.append("## 최근 체중 기록")
+        for w in weights[:12]:
+            prompt_lines.append(f"- {w.get('date', '?')}: {w.get('weight', '?')}kg")
+        prompt_lines.append("")
+
+    if history:
+        prompt_lines.append("## 진료 이력")
+        for h in history[:20]:
+            tags_str = ", ".join(h.get("tags", []) or [])
+            prompt_lines.append(
+                f"- {h.get('visit_date', '?')} {h.get('clinic_name', '?')} "
+                f"(항목 {h.get('item_count', 0)}개) tags=[{tags_str}]"
+            )
+        prompt_lines.append("")
+
+    if scheds:
+        prompt_lines.append("## 예방/진료 스케줄")
+        for s in scheds[:15]:
+            upcoming = "예정" if s.get("is_upcoming") else "지남"
+            prompt_lines.append(f"- {s.get('date', '?')} {s.get('title', '?')} ({upcoming})")
+        prompt_lines.append("")
+
+    prompt_lines.extend([
+        "## 응답 형식 (JSON만, 마크다운 금지)",
+        "{",
+        '  "summary": "종합 건강 인사이트 (한국어, 3~5문장)",',
+        '  "tags": [',
+        '    {"tag": "condition_code", "label": "한글 라벨", "count": 횟수, "recent_dates": ["yyyy-MM-dd"]}',
+        '  ],',
+        '  "period_stats": {"1m": {"tag": count}, "3m": {...}, "1y": {...}},',
+        '  "care_guide": {"condition_code": ["가이드 문장1", "가이드 문장2"]}',
+        "}",
+    ])
+
+    prompt = "\n".join(prompt_lines)
+
+    # ── Gemini 호출 ──
+    import urllib.request as _ureq
+
+    api_key = settings.GEMINI_API_KEY
+    model = settings.GEMINI_MODEL_NAME or "gemini-2.5-flash"
+    timeout = settings.GEMINI_TIMEOUT_SECONDS or 30
+
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    gemini_payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
+    }
+    gemini_body = json.dumps(gemini_payload).encode("utf-8")
+    gemini_req = _ureq.Request(
+        gemini_url,
+        data=gemini_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with _ureq.urlopen(gemini_req, timeout=float(timeout)) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        j = json.loads(raw)
+        txt = (
+            (j.get("candidates") or [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        ).strip()
+
+        logger.info("[AI Care] Gemini raw response length=%d", len(txt))
+
+    except Exception as e:
+        logger.exception("[AI Care] Gemini call failed: %r", e)
+        raise HTTPException(status_code=502, detail=f"AI analysis failed: {e}")
+
+    # ── JSON 파싱 ──
+    import re as _re
+
+    cleaned = txt
+    cleaned = _re.sub(r"^```(?:json)?\s*", "", cleaned, flags=_re.IGNORECASE)
+    cleaned = _re.sub(r"\s*```$", "", cleaned)
+
+    i = cleaned.find("{")
+    k = cleaned.rfind("}")
+    if i >= 0 and k > i:
+        cleaned = cleaned[i : k + 1]
+
+    try:
+        result = json.loads(cleaned)
+    except json.JSONDecodeError:
+        logger.error("[AI Care] JSON parse failed: %s", cleaned[:500])
+        result = {
+            "summary": txt[:500] if txt else "AI 분석 결과를 파싱하지 못했어요.",
+            "tags": [],
+            "period_stats": {},
+            "care_guide": {},
+        }
+
+    # ── 응답 정규화 ──
+    return {
+        "summary": result.get("summary", ""),
+        "tags": result.get("tags", []),
+        "period_stats": result.get("period_stats", {}),
+        "care_guide": result.get("care_guide", {}),
+    }
+
+
 @app.get("/api/admin/overview")
 def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
     users = db_fetchone("SELECT COUNT(*) AS cnt FROM public.users")
