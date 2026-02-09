@@ -2808,9 +2808,32 @@ class AICareAnalyzeRequest(BaseModel):
     recent_weights: Optional[List[Dict[str, Any]]] = Field(default=None, alias="recentWeights")
     medical_history: Optional[List[Dict[str, Any]]] = Field(default=None, alias="medicalHistory")
     schedules: Optional[List[Dict[str, Any]]] = None
+    force_refresh: Optional[bool] = Field(default=False, alias="forceRefresh")
 
     class Config:
         populate_by_name = True
+
+
+# ── AI 분석 결과 캐시 (메모리, 인스턴스 단위) ──
+import hashlib as _hashlib
+_ai_cache: Dict[str, Dict[str, Any]] = {}  # key: uid+data_hash → result
+_AI_CACHE_MAX = 200  # 최대 캐시 항목수
+
+
+def _make_ai_cache_key(uid: str, req: AICareAnalyzeRequest) -> str:
+    """진료 데이터의 해시를 생성. 같은 데이터면 같은 키."""
+    raw = json.dumps({
+        "profile": req.profile or {},
+        "history_count": len(req.medical_history or []),
+        "history_tags": [
+            (h.get("date", ""), h.get("tags", []))
+            for h in (req.medical_history or [])[:20]
+        ],
+        "schedules_count": len(req.schedules or []),
+        "weights_count": len(req.recent_weights or []),
+    }, sort_keys=True, ensure_ascii=False)
+    h = _hashlib.md5(raw.encode()).hexdigest()[:12]
+    return f"{uid}:{h}"
 
 
 @app.post("/api/ai/analyze")
@@ -2818,6 +2841,12 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     uid = (user.get("uid") or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="missing uid")
+
+    # ── 캐시 확인 (force_refresh=false일 때) ──
+    cache_key = _make_ai_cache_key(uid, req)
+    if not req.force_refresh and cache_key in _ai_cache:
+        logger.info("[AI Care] Cache HIT for %s", cache_key)
+        return _ai_cache[cache_key]
 
     # ── AI 분석: 로그인 사용자 전체 무료 ──
 
@@ -2889,13 +2918,13 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         "2. summary는 한국어 2~3문장으로 짧게. 친절한 말투(~해요 체).",
         "3. tags: 진료 이력의 tags를 분석해서 관련 태그를 반드시 포함. 태그는 최대 5개까지만.",
         "4. 진료 이력이 완전히 없는 경우에만 tags=[]로 비워.",
-        "5. care_guide: 각 태그별 한국어 가이드 1~2문장. 짧게 작성.",
-        "6. period_stats: 1m, 3m, 1y 기간별 각 태그 진료 횟수.",
-        "7. tags의 tag는 위 태그 코드 중에서만 선택. label은 한글 이름.",
+        "5. period_stats: 1m, 3m, 1y 기간별 각 태그 진료 횟수.",
+        "6. tags의 tag는 위 태그 코드 중에서만 선택. label은 한글 이름.",
+        "7. care_guide는 빈 객체 {}로 보내. 서버가 자동으로 채워줌.",
         "8. 전체 응답이 반드시 완전한 JSON이 되도록 할 것. 절대 중간에 끊기면 안 됨.",
         "",
         "## 응답 JSON 형식 (이 형식을 정확히 따를 것)",
-        '{"summary":"종합 분석 텍스트...","tags":[{"tag":"prevent_vaccine_rabies","label":"예방접종·광견병","count":1,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"prevent_vaccine_rabies":0},"3m":{"prevent_vaccine_rabies":1},"1y":{"prevent_vaccine_rabies":1}},"care_guide":{"prevent_vaccine_rabies":["광견병 예방접종은 매년 1회 접종이 권장돼요.","접종 후 1~2일 컨디션 변화를 관찰해 주세요."]}}',
+        '{"summary":"종합 분석 텍스트...","tags":[{"tag":"prevent_vaccine_rabies","label":"예방접종·광견병","count":1,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"prevent_vaccine_rabies":0},"3m":{"prevent_vaccine_rabies":1},"1y":{"prevent_vaccine_rabies":1}},"care_guide":{}}',
     ])
 
     prompt = "\n".join(prompt_lines)
@@ -2998,12 +3027,41 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         if m2:
             summary_val = m2.group(1).replace('\\"', '"').replace("\\n", "\n")
 
-    return {
+    # ── care_guide: condition_tags.py에서 자동 보강 ──
+    raw_tags = result.get("tags", [])
+    care_guide = {}
+    try:
+        from condition_tags import CONDITION_TAGS as _CT
+        for t in raw_tags:
+            if isinstance(t, dict):
+                tag_code = t.get("tag", "")
+            elif isinstance(t, str):
+                tag_code = t
+            else:
+                continue
+            if tag_code and tag_code in _CT:
+                care_guide[tag_code] = _CT[tag_code].guide
+    except Exception as e:
+        logger.warning("[AI Care] care_guide auto-fill failed: %s", e)
+        care_guide = result.get("care_guide", {})
+
+    response = {
         "summary": summary_val,
-        "tags": result.get("tags", []),
+        "tags": raw_tags,
         "period_stats": result.get("period_stats", {}),
-        "care_guide": result.get("care_guide", {}),
+        "care_guide": care_guide,
     }
+
+    # ── 캐시 저장 ──
+    if len(_ai_cache) >= _AI_CACHE_MAX:
+        # 오래된 항목 절반 제거
+        keys = list(_ai_cache.keys())
+        for k in keys[:_AI_CACHE_MAX // 2]:
+            _ai_cache.pop(k, None)
+    _ai_cache[cache_key] = response
+    logger.info("[AI Care] Cache STORED for %s", cache_key)
+
+    return response
 
 
 @app.get("/api/admin/overview")
