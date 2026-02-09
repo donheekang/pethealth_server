@@ -838,6 +838,8 @@ class MeSummaryResponse(BaseModel):
     doc_count: int
     claim_count: int
     schedule_count: int
+    ai_usage_count: int
+    ai_usage_limit: Optional[int]  # None = unlimited
 
 
 class DocumentUploadResponse(BaseModel):
@@ -1051,6 +1053,7 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
             doc_count,
             COALESCE(claim_count, 0) AS claim_count,
             COALESCE(schedule_count, 0) AS schedule_count,
+            COALESCE(ai_usage_count, 0) AS ai_usage_count,
             total_storage_bytes AS used_bytes
         FROM public.users
         WHERE firebase_uid = %s
@@ -1086,6 +1089,8 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
         "doc_count": int(row.get("doc_count") or 0),
         "claim_count": int(row.get("claim_count") or 0),
         "schedule_count": int(row.get("schedule_count") or 0),
+        "ai_usage_count": int(row.get("ai_usage_count") or 0),
+        "ai_usage_limit": None if effective_tier in ("premium", "platinum") else 10,
     }
 
 
@@ -2859,9 +2864,45 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     cache_key = _make_ai_cache_key(uid, req)
     if not req.force_refresh and cache_key in _ai_cache:
         logger.info("[AI Care] Cache HIT for %s", cache_key)
-        return _ai_cache[cache_key]
+        cached = _ai_cache[cache_key]
+        # ✅ 캐시 HIT 시 현재 사용량 정보도 함께 반환
+        try:
+            urow = db_fetchone("SELECT COALESCE(ai_usage_count,0) AS cnt, membership_tier, premium_until FROM public.users WHERE firebase_uid=%s", (uid,))
+            etier = _effective_tier_from_row((urow or {}).get("membership_tier"), (urow or {}).get("premium_until")) if urow else "member"
+            limit = None if etier in ("premium", "platinum") else 10
+            cached["ai_usage_count"] = int((urow or {}).get("cnt") or 0)
+            cached["ai_usage_limit"] = limit
+        except Exception:
+            pass
+        return cached
 
-    # ── AI 분석: 로그인 사용자 전체 무료 ──
+    # ── AI 분석 쿼터 체크 (member: 총 10회, premium/platinum: 무제한) ──
+    ai_limit = None
+    ai_count = 0
+    try:
+        urow = db_fetchone(
+            "SELECT COALESCE(ai_usage_count,0) AS cnt, membership_tier, premium_until FROM public.users WHERE firebase_uid=%s",
+            (uid,),
+        )
+        if urow:
+            etier = _effective_tier_from_row(urow.get("membership_tier"), urow.get("premium_until"))
+            ai_count = int(urow.get("cnt") or 0)
+            if etier not in ("premium", "platinum"):
+                ai_limit = 10
+                if ai_count >= ai_limit:
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "detail": "AI 케어 분석 무료 횟수(10회)를 모두 사용했어요. Pro 구독으로 무제한 이용하세요!",
+                            "code": "AI_QUOTA_EXCEEDED",
+                            "ai_usage_count": ai_count,
+                            "ai_usage_limit": ai_limit,
+                        },
+                    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("[AI Care] Quota check failed (ignored): %s", _sanitize_for_log(str(e)))
 
     # ── Gemini 설정 확인 ──
     if not settings.GEMINI_ENABLED or not settings.GEMINI_API_KEY:
@@ -3073,6 +3114,21 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
             _ai_cache.pop(k, None)
     _ai_cache[cache_key] = response
     logger.info("[AI Care] Cache STORED for %s", cache_key)
+
+    # ✅ v2.3.1: 실제 Gemini 호출 시에만 카운트 증가 (캐시 MISS)
+    new_count = ai_count
+    try:
+        db_execute(
+            "UPDATE public.users SET ai_usage_count = COALESCE(ai_usage_count, 0) + 1 WHERE firebase_uid = %s",
+            (uid,),
+        )
+        new_count = ai_count + 1
+        logger.info("[AI Care] Usage count incremented for %s: %d -> %d", uid, ai_count, new_count)
+    except Exception as e:
+        logger.warning("[AI Care] Usage count update failed (ignored): %s", _sanitize_for_log(str(e)))
+
+    response["ai_usage_count"] = new_count
+    response["ai_usage_limit"] = ai_limit
 
     return response
 
