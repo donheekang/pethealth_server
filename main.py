@@ -1169,6 +1169,36 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
 
         exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_uuid,))
         if exists and exists.get("user_uid") != uid:
+            # ✅ FIX: migration claim — oldUid 소유 펫을 newUid로 이전 허용
+            old_owner = exists.get("user_uid")
+            can_claim = False
+            try:
+                recent_token = db_fetchone(
+                    """SELECT 1 FROM public.migration_tokens
+                       WHERE old_uid=%s AND new_uid=%s
+                         AND status IN ('completed','processing')
+                         AND (used_at IS NULL OR used_at > now() - interval '10 minutes')
+                       LIMIT 1""",
+                    (old_owner, uid),
+                )
+                if recent_token:
+                    can_claim = True
+            except Exception:
+                pass
+
+            if can_claim:
+                # 소유권 이전 후 재시도
+                db_execute("UPDATE public.pets SET user_uid=%s WHERE id=%s", (uid, pet_uuid))
+                row = db_fetchone(
+                    """SELECT id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered,
+                              has_no_allergy, allergy_tags, created_at, updated_at
+                       FROM public.pets WHERE id=%s""",
+                    (pet_uuid,),
+                )
+                if row:
+                    logger.info("migration-claim pet %s: %s → %s", pet_uuid, old_owner, uid)
+                    return jsonable_encoder(row)
+
             raise HTTPException(status_code=403, detail="You do not own this pet id")
         raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert pet", kind="DB error"))
     except HTTPException:
