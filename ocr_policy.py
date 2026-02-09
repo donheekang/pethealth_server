@@ -36,9 +36,7 @@ _HOSP_RE = re.compile(r"(병원\s*명|원\s*명)\s*[:：]?\s*(.+)$")
 _PHONE_RE = re.compile(r"\b\d{2,3}-\d{3,4}-\d{4}\b")
 _BIZ_RE = re.compile(r"\b\d{3}-\d{2}-\d{5}\b")
 _CARD_RE = re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b")
-# 한글 이름 2~4자 (성+이름): 단독 토큰으로 나올 때 매칭
 _KOREAN_NAME_RE = re.compile(r"^[가-힣]{2,4}$")
-# 이름 라벨 키워드: 이 키워드 뒤에 오는 한글 이름을 마스킹
 _NAME_LABEL_KEYWORDS = {
     "고객명", "고객이름", "고객 이름", "보호자", "보호자명",
     "이름", "성명", "수신인", "수납자", "환자명",
@@ -66,13 +64,10 @@ _NOISE_TOKENS = [
     "입원", "퇴원",
     "항목", "단가", "수량", "금액",
     "동물명", "환자", "환자명", "품종",
-    # address / location noise
     "경기도", "서울", "인천", "부산", "대구", "대전", "광주", "울산", "세종",
     "충북", "충남", "전북", "전남", "경북", "경남", "강원", "제주",
 ]
 
-
-# Address pattern: 시/구/동/로/길 + 번지 style
 _ADDRESS_RE = re.compile(
     r"(경기도|서울|인천|부산|대구|대전|광주|울산|세종|충청|전라|경상|강원|제주)"
     r"|(\S+시\s+\S+구)"
@@ -112,7 +107,6 @@ def _is_noise_line(s: str) -> bool:
         return True
     if _looks_like_date_line(t):
         return True
-    # ✅ Address pattern detection
     if _ADDRESS_RE.search(t):
         return True
     has_letter = any(("a" <= ch.lower() <= "z") or ("가" <= ch <= "힣") for ch in t)
@@ -282,7 +276,6 @@ def _redact_image_with_vision_tokens(img, vision_response) -> Any:
             return img
         draw = ImageDraw.Draw(img)
 
-        # ── Pass 1: 전화번호/사업자번호/카드번호 마스킹 ──
         for a in anns[1:]:
             desc = str(getattr(a, "description", "") or "")
             if not desc:
@@ -291,20 +284,15 @@ def _redact_image_with_vision_tokens(img, vision_response) -> Any:
                 continue
             _fill_rect(draw, a)
 
-        # ── Pass 2: 이름 라벨 근처 한글 이름 마스킹 ──
-        # Vision OCR anns[1:]은 단어별 토큰. "고객" "이름" ":" "황지희" 순서로 옴.
-        # 라벨 키워드를 찾으면 뒤따르는 한글 2~4자 토큰을 마스킹.
-        tokens = list(anns[1:])  # word-level annotations
+        tokens = list(anns[1:])
         label_indices: set = set()
 
         for i, a in enumerate(tokens):
             desc = str(getattr(a, "description", "") or "").strip()
             desc_clean = desc.replace(" ", "")
-            # 단일 토큰이 라벨 키워드와 일치
             if desc_clean in _NAME_LABEL_KEYWORDS or desc_clean.rstrip(":：") in _NAME_LABEL_KEYWORDS:
                 label_indices.add(i)
                 continue
-            # "고객" + "이름" 같이 2토큰으로 분리된 경우
             if i > 0:
                 prev = str(getattr(tokens[i - 1], "description", "") or "").strip()
                 combo = (prev + desc).replace(" ", "")
@@ -312,20 +300,16 @@ def _redact_image_with_vision_tokens(img, vision_response) -> Any:
                     label_indices.add(i)
 
         for li in label_indices:
-            # 라벨 뒤 최대 3토큰 이내에서 한글 이름 찾기
             for offset in range(1, 4):
                 ni = li + offset
                 if ni >= len(tokens):
                     break
                 nd = str(getattr(tokens[ni], "description", "") or "").strip()
-                # 콜론/구분자는 건너뜀
                 if nd in (":", "：", "-", ")", "(", "/", "·"):
                     continue
-                # 한글 2~4자면 이름으로 판단 → 마스킹
                 if _KOREAN_NAME_RE.match(nd):
                     _fill_rect(draw, tokens[ni])
-                    break  # 이름 하나만 마스킹
-                # 한글이 아닌 다른 토큰이 나오면 중단
+                    break
                 break
 
         return img
@@ -334,7 +318,6 @@ def _redact_image_with_vision_tokens(img, vision_response) -> Any:
 
 
 def _fill_rect(draw, annotation) -> None:
-    """어노테이션의 bounding_poly를 흰색으로 채우기."""
     poly = getattr(annotation, "bounding_poly", None)
     if not poly or not getattr(poly, "vertices", None):
         return
@@ -636,7 +619,7 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================================
-# Gemini-first receipt parsing prompt (structured)
+# ✅ Gemini-first receipt parsing prompt (세분화 태그 동기화)
 # =========================================================
 _GEMINI_RECEIPT_PROMPT = """\
 You are analyzing a Korean veterinary hospital receipt image.
@@ -664,76 +647,128 @@ RULES:
 4. Be precise with prices — copy exact amounts from the receipt.
 
 STANDARD TAG CODES (use these exact codes for categoryTag):
-검사:
-  exam_blood = 혈액검사 (CBC, chemistry, biochem, blood test, 혈검, 피검)
-  exam_xray = X-ray (엑스레이, radiograph, 방사선)
-  exam_ultrasound = 초음파 (ultrasound, sono, 복부초음파, 심장초음파)
+
+검사 — 영상:
+  exam_xray = 엑스레이 (X-ray, radiograph, 방사선, 치아 방사선)
+  exam_ct = CT (CT촬영, CT조영, computed tomography)
+  exam_mri = MRI (MRI촬영, magnetic resonance)
+  exam_endoscope = 내시경 (endoscopy, 위내시경, 장내시경, 관절경)
+  exam_biopsy = 조직검사/생검 (biopsy, FNA, 병리검사)
+
+검사 — 초음파:
+  exam_echo = 심장초음파 (echocardiogram, cardiac ultrasound, echo)
+  exam_us_abdomen = 복부초음파 (abdominal ultrasound, abd US)
+  exam_us_general = 초음파 (ultrasound, sono, sonography) — 부위 불명시
+
+검사 — 혈액:
+  exam_blood_cbc = CBC/혈구검사 (complete blood count, CBC, 혈액검사+CBC)
+  exam_blood_chem = 생화학검사 (chemistry, biochem, 간수치, 신장수치)
+  exam_blood_general = 혈액검사 (blood test, 혈검, 피검사) — 세부 불명시
+  exam_blood_type = 혈액형검사 (blood type, crossmatch)
+  exam_coagulation = 응고검사 (PT, aPTT, coagulation)
+  exam_electrolyte = 전해질검사 (electrolyte, 나트륨, 칼륨)
+  exam_crp = CRP/염증 (C-reactive protein, 염증수치)
+
+검사 — 심장:
+  exam_ecg = 심전도 (ECG, EKG, electrocardiogram)
+  exam_heart_general = 심장검사 (cardiac exam, heart check)
+
+검사 — 호르몬:
+  exam_hormone = 호르몬검사 (T4, T3, TSH, 갑상선, cortisol, ACTH)
+
+검사 — 기타:
   exam_lab_panel = 종합검사 (종합검진, lab panel, screening)
-  exam_urine = 소변검사 (urinalysis, UA, urine test)
-  exam_fecal = 대변검사 (fecal, stool test, 분변검사)
+  exam_urine = 소변검사 (urinalysis, UA)
+  exam_fecal = 대변검사 (fecal, stool test)
   exam_fecal_pcr = 대변 PCR (fecal PCR, GI PCR)
-  exam_allergy = 알러지 검사 (allergy test, IgE)
-  exam_heart = 심장검사 (ECG, EKG, echo, 심전도, 심초음파)
-  exam_eye = 안과검사 (schirmer, fluorescein, IOP, 안압)
-  exam_skin = 피부검사 (skin scraping, cytology, 진균)
-  exam_sdma = SDMA (신장마커, renal SDMA)
-  exam_probnp = proBNP (심장마커, NT-proBNP, BNP)
-  exam_fructosamine = 당화알부민 (fructosamine, glycated albumin)
+  exam_sdma = SDMA (신장마커)
+  exam_probnp = proBNP (심장마커, NT-proBNP)
+  exam_fructosamine = 당화알부민 (fructosamine)
   exam_glucose_curve = 혈당곡선 (glucose curve)
   exam_blood_gas = 혈액가스 (blood gas, BGA, i-stat)
-  exam_general = 정밀검사/검진 (기본검사, 초진, 재진, 진찰, consult)
+  exam_allergy = 알러지 검사 (allergy test, IgE)
+  exam_eye = 안과검사 (schirmer, fluorescein, IOP, 안압)
+  exam_skin = 피부검사 (skin scraping, cytology, 진균)
+  exam_general = 기본검사/검진 (초진, 재진, 진찰, consult)
 
 예방접종:
-  vaccine_rabies = 광견병 백신 (rabies, rabbies, RA, R/A, 광견)
-  vaccine_comprehensive = 종합백신 (DHPP, DHPPI, DHLPP, FVRCP, 5종, 6종, 혼합백신)
-  vaccine_corona = 코로나 백신 (corona, coronavirus, 코로나장염)
+  vaccine_rabies = 광견병 백신 (rabies, RA, R/A, 광견)
+  vaccine_comprehensive = 종합백신 (DHPP, DHPPI, FVRCP, 5종백신, 6종백신)
+  vaccine_corona = 코로나 백신 (corona, coronavirus)
   vaccine_kennel = 켄넬코프 (kennel cough, bordetella)
   vaccine_fip = FIP (전염성복막염)
-  vaccine_parainfluenza = 파라인플루엔자 (parainfluenza, CPiV)
-  vaccine_lepto = 렙토 (lepto, leptospirosis, L2, L4)
+  vaccine_parainfluenza = 파라인플루엔자 (parainfluenza)
+  vaccine_lepto = 렙토 (lepto, leptospirosis)
 
 예방약/구충:
-  prevent_heartworm = 심장사상충 (heartworm, heartgard, 하트가드, 넥스가드스펙트라)
-  prevent_external = 외부기생충 (flea, tick, bravecto, nexgard, frontline, 벼룩, 진드기)
-  prevent_deworming = 구충 (deworm, drontal, milbemax, 회충, 내부기생충)
+  prevent_heartworm = 심장사상충 (heartworm, heartgard)
+  prevent_external = 외부기생충 (flea, tick, bravecto, nexgard)
+  prevent_deworming = 구충 (deworm, drontal, milbemax)
 
-처방약:
-  drug_antibiotic = 항생제 (antibiotic, amoxicillin, cephalexin, convenia, doxycycline, metronidazole, baytril)
-  drug_pain_antiinflammatory = 진통/소염 NSAID (meloxicam, carprofen, rimadyl, galliprant, 진통제, 소염제)
-  drug_steroid = 스테로이드 (steroid, prednisone, prednisolone, dexamethasone)
-  drug_gi = 위장약 (famotidine, omeprazole, cerenia, 구토, 설사, 장염)
-  drug_allergy = 알러지약 (apoquel, cytopoint, cetirizine, 가려움)
-  drug_eye = 안약 (eye drop, tobramycin, 점안)
-  drug_ear = 귀약 (otic, otomax, surolan, 외이염)
-  drug_skin = 피부약 (chlorhexidine, ketoconazole, 피부염)
-  drug_general = 약/처방 (일반 약품, medication, Rx)
+처방약 (medicine_ prefix):
+  medicine_antibiotic = 항생제 (antibiotic, amoxicillin, cephalexin, convenia)
+  medicine_anti_inflammatory = 소염제 (NSAID, meloxicam, carprofen)
+  medicine_painkiller = 진통제 (tramadol, gabapentin)
+  medicine_steroid = 스테로이드 (steroid, prednisone, prednisolone)
+  medicine_gi = 위장약 (famotidine, omeprazole, cerenia)
+  medicine_allergy = 알러지약 (apoquel, cytopoint)
+  medicine_eye = 안약 (eye drop, tobramycin)
+  medicine_ear = 귀약 (otic, otomax, surolan)
+  medicine_skin = 피부약 (chlorhexidine, ketoconazole)
+  medicine_oral = 내복약/경구약 (oral med, 먹는약, 내복약, 경구, 약값)
 
 처치/진료:
   care_injection = 주사 (injection, SC, IM, IV)
-  care_procedure_fee = 처치료 (procedure fee, treatment fee, 시술료)
-  care_dressing = 드레싱 (bandage, gauze, 소독, 붕대)
-  care_e_collar = 넥카라 (e-collar, cone)
-  care_prescription_diet = 처방식 (prescription diet, Hill's k/d, Royal Canin, 처방사료)
+  care_fluid = 수액/링거 (IV fluid, 링거, 피하수액)
+  care_transfusion = 수혈 (transfusion, packed RBC)
+  care_oxygen = 산소치료 (oxygen, O2, 산소텐트)
+  care_emergency = 응급처치 (emergency, ER, CPR)
+  care_catheter = 카테터/도뇨 (catheter, 유치도뇨관)
+  care_procedure_fee = 처치료 (procedure fee, 시술료)
+  care_dressing = 드레싱 (bandage, gauze, 소독)
+  care_anal_gland = 항문낭 (anal gland)
+  care_ear_flush = 귀세척 (ear flush)
 
-수술/치과/기타:
-  surgery_general = 수술 (surgery, spay, neuter, 중성화, 마취, 봉합)
-  dental_scaling = 스케일링 (scaling, dental cleaning, 치석)
+수술:
+  surgery_general = 수술/마취 (surgery, 마취, 봉합)
+  surgery_spay_neuter = 중성화 (spay, neuter, 자궁적출)
+  surgery_tumor = 종양수술 (tumor removal, 혹제거)
+  surgery_foreign_body = 이물제거 (foreign body, gastrotomy)
+  surgery_cesarean = 제왕절개 (cesarean, c-section)
+  surgery_hernia = 탈장수술 (hernia)
+  surgery_eye = 안과수술 (cherry eye, 백내장, enucleation)
+
+치과:
+  dental_scaling = 스케일링 (scaling, dental cleaning)
   dental_extraction = 발치 (extraction)
+  dental_treatment = 잇몸/치주치료 (periodontal, 불소도포)
+
+입원:
   hospitalization = 입원 (hospitalization, ICU, 입원비)
-  grooming = 미용 (grooming, bath, trim)
+
+재활:
+  rehab_therapy = 재활/물리치료 (rehabilitation, 수중런닝머신, 레이저치료, 침치료)
+
+기타:
+  care_e_collar = 넥카라 (e-collar, cone)
+  care_prescription_diet = 처방식 (prescription diet, Hill's, Royal Canin)
+  microchip = 마이크로칩 (microchip, 동물등록)
+  euthanasia = 안락사 (euthanasia)
+  funeral = 장례/화장 (cremation, funeral)
+  grooming_basic = 미용 (grooming, bath, trim)
   checkup_general = 기본진료 (checkup, consult, 초진, 재진)
+  ortho_patella = 슬개골 (patella, MPL, LPL)
+  ortho_arthritis = 관절염 (arthritis, OA)
   etc_other = 기타
 
-MAPPING RULES:
+CRITICAL MAPPING RULES:
 - Use the EXACT tag code from above for categoryTag.
 - standardName = the Korean standard name shown after "=" in the tag list.
-- Examples:
-  "Rabies" → categoryTag: "vaccine_rabies", standardName: "광견병 백신"
-  "X-ray" → categoryTag: "exam_xray", standardName: "X-ray"
-  "DHPP" → categoryTag: "vaccine_comprehensive", standardName: "종합백신"
-  "CBC" → categoryTag: "exam_blood", standardName: "혈액검사"
-  "스케일링" → categoryTag: "dental_scaling", standardName: "스케일링"
-  "넥스가드" → categoryTag: "prevent_external", standardName: "외부기생충"
+- For blood tests with CBC: use "exam_blood_cbc"
+- For general blood tests without specifics: use "exam_blood_general"
+- For 내복약/경구약/먹는약: use "medicine_oral"
+- For 호르몬/T4/갑상선: use "exam_hormone"
+- For 마취: use "surgery_general"
 - tags = list of unique categoryTag codes found across all items.
 - If you cannot determine the tag, set categoryTag: null, standardName: null.
 """
@@ -746,7 +781,6 @@ def _gemini_parse_receipt_full(
     model: str,
     timeout_seconds: int = 15,
 ) -> Optional[Dict[str, Any]]:
-    """Gemini-first: send image directly, get structured JSON."""
     api_key = (api_key or "").strip()
     model = (model or "gemini-2.5-flash").strip()
     if not api_key or not model:
@@ -754,7 +788,6 @@ def _gemini_parse_receipt_full(
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
 
-    # Detect mime type
     mime = "image/png"
     if image_bytes[:4] == b"RIFF":
         mime = "image/webp"
@@ -788,37 +821,91 @@ def _gemini_parse_receipt_full(
     return None
 
 
-# Valid standard tag codes (matching iOS ReceiptTag enum)
+# =========================================================
+# ✅ Valid standard tag codes (ReceiptTags.swift 완전 동기화)
+# =========================================================
 _VALID_TAG_CODES: set = {
-    # 검사
-    "exam_blood", "exam_xray", "exam_ultrasound", "exam_lab_panel",
-    "exam_urine", "exam_fecal", "exam_fecal_pcr", "exam_allergy",
-    "exam_heart", "exam_eye", "exam_skin", "exam_sdma", "exam_probnp",
-    "exam_fructosamine", "exam_glucose_curve", "exam_blood_gas", "exam_general",
+    # 검사 — 영상
+    "exam_xray", "exam_ct", "exam_mri", "exam_endoscope", "exam_biopsy",
+    # 검사 — 초음파 (세분화)
+    "exam_echo", "exam_us_abdomen", "exam_us_general",
+    # 검사 — 혈액 (세분화)
+    "exam_blood_cbc", "exam_blood_chem", "exam_blood_general",
+    "exam_blood_type", "exam_coagulation", "exam_electrolyte", "exam_crp",
+    # 검사 — 심장 (세분화)
+    "exam_ecg", "exam_heart_general",
+    # 검사 — 호르몬
+    "exam_hormone",
+    # 검사 — 기타
+    "exam_lab_panel", "exam_urine", "exam_fecal", "exam_fecal_pcr",
+    "exam_sdma", "exam_probnp", "exam_fructosamine", "exam_glucose_curve",
+    "exam_blood_gas", "exam_allergy", "exam_eye", "exam_skin", "exam_general",
     # 예방접종
     "vaccine_rabies", "vaccine_comprehensive", "vaccine_corona",
     "vaccine_kennel", "vaccine_fip", "vaccine_parainfluenza", "vaccine_lepto",
     # 예방약/구충
     "prevent_heartworm", "prevent_external", "prevent_deworming",
-    # 처방약
-    "drug_antibiotic", "drug_pain_antiinflammatory", "drug_steroid",
-    "drug_gi", "drug_allergy", "drug_eye", "drug_ear", "drug_skin", "drug_general",
-    # 처치/진료
-    "care_injection", "care_procedure_fee", "care_dressing",
-    "care_e_collar", "care_prescription_diet",
-    # 수술/치과/기타
-    "surgery_general", "dental_scaling", "dental_extraction",
-    "hospitalization", "grooming", "checkup_general", "etc_other",
-    # iOS ReceiptTag enum aliases (medicine_ prefix)
+    # 처방약 (medicine_ prefix — iOS ReceiptTag 기준)
     "medicine_antibiotic", "medicine_anti_inflammatory", "medicine_allergy",
     "medicine_gi", "medicine_ear", "medicine_skin", "medicine_eye",
-    "medicine_painkiller", "medicine_steroid",
-    # iOS additional
-    "ortho_patella", "ortho_arthritis", "grooming_basic",
-    # Legacy broad categories (backward compat)
-    "vaccine", "surgery", "dental", "checkup", "lab", "medicine",
-    "hospitalization", "emergency",
+    "medicine_painkiller", "medicine_steroid", "medicine_oral",
+    # 처치/진료/입원
+    "care_injection", "care_fluid", "care_transfusion", "care_oxygen",
+    "care_emergency", "care_catheter", "care_procedure_fee", "care_dressing",
+    "care_anal_gland", "care_ear_flush",
+    "hospitalization",
+    # 수술 (세분화)
+    "surgery_general", "surgery_spay_neuter", "surgery_tumor",
+    "surgery_foreign_body", "surgery_cesarean", "surgery_hernia", "surgery_eye",
+    # 치과
+    "dental_scaling", "dental_extraction", "dental_treatment",
+    # 관절
+    "ortho_patella", "ortho_arthritis",
+    # 재활
+    "rehab_therapy",
+    # 기타
+    "microchip", "euthanasia", "funeral",
+    "care_e_collar", "care_prescription_diet",
+    "checkup_general", "grooming_basic", "etc_other",
 }
+
+# ✅ 레거시 태그 → 새 태그 자동 변환 (Gemini가 옛 코드 리턴 시)
+_TAG_MIGRATION: Dict[str, str] = {
+    # 옛 통합 태그 → 새 일반 태그
+    "exam_blood": "exam_blood_general",
+    "exam_ultrasound": "exam_us_general",
+    "exam_heart": "exam_heart_general",
+    # drug_ → medicine_ (Gemini 프롬프트에 drug_ 안 쓰지만 혹시)
+    "drug_antibiotic": "medicine_antibiotic",
+    "drug_pain_antiinflammatory": "medicine_anti_inflammatory",
+    "drug_steroid": "medicine_steroid",
+    "drug_gi": "medicine_gi",
+    "drug_allergy": "medicine_allergy",
+    "drug_eye": "medicine_eye",
+    "drug_ear": "medicine_ear",
+    "drug_skin": "medicine_skin",
+    "drug_general": "medicine_oral",
+    # 기타 레거시
+    "grooming": "grooming_basic",
+    "surgery": "surgery_general",
+    "dental": "dental_scaling",
+    "checkup": "checkup_general",
+    "medicine": "medicine_oral",
+    "emergency": "care_emergency",
+}
+
+
+def _migrate_tag(code: str) -> Optional[str]:
+    """태그 코드를 정규화: valid면 그대로, 레거시면 변환, 아니면 None."""
+    if not code:
+        return None
+    c = code.strip().lower()
+    if c in _VALID_TAG_CODES:
+        return c
+    migrated = _TAG_MIGRATION.get(c)
+    if migrated and migrated in _VALID_TAG_CODES:
+        return migrated
+    return None
 
 
 def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -864,11 +951,10 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             ct = (it.get("categoryTag") or "").strip() or None
             sn = (it.get("standardName") or "").strip() or None
 
-            # Validate tag code against known standard codes
-            if ct and ct.lower() not in _VALID_TAG_CODES:
-                ct = None
+            # ✅ 태그 마이그레이션 적용
             if ct:
-                ct = ct.lower()
+                ct = _migrate_tag(ct)
+            if ct:
                 tags_set.add(ct)
 
             cleaned.append({
@@ -880,20 +966,18 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
     parsed["items"] = cleaned
 
-    # Tags from response or from items
     raw_tags = j.get("tags")
     if isinstance(raw_tags, list):
         for t in raw_tags:
-            ts = str(t).strip().lower()
-            if ts and ts in _VALID_TAG_CODES:
-                tags_set.add(ts)
+            migrated = _migrate_tag(str(t).strip())
+            if migrated:
+                tags_set.add(migrated)
 
     return parsed, list(tags_set)[:10]
 
 
 # =========================================================
 # Core function: process_receipt
-# Architecture: Gemini-first → Vision OCR fallback → regex fallback
 # =========================================================
 def process_receipt(
     raw_bytes: bytes,
@@ -911,23 +995,11 @@ def process_receipt(
     gemini_timeout_seconds: Optional[int] = None,
     **kwargs,
 ) -> Tuple[bytes, Dict[str, Any], Dict[str, Any]]:
-    """
-    Gemini-first receipt processing pipeline.
-
-    1. Image prep (resize, convert)
-    2. Gemini: image → structured JSON (primary)
-    3. Vision OCR: image → text (for redaction + fallback)
-    4. If Gemini failed: regex parse from OCR text (fallback)
-
-    Returns:
-      webp_bytes, parsed, hints
-    """
     if not raw_bytes:
         raise ValueError("empty raw bytes")
 
     Image, ImageOps, ImageDraw = _load_pil()
 
-    # ── 0) Load & prep image ──
     img = Image.open(io.BytesIO(raw_bytes))
     img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB", "RGBA"):
@@ -940,12 +1012,10 @@ def process_receipt(
     img = _ensure_max_pixels(img, int(image_max_pixels or 0))
     img = _resize_to_width(img, int(receipt_max_width or 0))
 
-    # PNG for OCR, WEBP for storage
     ocr_buf = io.BytesIO()
     img.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
 
-    # ── 1) Gemini settings ──
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
     g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
     g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")) or "gemini-2.5-flash"
@@ -957,7 +1027,6 @@ def process_receipt(
         "pipeline": "gemini_first",
     }
 
-    # ── 2) Gemini-first: image → structured JSON ──
     gemini_parsed = None
     gemini_tags: List[str] = []
 
@@ -985,14 +1054,12 @@ def process_receipt(
     else:
         _log.warning(f"[Gemini] SKIPPED: enabled={g_enabled}, key_present={bool(g_key.strip())}")
 
-    # ── 3) Vision OCR (for redaction + fallback text) ──
     ocr_text = ""
     vision_resp = None
 
     sema = _get_sema(int(ocr_max_concurrency or 4))
     acquired = sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
     if not acquired:
-        # If Gemini already succeeded, don't fail hard
         if gemini_parsed:
             hints["ocrSkipped"] = "semaphore_busy_but_gemini_ok"
         else:
@@ -1017,26 +1084,20 @@ def process_receipt(
             except Exception:
                 pass
 
-    # ── 4) Create both original + redacted webp ──
     original_webp = _to_webp_bytes(img, quality=int(receipt_webp_quality or 85))
     redacted = _redact_image_with_vision_tokens(img.copy(), vision_resp)
     redacted_webp = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
-    # webp_bytes = redacted for backward compat (앱 표시용)
     webp_bytes = redacted_webp
 
-    # ── 5) Build final parsed result ──
     if gemini_parsed and gemini_parsed.get("items"):
-        # Gemini succeeded → use as primary
         parsed = gemini_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = "gemini_primary"
     else:
-        # Fallback to regex parsing from OCR text
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
         hints["pipeline"] = "vision_regex_fallback"
 
-        # If Gemini partially succeeded, merge missing fields
         if gemini_parsed:
             if not parsed.get("hospitalName") and gemini_parsed.get("hospitalName"):
                 parsed["hospitalName"] = gemini_parsed["hospitalName"]
@@ -1045,7 +1106,6 @@ def process_receipt(
             if not parsed.get("totalAmount") and gemini_parsed.get("totalAmount"):
                 parsed["totalAmount"] = gemini_parsed["totalAmount"]
 
-    # Final sanitize
     if not isinstance(parsed.get("items"), list):
         parsed["items"] = []
     parsed["items"] = parsed["items"][:120]
@@ -1056,7 +1116,6 @@ def process_receipt(
             parsed["totalAmount"] = None
     parsed["ocrText"] = (ocr_text or "")[:8000]
 
-    # Attach tags to hints for main.py
     hints["tags"] = gemini_tags if gemini_tags else []
 
     return webp_bytes, original_webp, parsed, hints
@@ -1064,8 +1123,6 @@ def process_receipt(
 
 # =========================================================
 # Bridge function for main.py compatibility
-# main.py calls: ocr_policy.process_receipt_image(raw, timeout=..., ...)
-# and expects a dict return, not a tuple.
 # =========================================================
 def process_receipt_image(
     raw_bytes: bytes,
@@ -1082,13 +1139,6 @@ def process_receipt_image(
     gemini_timeout: int = 10,
     **kwargs,
 ) -> dict:
-    """
-    Bridge: main.py calls this. Delegates to process_receipt()
-    and converts tuple -> dict.
-
-    Returns dict with keys:
-        ocr_text, items, meta, webp_bytes, content_type
-    """
     if not raw_bytes:
         raise OCRImageError("empty raw bytes")
 
@@ -1123,7 +1173,6 @@ def process_receipt_image(
     except ValueError as e:
         raise OCRImageError(str(e)) from e
 
-    # Convert parsed → format main.py expects
     items_for_main = []
     for it in (parsed.get("items") or []):
         items_for_main.append({
