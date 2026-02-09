@@ -2887,11 +2887,14 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         "## 응답 규칙",
         "1. 순수 JSON만 출력. ```json 같은 마크다운 절대 금지.",
         "2. summary는 한국어 3~5문장, 친절한 말투(~해요 체)로 작성.",
-        "3. tags의 tag 필드는 위 태그 코드 중에서만 선택.",
-        "4. 진료 이력이 없으면 tags=[], period_stats={}, care_guide={}로 비워.",
-        "5. care_guide의 value는 한국어 가이드 문장 리스트.",
+        "3. tags: 진료 이력의 tags 필드를 분석해서 관련 태그를 반드시 포함할 것. 진료 이력에 tags가 있으면 해당 코드를 tags 배열에 넣어야 함. 절대 빈 배열로 두지 마.",
+        "4. 진료 이력이 완전히 없는 경우에만 tags=[]로 비워.",
+        "5. care_guide: 각 태그별로 한국어 케어 가이드 문장 2~3개를 리스트로 작성.",
+        "6. period_stats: 1m(최근1개월), 3m(최근3개월), 1y(최근1년) 기간별로 각 태그의 진료 횟수를 집계.",
+        "7. tags의 tag 필드는 위 태그 코드 중에서만 선택. label은 해당 태그의 한글 이름.",
         "",
-        '{"summary":"...","tags":[{"tag":"코드","label":"한글","count":N,"recent_dates":["yyyy-MM-dd"]}],"period_stats":{"1m":{},"3m":{},"1y":{}},"care_guide":{"코드":["가이드1","가이드2"]}}',
+        "## 응답 JSON 형식 (이 형식을 정확히 따를 것)",
+        '{"summary":"종합 분석 텍스트...","tags":[{"tag":"prevent_vaccine_rabies","label":"예방접종·광견병","count":1,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"prevent_vaccine_rabies":0},"3m":{"prevent_vaccine_rabies":1},"1y":{"prevent_vaccine_rabies":1}},"care_guide":{"prevent_vaccine_rabies":["광견병 예방접종은 매년 1회 접종이 권장돼요.","접종 후 1~2일 컨디션 변화를 관찰해 주세요."]}}',
     ])
 
     prompt = "\n".join(prompt_lines)
