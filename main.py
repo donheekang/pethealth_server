@@ -207,7 +207,7 @@ def _clean_tags(tags: Any) -> List[str]:
 
 def _effective_tier_from_row(membership_tier: Optional[str], premium_until: Any) -> str:
     tier = (membership_tier or "guest").strip().lower()
-    if tier not in ("guest", "member", "premium"):
+    if tier not in ("guest", "member", "premium", "platinum"):
         tier = "guest"
     try:
         if premium_until is not None:
@@ -1169,36 +1169,6 @@ def api_pet_upsert(req: PetUpsertRequest, user: Dict[str, Any] = Depends(get_cur
 
         exists = db_fetchone("SELECT id, user_uid FROM public.pets WHERE id=%s", (pet_uuid,))
         if exists and exists.get("user_uid") != uid:
-            # ✅ FIX: migration claim — oldUid 소유 펫을 newUid로 이전 허용
-            old_owner = exists.get("user_uid")
-            can_claim = False
-            try:
-                recent_token = db_fetchone(
-                    """SELECT 1 FROM public.migration_tokens
-                       WHERE old_uid=%s AND new_uid=%s
-                         AND status IN ('completed','processing')
-                         AND (used_at IS NULL OR used_at > now() - interval '10 minutes')
-                       LIMIT 1""",
-                    (old_owner, uid),
-                )
-                if recent_token:
-                    can_claim = True
-            except Exception:
-                pass
-
-            if can_claim:
-                # 소유권 이전 후 재시도
-                db_execute("UPDATE public.pets SET user_uid=%s WHERE id=%s", (uid, pet_uuid))
-                row = db_fetchone(
-                    """SELECT id, user_uid, name, species, breed, birthday, weight_kg, gender, neutered,
-                              has_no_allergy, allergy_tags, created_at, updated_at
-                       FROM public.pets WHERE id=%s""",
-                    (pet_uuid,),
-                )
-                if row:
-                    logger.info("migration-claim pet %s: %s → %s", pet_uuid, old_owner, uid)
-                    return jsonable_encoder(row)
-
             raise HTTPException(status_code=403, detail="You do not own this pet id")
         raise HTTPException(status_code=500, detail=_internal_detail("Failed to upsert pet", kind="DB error"))
     except HTTPException:
@@ -3046,4 +3016,35 @@ def admin_overview(admin: Dict[str, Any] = Depends(get_admin_user)):
         "dauToday": int((dau or {}).get("cnt") or 0),
         "totalStorageBytes": int((storage or {}).get("total") or 0),
     }
+
+
+# =========================================================
+# Subscription tier update (v2.3.0+)
+# =========================================================
+class UpdateTierRequest(BaseModel):
+    membership_tier: str
+
+
+@app.post("/api/me/update-tier")
+def api_update_tier(
+    req: UpdateTierRequest,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    tier = (req.membership_tier or "").strip().lower()
+    if tier not in ("member", "premium", "platinum"):
+        raise HTTPException(status_code=400, detail=f"invalid tier: {tier}")
+
+    try:
+        db_execute(
+            "UPDATE public.users SET membership_tier=%s, updated_at=now() WHERE firebase_uid=%s",
+            (tier, uid),
+        )
+    except Exception as e:
+        _raise_mapped_db_error(e)
+
+    return {"ok": True, "tier": tier}
 
