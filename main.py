@@ -903,7 +903,7 @@ class OCRItemMapDeactivateRequest(BaseModel):
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.3.0")
+app = FastAPI(title="PetHealth+ Server", version="2.3.1")
 
 _origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
 _allow_credentials = bool(settings.CORS_ALLOW_CREDENTIALS)
@@ -960,7 +960,7 @@ def _shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "PetHealth+ Server Running (v2.3.0)"}
+    return {"status": "ok", "message": "PetHealth+ Server Running (v2.3.1)"}
 
 
 @app.get("/api/health")
@@ -1002,7 +1002,7 @@ def health():
 
     return {
         "status": "ok",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "storage": "stub" if settings.STUB_MODE else "firebase",
         "db_enabled": bool(settings.DB_ENABLED),
         "db_configured": bool(settings.DATABASE_URL),
@@ -1907,6 +1907,19 @@ def process_receipt(
                                 )
                             except Exception as ce:
                                 logger.info("[DB] candidate insert failed (ignored): %s", _sanitize_for_log(_pg_message(ce)))
+
+                        # ✅ v2.3.1: Auto-select rank 1 candidate into health_records
+                        top_mgmt_no = cands[0]["hospital_mgmt_no"]
+                        try:
+                            cur.execute(
+                                "UPDATE public.health_records SET hospital_mgmt_no = %s WHERE id = %s AND deleted_at IS NULL",
+                                (top_mgmt_no, record_uuid),
+                            )
+                            rec_row = dict(rec_row)
+                            rec_row["hospital_mgmt_no"] = top_mgmt_no
+                            logger.info("[receipt] Auto-matched hospital: record=%s, mgmt_no=%s", record_uuid, top_mgmt_no)
+                        except Exception as am_err:
+                            logger.warning("[receipt] Auto-match failed (ignored): %s", _sanitize_for_log(_pg_message(am_err)))
 
                 # Build hospital candidates list for response
                 resp_candidates = []
