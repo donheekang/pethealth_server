@@ -2901,14 +2901,14 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
 
     api_key = settings.GEMINI_API_KEY
     model = settings.GEMINI_MODEL_NAME or "gemini-2.5-flash"
-    timeout = max(settings.GEMINI_TIMEOUT_SECONDS or 30, 30)
+    timeout = max(settings.GEMINI_TIMEOUT_SECONDS or 60, 60)
 
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     gemini_payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,
             "responseMimeType": "application/json",
         },
     }
@@ -2925,14 +2925,20 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
             raw = resp.read().decode("utf-8", errors="replace")
 
         j = json.loads(raw)
+        candidate = (j.get("candidates") or [{}])[0]
+        finish_reason = candidate.get("finishReason", "UNKNOWN")
         txt = (
-            (j.get("candidates") or [{}])[0]
+            candidate
             .get("content", {})
             .get("parts", [{}])[0]
             .get("text", "")
         ).strip()
 
-        logger.info("[AI Care] Gemini raw response length=%d", len(txt))
+        logger.info("[AI Care] Gemini raw response length=%d finishReason=%s", len(txt), finish_reason)
+
+        # finishReason이 MAX_TOKENS이면 응답이 잘린 것
+        if finish_reason == "MAX_TOKENS":
+            logger.warning("[AI Care] Gemini response was truncated (MAX_TOKENS)")
 
     except Exception as e:
         logger.exception("[AI Care] Gemini call failed: %r", e)
