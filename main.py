@@ -1090,7 +1090,7 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
         "claim_count": int(row.get("claim_count") or 0),
         "schedule_count": int(row.get("schedule_count") or 0),
         "ai_usage_count": int(row.get("ai_usage_count") or 0),
-        "ai_usage_limit": None if effective_tier in ("premium", "platinum") else 10,
+        "ai_usage_limit": None if effective_tier in ("premium", "platinum") else 3,
     }
 
 
@@ -2876,7 +2876,7 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
             pass
         return cached
 
-    # ── AI 분석 쿼터 체크 (member: 총 10회, premium/platinum: 무제한) ──
+    # ── AI 분석 쿼터 체크  ──
     ai_limit = None
     ai_count = 0
     try:
@@ -2888,12 +2888,12 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
             etier = _effective_tier_from_row(urow.get("membership_tier"), urow.get("premium_until"))
             ai_count = int(urow.get("cnt") or 0)
             if etier not in ("premium", "platinum"):
-                ai_limit = 10
+                ai_limit = 3
                 if ai_count >= ai_limit:
                     return JSONResponse(
                         status_code=429,
                         content={
-                            "detail": "AI 케어 분석 무료 횟수(10회)를 모두 사용했어요. Pro 구독으로 무제한 이용하세요!",
+                            "detail": "AI 케어 분석 무료 횟수(3회)를 모두 사용했어요. Pro 구독으로 무제한 이용하세요!",
                             "code": "AI_QUOTA_EXCEEDED",
                             "ai_usage_count": ai_count,
                             "ai_usage_limit": ai_limit,
