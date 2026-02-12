@@ -1896,12 +1896,22 @@ def process_receipt(
 
                 # --- hospital candidates ---
                 candidate_limit = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
-                if hosp_name and not hosp_mgmt and candidate_limit > 0:
-                    like = f"%{hosp_name}%"
-                    cur.execute(
-                        "SELECT hospital_mgmt_no, name, road_address, jibun_address, lat, lng, is_custom_entry, similarity(search_vector, %s) AS score FROM public.hospitals WHERE (is_custom_entry = false OR created_by_uid = %s) AND search_vector ILIKE %s ORDER BY score DESC LIMIT %s",
-                        (hosp_name, uid, like, candidate_limit),
-                    )
+               if hosp_name and not hosp_mgmt and candidate_limit > 0:
+    like = f"%{hosp_name}%"
+    clean_name = hosp_name.replace(" ", "")
+    like_clean = f"%{clean_name}%"
+    cur.execute(
+        """SELECT hospital_mgmt_no, name, road_address, jibun_address, lat, lng, is_custom_entry, 
+           similarity(name, %s) AS score 
+        FROM public.hospitals 
+        WHERE (is_custom_entry = false OR created_by_uid = %s) 
+          AND (search_vector ILIKE %s 
+               OR REPLACE(name, ' ', '') ILIKE %s
+               OR REPLACE(%s, ' ', '') ILIKE '%%' || REPLACE(name, ' ', '') || '%%')
+        ORDER BY score DESC 
+        LIMIT %s""",
+        (hosp_name, uid, like, like_clean, hosp_name, candidate_limit),
+    )
                     cands = cur.fetchall() or []
                     if cands:
                         for rank, c in enumerate(cands, start=1):
