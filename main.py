@@ -207,7 +207,7 @@ def _clean_tags(tags: Any) -> List[str]:
 
 def _effective_tier_from_row(membership_tier: Optional[str], premium_until: Any) -> str:
     tier = (membership_tier or "guest").strip().lower()
-    if tier not in ("guest", "member", "premium", "platinum"):
+    if tier not in ("guest", "member", "premium"):
         tier = "guest"
     try:
         if premium_until is not None:
@@ -1090,7 +1090,7 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
         "claim_count": int(row.get("claim_count") or 0),
         "schedule_count": int(row.get("schedule_count") or 0),
         "ai_usage_count": int(row.get("ai_usage_count") or 0),
-        "ai_usage_limit": None if effective_tier in ("premium", "platinum") else 3,
+        "ai_usage_limit": None if effective_tier == "premium" else 3,
     }
 
 
@@ -2879,7 +2879,7 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         try:
             urow = db_fetchone("SELECT COALESCE(ai_usage_count,0) AS cnt, membership_tier, premium_until FROM public.users WHERE firebase_uid=%s", (uid,))
             etier = _effective_tier_from_row((urow or {}).get("membership_tier"), (urow or {}).get("premium_until")) if urow else "member"
-            limit = None if etier in ("premium", "platinum") else 3
+            limit = None if etier == "premium" else 3
             cached["ai_usage_count"] = int((urow or {}).get("cnt") or 0)
             cached["ai_usage_limit"] = limit
         except Exception:
@@ -2910,7 +2910,7 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         if urow:
             etier = _effective_tier_from_row(urow.get("membership_tier"), urow.get("premium_until"))
             ai_count = int(urow.get("cnt") or 0)
-            if etier not in ("premium", "platinum"):
+            if etier != "premium":
                 ai_limit = 3
                 if ai_count >= ai_limit:
                     return JSONResponse(
@@ -3195,7 +3195,7 @@ def api_update_tier(
         raise HTTPException(status_code=401, detail="missing uid")
 
     tier = (req.membership_tier or "").strip().lower()
-    if tier not in ("member", "premium", "platinum"):
+    if tier not in ("member", "premium"):
         raise HTTPException(status_code=400, detail=f"invalid tier: {tier}")
 
     try:
