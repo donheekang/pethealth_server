@@ -30,7 +30,7 @@ import secrets
 import threading
 import logging
 from contextlib import contextmanager
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple, Set, Iterable, Iterator
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form, Depends, Body, Request
@@ -905,7 +905,7 @@ class OCRItemMapDeactivateRequest(BaseModel):
 # =========================================================
 # FastAPI app
 # =========================================================
-app = FastAPI(title="PetHealth+ Server", version="2.3.1")
+app = FastAPI(title="PetHealth+ Server", version="2.3.2")
 
 _origins = [o.strip() for o in (settings.CORS_ALLOW_ORIGINS or "*").split(",") if o.strip()]
 _allow_credentials = bool(settings.CORS_ALLOW_CREDENTIALS)
@@ -1896,22 +1896,22 @@ def process_receipt(
 
                 # --- hospital candidates ---
                 candidate_limit = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
-               if hosp_name and not hosp_mgmt and candidate_limit > 0:
-    like = f"%{hosp_name}%"
-    clean_name = hosp_name.replace(" ", "")
-    like_clean = f"%{clean_name}%"
-    cur.execute(
-        """SELECT hospital_mgmt_no, name, road_address, jibun_address, lat, lng, is_custom_entry, 
-           similarity(name, %s) AS score 
-        FROM public.hospitals 
-        WHERE (is_custom_entry = false OR created_by_uid = %s) 
-          AND (search_vector ILIKE %s 
-               OR REPLACE(name, ' ', '') ILIKE %s
-               OR REPLACE(%s, ' ', '') ILIKE '%%' || REPLACE(name, ' ', '') || '%%')
-        ORDER BY score DESC 
-        LIMIT %s""",
-        (hosp_name, uid, like, like_clean, hosp_name, candidate_limit),
-    )
+                if hosp_name and not hosp_mgmt and candidate_limit > 0:
+                    like = f"%{hosp_name}%"
+                    clean_name = hosp_name.replace(" ", "")
+                    like_clean = f"%{clean_name}%"
+                    cur.execute(
+                        """SELECT hospital_mgmt_no, name, road_address, jibun_address, lat, lng, is_custom_entry,
+                           similarity(name, %s) AS score
+                        FROM public.hospitals
+                        WHERE (is_custom_entry = false OR created_by_uid = %s)
+                          AND (search_vector ILIKE %s
+                               OR REPLACE(name, ' ', '') ILIKE %s
+                               OR REPLACE(%s, ' ', '') ILIKE '%%' || REPLACE(name, ' ', '') || '%%')
+                        ORDER BY score DESC
+                        LIMIT %s""",
+                        (hosp_name, uid, like, like_clean, hosp_name, candidate_limit),
+                    )
                     cands = cur.fetchall() or []
                     if cands:
                         for rank, c in enumerate(cands, start=1):
@@ -2879,17 +2879,30 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         try:
             urow = db_fetchone("SELECT COALESCE(ai_usage_count,0) AS cnt, membership_tier, premium_until FROM public.users WHERE firebase_uid=%s", (uid,))
             etier = _effective_tier_from_row((urow or {}).get("membership_tier"), (urow or {}).get("premium_until")) if urow else "member"
-            limit = None if etier in ("premium", "platinum") else 10
+            limit = None if etier in ("premium", "platinum") else 3
             cached["ai_usage_count"] = int((urow or {}).get("cnt") or 0)
             cached["ai_usage_limit"] = limit
         except Exception:
             pass
         return cached
 
-    # ── AI 분석 쿼터 체크  ──
+    # ── AI 분석 쿼터 체크 + 월 자동 리셋 ──
     ai_limit = None
     ai_count = 0
     try:
+        # 이번 달 1일 기준으로 리셋 체크
+        now_utc = datetime.now(timezone.utc)
+        first_of_month = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        # ai_usage_reset이 이번 달 1일 이전이면 카운트 리셋
+        db_execute(
+            """UPDATE public.users
+            SET ai_usage_count = 0, ai_usage_reset = %s
+            WHERE firebase_uid = %s
+              AND (ai_usage_reset IS NULL OR ai_usage_reset < %s)""",
+            (first_of_month, uid, first_of_month),
+        )
+
         urow = db_fetchone(
             "SELECT COALESCE(ai_usage_count,0) AS cnt, membership_tier, premium_until FROM public.users WHERE firebase_uid=%s",
             (uid,),
@@ -3194,5 +3207,4 @@ def api_update_tier(
         _raise_mapped_db_error(e)
 
     return {"ok": True, "tier": tier}
-
 
