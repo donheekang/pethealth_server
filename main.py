@@ -991,7 +991,7 @@ async def debug_gemini_test():
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": "Say 'hello' in Korean. Reply only one word."}]}],
-        "generationConfig": {"maxOutputTokens": 20},
+        "generationConfig": {"maxOutputTokens": 1024, "thinkingConfig": {"thinkingBudget": 256}},
     }
 
     t0 = time.time()
