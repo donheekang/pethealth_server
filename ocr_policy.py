@@ -687,14 +687,12 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
   "visitDate": "YYYY-MM-DD" or null,
   "totalAmount": integer or null,
   "discountAmount": integer or null,
-  "petNames": ["동물이름1", "동물이름2"] or [],
   "items": [
     {
       "itemName": "진료항목명 (영수증에 적힌 그대로)",
       "price": integer_or_null,
       "originalPrice": integer_or_null,
-      "discount": integer_or_null,
-      "petName": "해당 동물이름" or null
+      "discount": integer_or_null
     }
   ]
 }
@@ -705,22 +703,20 @@ RULES:
 3. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
 4. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
 5. Be precise with prices — copy exact amounts from the receipt.
-6. DISCOUNT HANDLING:
+6. DISCOUNT HANDLING (중요!!):
    - price = actual charged amount (할인 적용 후 금액).
    - originalPrice = original amount before discount. null if no discount.
    - discount = discount amount as positive integer. null if no discount.
    - discountAmount at top level = total discount across all items.
-   - 절사할인/단수할인/할인 등 할인 항목이 별도 라인으로 있으면, 반드시 items에 포함.
-     itemName은 영수증 그대로 (예: "절사할인"), price는 음수 (예: -200).
+   - 할인 항목이 별도 라인으로 있으면 반드시 items에 포함하고, price는 반드시 음수!!
+     예시: "절사할인" → price: -200, "동물종합검진B코스 할인" → price: -88000
+     "쿠폰 할인 뼈없는소고기캔" → price: -12600
+   - CRITICAL: ANY item whose name contains "할인", "절사", "감면", "환급", "쿠폰", "discount"
+     MUST have a NEGATIVE price value (e.g. -88000, NOT 88000).
+   - The price field for discount lines represents the amount SUBTRACTED from the total.
 7. Extract ALL items — do not skip any line item, even if you are unsure what it is.
-   Include discount lines (절사할인, 할인, 쿠폰할인 etc.) as items with negative price.
+   Include discount lines (절사할인, 할인, 쿠폰할인 etc.) as items with NEGATIVE price.
 8. If an item has quantity (수량) > 1, still report it as a single item with the total price.
-9. PET NAME DETECTION (다두 영수증 처리):
-   - petNames = list of all pet/animal names found on the receipt (e.g. ["뚱이", "빡이"]).
-   - If the receipt has sections grouped by pet name, set each item's "petName" to the pet it belongs to.
-   - If only ONE pet on the receipt or names are unclear, set petNames to [] and each item's petName to null.
-   - Discount lines (할인, 절사할인) that apply to the whole receipt: set petName to null.
-   - Common patterns: "뚱이", "빡이" as section headers, or "환자명: XXX" labels.
 """
 
 
@@ -867,7 +863,6 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         "hospitalName": None,
         "visitDate": None,
         "totalAmount": None,
-        "petNames": [],
         "items": [],
         "ocrText": "",
     }
@@ -883,11 +878,6 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
     ta = _coerce_int_amount(j.get("totalAmount"))
     parsed["totalAmount"] = ta if ta and ta > 0 else None
-
-    # petNames 추출 (다두 영수증)
-    raw_pet_names = j.get("petNames")
-    if isinstance(raw_pet_names, list):
-        parsed["petNames"] = [str(pn).strip() for pn in raw_pet_names if isinstance(pn, str) and pn.strip()]
 
     items = j.get("items")
     tags_set: set = set()
@@ -917,17 +907,12 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if ct:
                 tags_set.add(ct)
 
-            # petName 추출 (다두 영수증)
-            pet_name_raw = (it.get("petName") or "").strip() or None
-
             item_entry = {
                 "itemName": nm,
                 "price": pr,
                 "categoryTag": ct,
                 "standardName": sn,
             }
-            if pet_name_raw:
-                item_entry["petName"] = pet_name_raw
             if orig_pr is not None:
                 item_entry["originalPrice"] = orig_pr
             if disc is not None and disc > 0:
@@ -1159,15 +1144,12 @@ def process_receipt_image(
             "categoryTag": it.get("categoryTag"),
             "standardName": it.get("standardName"),
         }
-        if it.get("petName"):
-            entry["petName"] = it["petName"]
         items_for_main.append(entry)
 
     meta = {
         "hospital_name": parsed.get("hospitalName"),
         "visit_date": parsed.get("visitDate"),
         "total_amount": parsed.get("totalAmount"),
-        "petNames": parsed.get("petNames") or [],
         "address_hint": (hints or {}).get("addressHint"),
         "ocr_engine": (hints or {}).get("ocrEngine"),
         "gemini_used": (hints or {}).get("geminiUsed", False),
