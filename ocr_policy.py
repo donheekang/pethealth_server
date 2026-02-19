@@ -522,12 +522,20 @@ def _call_gemini_generate_content(
     model: str,
     parts: List[Dict[str, Any]],
     timeout_seconds: int = 10,
+    media_resolution: Optional[str] = None,
 ) -> str:
     import urllib.request
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    gen_config: Dict[str, Any] = {"temperature": 0.0, "maxOutputTokens": 2048}
+
+    # ✅ Gemini 3: media_resolution으로 이미지 해상도 제어
+    # "media_resolution_high" → 세밀한 텍스트(영수증) 인식에 최적
+    if media_resolution:
+        gen_config["mediaResolution"] = media_resolution
+
     payload = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048},
+        "generationConfig": gen_config,
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
@@ -569,7 +577,7 @@ def _gemini_parse_receipt(
     timeout_seconds: int = 10,
 ) -> Optional[Dict[str, Any]]:
     api_key = (api_key or "").strip()
-    model = (model or "gemini-2.5-flash").strip()
+    model = (model or "gemini-3-flash-preview").strip()
     if not api_key or not model:
         return None
     prompt = (
@@ -595,7 +603,7 @@ def _gemini_parse_receipt(
     if (ocr_text or "").strip():
         parts.append({"text": "OCR text (may be noisy):\n" + (ocr_text or "")[:6000]})
     try:
-        out = _call_gemini_generate_content(api_key=api_key, model=model, parts=parts, timeout_seconds=timeout_seconds)
+        out = _call_gemini_generate_content(api_key=api_key, model=model, parts=parts, timeout_seconds=timeout_seconds, media_resolution="media_resolution_high")
         j = _extract_json_from_model_text(out)
         if isinstance(j, dict):
             return j
@@ -817,7 +825,7 @@ def _gemini_parse_receipt_full(
     timeout_seconds: int = 15,
 ) -> Optional[Dict[str, Any]]:
     api_key = (api_key or "").strip()
-    model = (model or "gemini-2.5-flash").strip()
+    model = (model or "gemini-3-flash-preview").strip()
     if not api_key or not model:
         return None
 
@@ -842,6 +850,7 @@ def _gemini_parse_receipt_full(
             model=model,
             parts=parts,
             timeout_seconds=timeout_seconds,
+            media_resolution="media_resolution_high",  # ✅ Gemini 3: 고해상도 이미지 분석
         )
         import logging
         _glog = logging.getLogger("ocr_policy")
@@ -1060,8 +1069,8 @@ def process_receipt(
 
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
     g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
-    g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")) or "gemini-2.5-flash"
-    g_timeout = int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "15") or "15"))
+    g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")) or "gemini-3-flash-preview"
+    g_timeout = int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "20") or "20"))
 
     hints: Dict[str, Any] = {
         "ocrEngine": "none",
@@ -1178,8 +1187,8 @@ def process_receipt_image(
     receipt_webp_quality: int = 85,
     gemini_enabled: bool = False,
     gemini_api_key: str = "",
-    gemini_model_name: str = "gemini-2.5-flash",
-    gemini_timeout: int = 15,            # ✅ 10→15: 고해상도 처리 시간 확보
+    gemini_model_name: str = "gemini-3-flash-preview",
+    gemini_timeout: int = 20,            # ✅ 10→20: Gemini 3 thinking 시간 확보
     **kwargs,
 ) -> dict:
     if not raw_bytes:
