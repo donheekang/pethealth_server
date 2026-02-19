@@ -723,6 +723,11 @@ RULE 1: EXTRACT EVERY LINE ITEM — ZERO EXCEPTIONS
   · 기타: 제증명, 진단서, 기타 비용
 - Items with *, **, †, brackets [], or any symbol → STILL extract them.
 - If the receipt has MULTIPLE SECTIONS (e.g. "진료 내역", "용품 내역") → extract from ALL sections.
+- TABLE FORMAT: Many receipts have table columns (항목명 | 수량 | 단가 | 금액).
+  → Extract EVERY ROW in the table. Do NOT skip rows just because they look similar.
+  → 예: "혈액(혈청)-기본(7항목)" and "혈액(혈청)-Chemistry 1항" are DIFFERENT items — extract BOTH.
+- SIMILAR NAMES: Items may have similar names but different details (e.g. 혈액 검사 types).
+  → Each row is a SEPARATE item. Never merge similar-looking rows.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 2: itemName = EXACT COPY FROM RECEIPT
@@ -749,7 +754,13 @@ RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
   · If receipt shows "수량: 4 × 단가: 22,000 = 88,000" → price: 88000 (use the total)
   · If receipt shows "내복약 1일 × 7 = 31,500" → price: 31500 (use the total)
   · If only unit price visible with quantity → multiply: price = 수량 × 단가
+  · IMPORTANT: Some receipts show columns like "항목 | 수량 | 단가 | 금액"
+    → Always use the FINAL 금액 column, not 단가.
+    → If 수량 > 1 and only 단가 is shown → price = 수량 × 단가.
 - price = null ONLY if truly no price is visible for that item.
+- CRITICAL: Read every digit carefully. Similar-looking digits:
+  · 3 vs 8, 5 vs 6, 0 vs 8, 1 vs 7 — zoom in and verify.
+  · If the total doesn't match your items sum, re-read the prices digit by digit.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 4: DISCOUNT ITEMS → NEGATIVE PRICE
@@ -874,6 +885,7 @@ _VALID_TAG_CODES: set = {
     "exam_lab_panel", "exam_urine", "exam_fecal", "exam_fecal_pcr",
     "exam_sdma", "exam_probnp", "exam_fructosamine", "exam_glucose_curve",
     "exam_blood_gas", "exam_allergy", "exam_eye", "exam_skin", "exam_general",
+    "exam_ear", "exam_microscope",
     # 예방접종
     "vaccine_rabies", "vaccine_comprehensive", "vaccine_corona",
     "vaccine_kennel", "vaccine_fip", "vaccine_parainfluenza", "vaccine_lepto",
@@ -900,7 +912,8 @@ _VALID_TAG_CODES: set = {
     # 기타
     "microchip", "euthanasia", "funeral",
     "care_e_collar", "care_prescription_diet",
-    "checkup_general", "grooming_basic", "etc_other",
+    "supply_food", "supply_supplement", "supply_goods",
+    "checkup_general", "grooming_basic", "etc_fee", "etc_discount", "etc_other",
 }
 
 # ✅ 레거시 태그 → 새 태그 자동 변환 (Gemini가 옛 코드 리턴 시)
