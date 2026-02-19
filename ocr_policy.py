@@ -855,20 +855,22 @@ def _gemini_parse_receipt_full(
         {"inline_data": {"mime_type": mime, "data": b64}},
     ]
 
-    # ✅ Google Vision OCR 텍스트가 있으면 Gemini에 참고자료로 전달
+    # ✅ Google Vision OCR 텍스트: 가격(숫자) 검증용으로만 사용
     if (ocr_text or "").strip():
         parts.append({"text": (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "MANDATORY REFERENCE: Google Vision OCR text\n"
+            "SUPPLEMENTARY: OCR text (for PRICE/NUMBER verification ONLY)\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "CRITICAL: You MUST cross-check EVERY price and item name against this OCR text.\n"
-            "If your extracted price differs from what appears in this text, USE THE OCR TEXT NUMBER.\n"
-            "The OCR text below is machine-read and highly accurate for NUMBERS.\n"
-            "Steps:\n"
-            "1. For each item you extract, find the matching line in this OCR text.\n"
-            "2. Compare your price with the number in the OCR text.\n"
-            "3. If they differ, trust the OCR text number.\n"
-            "4. Check if you missed any items that appear in the OCR text but not in your extraction.\n"
+            "⚠️ WARNING: This OCR text often has GARBLED item names (e.g. '고기인물' instead of '고가약물').\n"
+            "DO NOT copy item names from this text. ALWAYS read item names from the IMAGE.\n"
+            "\n"
+            "USE THIS TEXT ONLY FOR:\n"
+            "1. Counting how many line items exist (to make sure you don't miss any)\n"
+            "2. Verifying NUMBERS/PRICES (the digits are usually accurate)\n"
+            "\n"
+            "DO NOT USE THIS TEXT FOR:\n"
+            "- Item names (read names from the IMAGE only)\n"
+            "- Replacing or modifying names you read from the image\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             + (ocr_text or "").strip()[:6000]
         )})
@@ -935,17 +937,24 @@ def _claude_parse_receipt(
         },
     ]
 
-    # Vision OCR 텍스트 참고자료 추가
+    # Vision OCR 텍스트: 가격(숫자) 검증 및 항목 수 확인용
     if (ocr_text or "").strip():
         user_content.append({
             "type": "text",
             "text": (
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "MANDATORY REFERENCE: Google Vision OCR text\n"
+                "SUPPLEMENTARY: OCR text (for PRICE/NUMBER verification ONLY)\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "CRITICAL: Cross-check EVERY price and item name against this text.\n"
-                "This OCR text is machine-read and highly accurate for NUMBERS.\n"
-                "If any item in this text is missing from your extraction, ADD IT.\n"
+                "⚠️ WARNING: This OCR text often has GARBLED item names (e.g. '고기인물' instead of '고가약물').\n"
+                "DO NOT copy item names from this text. ALWAYS read item names from the IMAGE.\n"
+                "\n"
+                "USE THIS TEXT ONLY FOR:\n"
+                "1. Counting how many line items exist (to make sure you don't miss any)\n"
+                "2. Verifying NUMBERS/PRICES (the digits are usually accurate)\n"
+                "\n"
+                "DO NOT USE THIS TEXT FOR:\n"
+                "- Item names (read names from the IMAGE only)\n"
+                "- Replacing or modifying names you read from the image\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 + (ocr_text or "").strip()[:6000]
             ),
@@ -1093,102 +1102,48 @@ def _migrate_tag(code: str) -> Optional[str]:
 
 
 # =========================================================
-# ✅ Gemini ↔ Vision OCR 교차검증 (가격 교정)
+# ✅ AI ↔ Vision OCR 교차검증 (로깅 전용 — 교정 안 함)
 # =========================================================
 def _cross_validate_prices(
-    gemini_items: List[Dict[str, Any]],
+    ai_items: List[Dict[str, Any]],
     ocr_text: str,
 ) -> List[Dict[str, Any]]:
     """
-    Gemini가 추출한 항목의 가격을 Vision OCR 텍스트와 교차검증.
-    OCR 텍스트에서 항목명 근처 라인의 숫자를 찾아 Gemini 가격과 비교.
-    불일치 시 OCR 숫자로 교정.
+    AI가 추출한 항목의 가격이 Vision OCR 텍스트에 존재하는지 로깅.
+    OCR 이름이 깨질 수 있으므로 가격 교정은 하지 않음 (AI를 신뢰).
+    로그로 불일치 항목만 기록.
     """
-    if not ocr_text or not gemini_items:
-        return gemini_items
+    if not ocr_text or not ai_items:
+        return ai_items
 
     import logging
     _xlog = logging.getLogger("ocr_policy.xval")
 
-    # OCR 텍스트를 라인별로 파싱: (라인텍스트, [숫자들])
-    ocr_lines: List[Tuple[str, List[int]]] = []
+    # OCR 텍스트에 등장하는 모든 숫자 집합
+    all_ocr_nums: set = set()
     for raw_ln in ocr_text.splitlines():
-        ln = re.sub(r"\s+", " ", raw_ln).strip()
-        if not ln:
-            continue
-        nums = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+\d", ln)]
-        nums = [n for n in nums if 100 <= abs(n) <= 50_000_000]
-        ocr_lines.append((ln, nums))
+        for m in re.findall(r"[\d,]+\d", raw_ln):
+            try:
+                n = int(m.replace(",", ""))
+                if 100 <= n <= 50_000_000:
+                    all_ocr_nums.add(n)
+            except ValueError:
+                pass
 
-    # OCR 텍스트에 등장하는 모든 가격 집합
-    all_ocr_prices: set = set()
-    for _, nums in ocr_lines:
-        for n in nums:
-            all_ocr_prices.add(n)
-            all_ocr_prices.add(-n)  # 할인 항목 대비
-
-    def _normalize_for_match(s: str) -> str:
-        s = re.sub(r"[^가-힣a-zA-Z0-9]", "", s.lower())
-        return s
-
-    corrected = []
-    for item in gemini_items:
-        nm = (item.get("itemName") or "").strip()
+    mismatch_count = 0
+    for item in ai_items:
         pr = item.get("price")
-        if not nm or pr is None:
-            corrected.append(item)
+        if pr is None:
             continue
+        if abs(pr) not in all_ocr_nums:
+            nm = (item.get("itemName") or "")[:40]
+            _xlog.warning(f"[XVAL] price not in OCR: '{nm}' = {pr}")
+            mismatch_count += 1
 
-        # 가격이 OCR 텍스트에 존재하면 → OK
-        if pr in all_ocr_prices:
-            corrected.append(item)
-            continue
+    if mismatch_count:
+        _xlog.warning(f"[XVAL] {mismatch_count}/{len(ai_items)} prices not found in OCR text")
 
-        # 가격 불일치 → OCR 라인에서 항목명 매칭 후 올바른 가격 찾기
-        nm_norm = _normalize_for_match(nm)
-        # 항목명의 핵심 키워드 추출 (2글자 이상)
-        keywords = [w for w in re.findall(r"[가-힣a-zA-Z]{2,}", nm) if len(w) >= 2]
-
-        best_line_idx = -1
-        best_match_score = 0
-
-        for i, (ln_text, ln_nums) in enumerate(ocr_lines):
-            if not ln_nums:
-                continue
-            ln_norm = _normalize_for_match(ln_text)
-            # 전체 이름 포함 체크
-            if nm_norm and nm_norm in ln_norm:
-                score = len(nm_norm) * 3
-            else:
-                # 키워드 매칭 점수
-                score = sum(3 for kw in keywords if kw.lower() in ln_text.lower())
-            if score > best_match_score:
-                best_match_score = score
-                best_line_idx = i
-
-        if best_line_idx >= 0 and best_match_score >= 4:
-            _, candidate_nums = ocr_lines[best_line_idx]
-            # 후보 숫자 중 Gemini 가격과 가장 가까운 것 선택
-            if candidate_nums:
-                # 금액 컬럼: 보통 마지막 숫자가 최종 금액
-                # 단가×수량인 경우도 있으니, Gemini 가격과 가장 가까운 것 우선
-                closest = min(candidate_nums, key=lambda n: abs(abs(n) - abs(pr)))
-                # 할인 항목이면 부호 유지
-                if pr < 0:
-                    closest = -abs(closest)
-                if closest != pr:
-                    _xlog.warning(
-                        f"[XVAL] price corrected: '{nm}' "
-                        f"gemini={pr} → ocr={closest} "
-                        f"(line: {ocr_lines[best_line_idx][0][:60]})"
-                    )
-                    item = dict(item)
-                    item["price"] = closest
-                    item["_price_corrected"] = True
-
-        corrected.append(item)
-
-    return corrected
+    return ai_items  # 교정 없이 그대로 반환
 
 
 # =========================================================
