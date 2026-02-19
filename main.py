@@ -1114,7 +1114,7 @@ async def debug_tag_test(item: str = "검사 - 혈압측정"):
     태그 매칭 결과를 확인
     """
     import traceback as _tb
-    result = {"item": item}
+    result = {"item": item, "TAG_ITEM_THRESHOLD": int(settings.TAG_ITEM_THRESHOLD)}
     try:
         if tag_policy is None:
             result["error"] = "tag_policy 모듈이 로드되지 않음"
@@ -1129,10 +1129,15 @@ async def debug_tag_test(item: str = "검사 - 혈압측정"):
         if has_variants:
             result["variants"] = tag_policy._generate_variants(item)
 
-        # classify_item 호출
-        tag_code = tag_policy.classify_item(item, threshold=90)
+        # classify_item 호출 (실제 설정 threshold 사용)
+        actual_threshold = int(settings.TAG_ITEM_THRESHOLD)
+        tag_code = tag_policy.classify_item(item, threshold=actual_threshold)
         result["tag_code"] = tag_code
+        result["actual_threshold_used"] = actual_threshold
         result["success"] = tag_code is not None
+        # threshold=90으로도 테스트
+        tag_code_90 = tag_policy.classify_item(item, threshold=90)
+        result["tag_code_with_90"] = tag_code_90
 
         # 상위 5개 후보 점수
         candidates = []
@@ -1980,10 +1985,16 @@ def process_receipt(
             if tag_policy is not None:
                 try:
                     cat_tag = tag_policy.classify_item(mapped, threshold=int(settings.TAG_ITEM_THRESHOLD))
-                except Exception:
-                    pass
+                    _dlog.warning(f"[TAG] classify_item('{mapped}', thresh={settings.TAG_ITEM_THRESHOLD}) → {cat_tag}")
+                except Exception as _tag_err:
+                    _dlog.warning(f"[TAG] classify_item ERROR for '{mapped}': {_tag_err}")
+            else:
+                _dlog.warning(f"[TAG] tag_policy is None, skipping classify_item for '{mapped}'")
+        else:
+            _dlog.warning(f"[TAG] Gemini already set categoryTag='{cat_tag}' for '{mapped}'")
         if not cat_tag:
             cat_tag = _fallback_classify_item(mapped)
+            _dlog.warning(f"[TAG] fallback_classify_item('{mapped}') → {cat_tag}")
 
         final_items.append({
             "itemName": mapped,
