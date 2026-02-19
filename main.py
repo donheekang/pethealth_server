@@ -938,6 +938,43 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": _internal_detail(msg, kind="Internal Server Error")})
 
 
+# ── 🔍 OCR/Gemini 진단 엔드포인트 ──
+@app.get("/api/debug/ocr-status")
+async def debug_ocr_status():
+    """
+    브라우저에서 /api/debug/ocr-status 접속하면
+    Gemini 설정 상태를 바로 확인할 수 있음
+    """
+    has_key = bool(settings.GEMINI_API_KEY and len(settings.GEMINI_API_KEY) > 5)
+    key_preview = (settings.GEMINI_API_KEY[:6] + "***") if has_key else "(비어있음)"
+
+    # ocr_policy 모듈 상태 확인
+    ocr_ok = False
+    try:
+        if ocr_policy is not None:
+            ocr_ok = True
+    except Exception:
+        pass
+
+    return {
+        "gemini_enabled": bool(settings.GEMINI_ENABLED),
+        "gemini_api_key_set": has_key,
+        "gemini_api_key_preview": key_preview,
+        "gemini_model": str(settings.GEMINI_MODEL_NAME),
+        "gemini_timeout": int(settings.GEMINI_TIMEOUT_SECONDS),
+        "receipt_max_width": int(settings.RECEIPT_MAX_WIDTH),
+        "ocr_module_loaded": ocr_ok,
+        "verdict": (
+            "✅ Gemini 정상 — AI OCR 활성화됨"
+            if (bool(settings.GEMINI_ENABLED) and has_key and ocr_ok)
+            else "❌ Gemini 비활성 — "
+                 + ("API 키 없음" if not has_key else "")
+                 + ("GEMINI_ENABLED=False" if not bool(settings.GEMINI_ENABLED) else "")
+                 + ("ocr_policy 로드 실패" if not ocr_ok else "")
+        ),
+    }
+
+
 @app.on_event("startup")
 def _startup():
     init_db_pool()
