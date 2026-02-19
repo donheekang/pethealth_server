@@ -686,10 +686,13 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
   "hospitalName": "병원이름" or null,
   "visitDate": "YYYY-MM-DD" or null,
   "totalAmount": integer or null,
+  "discountAmount": integer or null,
   "items": [
     {
       "itemName": "진료항목명",
       "price": integer_or_null,
+      "originalPrice": integer_or_null,
+      "discount": integer_or_null,
       "categoryTag": "standard_tag_code_or_null",
       "standardName": "한글 표준명 or null"
     }
@@ -702,6 +705,13 @@ RULES:
 2. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
 3. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
 4. Be precise with prices — copy exact amounts from the receipt.
+5. DISCOUNT HANDLING:
+   - If an item has a discount (할인, DC, 감면, 면제), set "price" = actual charged amount (할인 적용 후).
+   - Set "originalPrice" = original amount before discount.
+   - Set "discount" = discount amount (양수로 기입).
+   - If the receipt shows a separate discount line (할인, DC), include it as a discount item with negative price.
+   - "discountAmount" at top level = total discount across all items (할인합계).
+   - If no discount exists, set discount fields to null.
 
 STANDARD TAG CODES (use these exact codes for categoryTag):
 
@@ -1003,8 +1013,9 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if not nm or _is_noise_line(nm):
                 continue
             pr = _coerce_int_amount(it.get("price"))
-            if pr is not None and pr < 0:
-                pr = None
+            orig_pr = _coerce_int_amount(it.get("originalPrice"))
+            disc = _coerce_int_amount(it.get("discount"))
+            # 음수 금액은 할인 항목으로 허용
 
             ct = (it.get("categoryTag") or "").strip() or None
             sn = (it.get("standardName") or "").strip() or None
@@ -1015,12 +1026,17 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if ct:
                 tags_set.add(ct)
 
-            cleaned.append({
+            item_entry = {
                 "itemName": nm,
                 "price": pr,
                 "categoryTag": ct,
                 "standardName": sn,
-            })
+            }
+            if orig_pr is not None:
+                item_entry["originalPrice"] = orig_pr
+            if disc is not None and disc > 0:
+                item_entry["discount"] = disc
+            cleaned.append(item_entry)
 
     parsed["items"] = cleaned
 
