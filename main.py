@@ -1002,27 +1002,19 @@ async def debug_gemini_test():
         body = resp.json()
 
         if resp.status_code == 200:
-            text = ""
+            # 원본 응답 구조를 그대로 반환해서 디버깅
+            raw_parts = []
             try:
-                parts_list = body["candidates"][0]["content"]["parts"]
-                # Gemini 3: thinking 파트 건너뛰고 실제 응답만 추출
-                for p in parts_list:
-                    if p.get("thought") or p.get("thinking"):
-                        continue
-                    if p.get("text"):
-                        text = p["text"]
-                        break
-                if not text and parts_list:
-                    text = parts_list[-1].get("text", "(파싱 실패)")
+                raw_parts = body["candidates"][0]["content"]["parts"]
             except Exception:
-                text = "(파싱 실패)"
+                pass
             return {
                 "success": True,
                 "model": model,
                 "status_code": resp.status_code,
-                "gemini_reply": text.strip(),
+                "raw_parts": raw_parts,
+                "raw_body_preview": str(body)[:2000],
                 "elapsed_sec": elapsed,
-                "verdict": f"✅ Gemini 응답 정상 ({elapsed}초)",
             }
         else:
             err_msg = body.get("error", {}).get("message", str(body)[:300])
