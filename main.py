@@ -1037,6 +1037,75 @@ async def debug_gemini_test():
         }
 
 
+@app.post("/api/debug/ocr-test")
+async def debug_ocr_test(request: Request):
+    """
+    영수증 이미지를 직접 보내서 OCR 파이프라인 전체 결과를 확인.
+    curl -X POST -F "file=@receipt.jpg" https://pethealthplus.onrender.com/api/debug/ocr-test
+    """
+    import time as _time
+    body = await request.body()
+    if not body:
+        return {"error": "이미지를 보내주세요 (raw body 또는 multipart)"}
+
+    # multipart인 경우 파일 추출
+    content_type = request.headers.get("content-type", "")
+    raw = body
+    if "multipart" in content_type:
+        form = await request.form()
+        f = form.get("file")
+        if f:
+            raw = await f.read()
+
+    t0 = _time.time()
+    try:
+        _require_module(ocr_policy, "ocr_policy")
+        result = ocr_policy.process_receipt_image(
+            raw,
+            timeout=int(settings.OCR_TIMEOUT_SECONDS),
+            max_concurrency=int(settings.OCR_MAX_CONCURRENCY),
+            sema_timeout=float(settings.OCR_SEMA_ACQUIRE_TIMEOUT_SECONDS),
+            max_pixels=int(settings.IMAGE_MAX_PIXELS),
+            receipt_max_width=int(settings.RECEIPT_MAX_WIDTH),
+            receipt_webp_quality=int(settings.RECEIPT_WEBP_QUALITY),
+            gemini_enabled=bool(settings.GEMINI_ENABLED),
+            gemini_api_key=str(settings.GEMINI_API_KEY),
+            gemini_model_name=str(settings.GEMINI_MODEL_NAME),
+            gemini_timeout=int(settings.GEMINI_TIMEOUT_SECONDS),
+        )
+        elapsed = round(_time.time() - t0, 2)
+
+        items = result.get("items") or []
+        meta = result.get("meta") or {}
+        ocr_text = result.get("ocr_text") or ""
+
+        return {
+            "success": True,
+            "elapsed_sec": elapsed,
+            "pipeline": meta.get("pipeline", "unknown"),
+            "gemini_used": meta.get("geminiUsed", False),
+            "gemini_error": meta.get("geminiError", None),
+            "vision_error": meta.get("visionError", None),
+            "ocr_engine": meta.get("ocrEngine", "unknown"),
+            "item_count": len(items),
+            "items": items[:30],
+            "hospital_name": meta.get("hospital_name"),
+            "visit_date": meta.get("visit_date"),
+            "total_amount": result.get("total_amount"),
+            "ocr_text_preview": ocr_text[:1000],
+            "all_meta": {k: v for k, v in meta.items() if k != "tags"},
+        }
+    except Exception as e:
+        import traceback
+        elapsed = round(_time.time() - t0, 2)
+        return {
+            "success": False,
+            "elapsed_sec": elapsed,
+            "error": str(e)[:500],
+            "traceback": traceback.format_exc()[-800:],
+        }
+
+
 @app.on_event("startup")
 def _startup():
     init_db_pool()
