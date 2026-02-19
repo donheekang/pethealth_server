@@ -141,6 +141,18 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "피부세포","tape cytology","테이프도말","우드램프","wood lamp","dtm",
         "피부배양","진균배양","피부조직검사",
     ]},
+    {"code": "exam_ear", "group": "exam", "aliases": [
+        "귀검사","이경","검이경","이경검사","otoscope","otoscopy","이도검사",
+        "귀내시경","이도내시경","ear exam","ear examination","ear check",
+        "검사-귀","귀-set","귀set","이경+현미경","귀검진","이도검진",
+        "귀진찰","외이도검사","외이도","이개검사",
+        "검사귀set","검사귀","귀현미경","귀현미경도말",
+    ]},
+    {"code": "exam_microscope", "group": "exam", "aliases": [
+        "현미경","현미경검사","현미경도말","도말검사","도말","microscopy",
+        "microscope","현미경관찰","도말표본","smear","smear test","도말시험",
+        "현미경분석","현미경판독",
+    ]},
     # === 감염병 검사 (snap test 등) ===
     {"code": "exam_snap_test", "group": "exam", "aliases": [
         "snap","snap test","snap4dx","4dx","snap fiv","snap felv","fiv","felv",
@@ -406,13 +418,34 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     ]},
     # === 기타 ===
     {"code": "care_e_collar", "group": "etc", "aliases": [
-        "e-collar","ecollar","cone","elizabethan collar","넥카라",
-        "엘리자베스카라","보호카라","보호대","깔대기",
+        "e-collar","ecollar","cone","elizabethan collar","넥카라","넥칼라",
+        "엘리자베스카라","보호카라","보호대","깔대기","목카라","목칼라",
+        "넥카라 소","넥카라 중","넥카라 대","넥칼라 소","넥칼라 중","넥칼라 대",
     ]},
     {"code": "care_prescription_diet", "group": "etc", "aliases": [
         "prescription diet","rx diet","therapeutic diet","처방식","처방사료",
         "병원사료","hill's","hills","royal canin","k/d","c/d","i/d","z/d",
         "처방전용사료","의료용사료","치료식","치료용사료","로얄캐닌","힐스",
+        "처방식이","처방용사료","처방캔","처방파우치","처방간식",
+    ]},
+    {"code": "supply_food", "group": "etc", "aliases": [
+        "사료","건사료","습식사료","캔","캔사료","간식","간식류","트릿","treat",
+        "food","pet food","dog food","cat food","kibble","wet food","dry food",
+        "사료비","사료구매","사료대","파우치","토퍼","습식","건식","자연식",
+        "생식","화식","수제사료","수제간식",
+        "일반사료","일반간식",
+    ]},
+    {"code": "supply_supplement", "group": "etc", "aliases": [
+        "영양제","보조제","supplement","nutritional supplement","비타민","vitamin",
+        "오메가3","omega","유산균","프로바이오틱","프리바이오틱","관절영양제",
+        "관절보조","피부영양제","면역보조","영양보조","건강보조식품","건강보조",
+        "종합영양제","멀티비타민","눈영양제","간영양제","신장영양제",
+    ]},
+    {"code": "supply_goods", "group": "etc", "aliases": [
+        "용품","pet supply","pet supplies","펫용품","반려동물용품",
+        "장난감","toy","리드줄","목줄","하네스","harness","leash","collar",
+        "식기","밥그릇","물그릇","배변패드","패드","배변","pet pad",
+        "케이지","캐리어","carrier","이동장","방석","침대","pet bed",
     ]},
     {"code": "checkup_general", "group": "checkup", "aliases": [
         "checkup","consult","opd","진료","상담","초진","재진","진찰",
@@ -763,17 +796,44 @@ def resolve_record_tags(*, items, hospital_name=None, ocr_text=None, record_thre
 # =========================================================
 # main.py 호환 함수: classify_item / classify_record
 # =========================================================
+_PRESCRIPTION_KEYWORDS = {"처방", "rx", "prescription", "therapeutic", "치료용"}
+
 def classify_item(item_name: str, threshold: int = 100) -> Optional[str]:
     """단일 항목명 → 최적 태그 코드 반환. 매칭 안 되면 None."""
     if not (item_name or "").strip():
         return None
     best_code = None
     best_score = 0
+    second_code = None
+    second_score = 0
     for tag in TAG_CATALOG:
         s, _ = _match_score(tag, item_name)
         if s > best_score:
+            second_code, second_score = best_code, best_score
             best_score = s
             best_code = tag["code"]
+        elif s > second_score:
+            second_score = s
+            second_code = tag["code"]
+
+    # 처방식 우선: supply_food가 1등이지만 "처방" 키워드가 있으면 care_prescription_diet 우선
+    if best_code == "supply_food":
+        nm_lower = _normalize(item_name)
+        if any(_normalize(kw) in nm_lower for kw in _PRESCRIPTION_KEYWORDS):
+            # care_prescription_diet가 후보에 있으면 교체
+            if second_code == "care_prescription_diet" and second_score >= threshold:
+                best_code = second_code
+                best_score = second_score
+            else:
+                # 직접 검색
+                for tag in TAG_CATALOG:
+                    if tag["code"] == "care_prescription_diet":
+                        s, _ = _match_score(tag, item_name)
+                        if s >= threshold:
+                            best_code = "care_prescription_diet"
+                            best_score = s
+                        break
+
     if best_code and best_score >= threshold:
         if best_code == "etc_other":
             return None
