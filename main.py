@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     FIREBASE_ADMIN_SA_B64: str = ""
     FIREBASE_STORAGE_BUCKET: str = ""
 
-    RECEIPT_MAX_WIDTH: int = 1024
+    RECEIPT_MAX_WIDTH: int = 2048          # ✅ 1024→2048: OCR 해상도 향상
     RECEIPT_WEBP_QUALITY: int = 85
 
     MAX_RECEIPT_IMAGE_BYTES: int = 10 * 1024 * 1024
@@ -97,10 +97,10 @@ class Settings(BaseSettings):
 
     OCR_HOSPITAL_CANDIDATE_LIMIT: int = 3
 
-    GEMINI_ENABLED: bool = False
+    GEMINI_ENABLED: bool = True           # ✅ False→True: Gemini OCR 기본 활성화
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
-    GEMINI_TIMEOUT_SECONDS: int = 10
+    GEMINI_TIMEOUT_SECONDS: int = 15      # ✅ 10→15: 고해상도 이미지 처리 시간 확보
 
     TAG_RECORD_THRESHOLD: int = 125
     TAG_ITEM_THRESHOLD: int = 140
