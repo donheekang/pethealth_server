@@ -537,13 +537,26 @@ def _call_gemini_generate_content(
     with urllib.request.urlopen(req, timeout=float(timeout_seconds or 10)) as resp:
         data = resp.read().decode("utf-8", errors="replace")
     j = json.loads(data)
-    txt = (
+    # ✅ Gemini 3: thinking part를 건너뛰고 실제 응답 텍스트 추출
+    parts_out = (
         (j.get("candidates") or [{}])[0]
         .get("content", {})
-        .get("parts", [{}])[0]
-        .get("text", "")
+        .get("parts", [])
     )
-    return (txt or "").strip()
+    txt_parts = []
+    for p in parts_out:
+        # thought=true인 파트는 건너뛰기 (Gemini 3 thinking 모드)
+        if p.get("thought") or p.get("thinking"):
+            continue
+        t = p.get("text", "")
+        if t:
+            txt_parts.append(t)
+    # thinking 파트밖에 없으면 마지막 파트라도 사용
+    if not txt_parts and parts_out:
+        last = parts_out[-1].get("text", "")
+        if last:
+            txt_parts.append(last)
+    return "\n".join(txt_parts).strip()
 
 
 def _extract_json_from_model_text(s: str) -> Optional[Dict[str, Any]]:
