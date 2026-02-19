@@ -1107,6 +1107,49 @@ async def debug_ocr_test(request: Request):
         }
 
 
+@app.get("/api/debug/tag-test")
+async def debug_tag_test(item: str = "검사 - 혈압측정"):
+    """
+    브라우저에서 /api/debug/tag-test?item=검사 - 혈압측정
+    태그 매칭 결과를 확인
+    """
+    import traceback as _tb
+    result = {"item": item}
+    try:
+        if tag_policy is None:
+            result["error"] = "tag_policy 모듈이 로드되지 않음"
+            return result
+
+        # _generate_variants 존재 여부 확인
+        has_variants = hasattr(tag_policy, "_generate_variants")
+        has_strip = hasattr(tag_policy, "_strip_prefixes")
+        result["has_generate_variants"] = has_variants
+        result["has_strip_prefixes"] = has_strip
+
+        if has_variants:
+            result["variants"] = tag_policy._generate_variants(item)
+
+        # classify_item 호출
+        tag_code = tag_policy.classify_item(item, threshold=90)
+        result["tag_code"] = tag_code
+        result["success"] = tag_code is not None
+
+        # 상위 5개 후보 점수
+        candidates = []
+        for tag in tag_policy.TAG_CATALOG:
+            s, ev = tag_policy._match_score(tag, item)
+            if s > 50:
+                candidates.append({"code": tag["code"], "score": s, "why": ev.get("why", [])[:3]})
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        result["top_candidates"] = candidates[:5]
+
+    except Exception as e:
+        result["error"] = str(e)[:500]
+        result["traceback"] = _tb.format_exc()[-500:]
+
+    return result
+
+
 @app.on_event("startup")
 def _startup():
     init_db_pool()
