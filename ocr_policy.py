@@ -957,6 +957,14 @@ def _claude_parse_receipt(
     payload = {
         "model": model,
         "max_tokens": 8192,
+        "system": (
+            "You are a precision OCR data extractor for Korean veterinary hospital receipts. "
+            "You read receipt images with extreme accuracy. "
+            "You MUST extract EVERY line item visible on the receipt — never skip items. "
+            "Your item prices MUST add up to the totalAmount on the receipt. "
+            "If your sum doesn't match, re-read the receipt until it does. "
+            "Return ONLY valid JSON, no explanation."
+        ),
         "messages": [
             {"role": "user", "content": user_content}
         ],
@@ -1244,8 +1252,13 @@ def _recover_missing_items(
     return gemini_items
 
 
-def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    """Normalize Gemini-first result into (parsed, tags)."""
+def _normalize_gemini_full_result(
+    j: Dict[str, Any],
+    skip_noise_filter: bool = False,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Normalize AI result into (parsed, tags).
+    skip_noise_filter=True: AI(Claude)가 반환한 항목은 노이즈 필터 건너뜀.
+    """
     parsed: Dict[str, Any] = {
         "hospitalName": None,
         "visitDate": None,
@@ -1278,7 +1291,10 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if not nm:
                 continue
             nm = _canonicalize_item_name(_clean_item_name(nm))
-            if not nm or _is_noise_line(nm):
+            if not nm:
+                continue
+            # ✅ AI(Claude) 결과는 노이즈 필터 건너뜀 — AI가 이미 진짜 항목만 반환
+            if not skip_noise_filter and _is_noise_line(nm):
                 continue
             pr = _coerce_int_amount(it.get("price"))
             orig_pr = _coerce_int_amount(it.get("originalPrice"))
@@ -1504,8 +1520,12 @@ def process_receipt(
 
     # --- 정규화 ---
     if isinstance(ai_result_json, dict):
-        ai_parsed, ai_tags = _normalize_gemini_full_result(ai_result_json)
-        _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}")
+        # ✅ Claude 결과는 노이즈 필터 건너뜀 (Claude가 이미 진짜 항목만 반환)
+        is_claude = bool(hints.get("claudeUsed"))
+        ai_parsed, ai_tags = _normalize_gemini_full_result(
+            ai_result_json, skip_noise_filter=is_claude,
+        )
+        _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}, skip_noise={is_claude}")
 
         # Claude 사용 시: 이미지 직접 읽기 → 후처리 불필요 (Claude를 신뢰)
         # Gemini 폴백 시: OCR 교차검증 + 누락 복구 적용
