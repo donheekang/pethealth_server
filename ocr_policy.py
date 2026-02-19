@@ -904,110 +904,6 @@ def _gemini_parse_receipt_full(
     return None
 
 
-# =========================================================
-# ✅ Claude API를 이용한 영수증 OCR (Gemini 대체)
-# =========================================================
-def _claude_parse_receipt(
-    *,
-    image_bytes: bytes,
-    api_key: str,
-    model: str = "claude-sonnet-4-20250514",
-    timeout_seconds: int = 60,
-    ocr_text: str = "",
-) -> Optional[Dict[str, Any]]:
-    """Claude Vision API로 영수증 이미지를 분석하여 구조화된 JSON 반환."""
-    api_key = (api_key or "").strip()
-    if not api_key:
-        return None
-
-    import logging
-    _clog = logging.getLogger("ocr_policy.claude")
-
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-
-    mime = "image/png"
-    if image_bytes[:4] == b"RIFF":
-        mime = "image/webp"
-    elif image_bytes[:3] == b"\xff\xd8\xff":
-        mime = "image/jpeg"
-    elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-        mime = "image/png"
-
-    # Claude용 프롬프트 (Gemini와 동일한 구조)
-    user_content: List[Dict[str, Any]] = [
-        {
-            "type": "image",
-            "source": {"type": "base64", "media_type": mime, "data": b64},
-        },
-        {
-            "type": "text",
-            "text": _GEMINI_RECEIPT_PROMPT,  # 같은 프롬프트 재사용
-        },
-    ]
-
-    # ✅ OCR 힌트 전달 (항목 수 + 총액만 — 깨진 이름은 보내지 않음)
-    if (ocr_text or "").strip():
-        user_content.append({
-            "type": "text",
-            "text": ocr_text.strip(),
-        })
-
-    import urllib.request
-
-    payload = {
-        "model": model,
-        "max_tokens": 8192,
-        "system": (
-            "You are a precision OCR data extractor for Korean veterinary hospital receipts. "
-            "You read receipt images with extreme accuracy. "
-            "You MUST extract EVERY line item visible on the receipt — never skip items. "
-            "Your item prices MUST add up to the totalAmount on the receipt. "
-            "If your sum doesn't match, re-read the receipt until it does. "
-            "Return ONLY valid JSON, no explanation."
-        ),
-        "messages": [
-            {"role": "user", "content": user_content}
-        ],
-    }
-
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=float(timeout_seconds)) as resp:
-            data = resp.read().decode("utf-8", errors="replace")
-        j = json.loads(data)
-
-        # Claude 응답에서 텍스트 추출
-        content_blocks = j.get("content", [])
-        txt_parts = []
-        for block in content_blocks:
-            if block.get("type") == "text":
-                txt_parts.append(block.get("text", ""))
-
-        raw_text = "\n".join(txt_parts).strip()
-        _clog.info(f"[Claude-call] raw_len={len(raw_text)}, preview={repr(raw_text[:300])}")
-
-        # JSON 추출
-        result = _extract_json_from_model_text(raw_text)
-        _clog.info(f"[Claude-call] parsed={'ok' if isinstance(result, dict) else 'FAIL'}")
-
-        if isinstance(result, dict):
-            return result
-
-    except Exception as e:
-        _clog.error(f"[Claude-call] EXCEPTION: {type(e).__name__}: {e}")
-
-    return None
 
 
 # =========================================================
@@ -1381,27 +1277,15 @@ def process_receipt(
     img_ocr.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
 
-    # ✅ Claude용 이미지: 원본 컬러 그대로 (전처리 없음 — Claude Vision은 원본이 더 정확)
-    claude_buf = io.BytesIO()
-    img_claude = _resize_to_width(img.copy(), ocr_max_w)
-    img_claude.save(claude_buf, format="PNG")
-    claude_image_bytes = claude_buf.getvalue()
-
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
     g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
     g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")) or "gemini-3-flash-preview"
     g_timeout = max(60, int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60") or "60")))
 
-    # ✅ Claude API 설정 (비용 절약: 환경변수 CLAUDE_OCR_ENABLED=true일 때만 활성화)
-    c_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    c_model = os.getenv("CLAUDE_OCR_MODEL", "claude-sonnet-4-20250514").strip()
-    c_timeout = max(60, int(os.getenv("CLAUDE_OCR_TIMEOUT", "90") or "90"))
-    c_enabled = _env_bool("CLAUDE_OCR_ENABLED") and bool(c_key)  # ✅ 명시적 활성화 필요
-
     hints: Dict[str, Any] = {
         "ocrEngine": "none",
         "geminiUsed": False,
-        "pipeline": "claude_first" if c_enabled else "gemini_first",
+        "pipeline": "gemini_first",
     }
 
     ai_parsed = None
@@ -1409,7 +1293,7 @@ def process_receipt(
 
     import logging
     _log = logging.getLogger("ocr_policy")
-    _log.info(f"[AI] claude_enabled={c_enabled}, gemini_enabled={g_enabled}, claude_model={c_model}, gemini_model={g_model}")
+    _log.info(f"[AI] gemini_enabled={g_enabled}, gemini_model={g_model}")
 
     # ✅ Step 1: Google Vision OCR 먼저 실행 (텍스트 추출)
     ocr_text = ""
@@ -1453,14 +1337,12 @@ def process_receipt(
         except Exception:
             pass
 
-    # ✅ Step 2: AI 영수증 분석 (Gemini 주력 → Claude 폴백)
-    # 비용 효율: Gemini Flash ≈ 1~5원/건, Claude Sonnet ≈ 30~100원/건
+    # ✅ Step 2: Gemini AI 영수증 분석
     ai_result_json = None
 
-    # --- 2a: Gemini 주력 (비용 효율적) ---
     if g_enabled and g_key.strip():
         try:
-            _log.info(f"[Gemini] primary: model={g_model}, timeout={g_timeout}")
+            _log.info(f"[Gemini] calling model={g_model}, timeout={g_timeout}")
             gj = _gemini_parse_receipt_full(
                 image_bytes=ocr_image_bytes,
                 api_key=g_key,
@@ -1474,66 +1356,26 @@ def process_receipt(
                 hints["geminiUsed"] = True
                 _log.info(f"[Gemini] SUCCESS: items={len(gj.get('items', []))}")
             else:
-                _log.warning("[Gemini] returned non-dict, falling back to Claude")
+                _log.warning("[Gemini] returned non-dict")
         except Exception as e:
             _log.error(f"[Gemini] ERROR: {e}")
             hints["geminiError"] = str(e)[:200]
 
-    # --- 2b: Claude 폴백 (Gemini 실패 시, CLAUDE_OCR_ENABLED=true일 때만) ---
-    if ai_result_json is None and c_enabled:
-        try:
-            # OCR에서 추출한 숫자 힌트 (이름은 깨지니 숫자만)
-            ocr_hint = ""
-            if ocr_item_count > 0 or ocr_total_amount:
-                hint_parts = []
-                if ocr_item_count > 0:
-                    hint_parts.append(f"- Line item count from OCR: approximately {ocr_item_count} items")
-                if ocr_total_amount:
-                    hint_parts.append(f"- Total amount from OCR: {ocr_total_amount:,}원")
-                ocr_hint = (
-                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "VERIFICATION TARGETS (from machine OCR — numbers are accurate):\n"
-                    + "\n".join(hint_parts) + "\n"
-                    "Your extracted items MUST match these targets.\n"
-                    "If your item count or price sum differs significantly, re-read the receipt.\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                )
-
-            _log.info(f"[Claude] fallback: model={c_model}, timeout={c_timeout}, ocr_hint_len={len(ocr_hint)}")
-            cj = _claude_parse_receipt(
-                image_bytes=claude_image_bytes,
-                api_key=c_key,
-                model=c_model,
-                timeout_seconds=c_timeout,
-                ocr_text=ocr_hint,
-            )
-            if isinstance(cj, dict):
-                ai_result_json = cj
-                hints["ocrEngine"] = f"claude:{c_model}"
-                hints["claudeUsed"] = True
-                _log.info(f"[Claude] fallback SUCCESS: items={len(cj.get('items', []))}")
-            else:
-                _log.warning("[Claude] returned non-dict")
-        except Exception as e:
-            _log.error(f"[Claude] ERROR: {type(e).__name__}: {e}")
-            hints["claudeError"] = str(e)[:200]
-
     if ai_result_json is None:
-        _log.warning("[AI] both Gemini and Claude failed or disabled")
+        _log.warning("[AI] Gemini failed or disabled")
 
     # --- 정규화 ---
     if isinstance(ai_result_json, dict):
-        # ✅ AI(Claude든 Gemini든) 결과는 노이즈 필터 건너뜀
-        # AI가 이미 프롬프트에서 "진짜 항목만 반환"하라고 지시받았으므로
-        # _is_noise_line 필터가 유효 항목을 삭제하는 것을 방지
+        # ✅ AI 결과는 노이즈 필터 건너뜀
+        # AI가 프롬프트에서 "진짜 항목만 반환"하라고 지시받았으므로
+        # _is_noise_line 필터가 유효 항목("항목", "합계" 등 포함)을 삭제하는 것을 방지
         ai_parsed, ai_tags = _normalize_gemini_full_result(
             ai_result_json, skip_noise_filter=True,
         )
-        _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}, skip_noise=True")
+        _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}")
 
-        # Claude 사용 시: 이미지 직접 읽기 → 후처리 불필요 (Claude를 신뢰)
-        # Gemini 폴백 시: OCR 교차검증 + 누락 복구 적용
-        if not hints.get("claudeUsed") and ocr_text and ai_parsed.get("items"):
+        # OCR 교차검증 + 누락 복구 적용
+        if ocr_text and ai_parsed.get("items"):
             # Gemini 폴백인 경우만 OCR 기반 로깅
             _cross_validate_prices(ai_parsed["items"], ocr_text)
 
