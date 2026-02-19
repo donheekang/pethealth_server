@@ -1163,6 +1163,15 @@ def _startup():
             init_firebase_admin(require_init=True)
         except Exception as e:
             logger.warning("[Startup] Firebase init failed: %s", _sanitize_for_log(repr(e)))
+    # --- auto migration: 할인 항목 음수 price 허용 ---
+    if settings.DB_ENABLED and settings.DATABASE_URL:
+        try:
+            db_execute("""
+                ALTER TABLE public.health_items DROP CONSTRAINT IF EXISTS health_items_price_nonneg
+            """)
+            logger.info("[Startup] Dropped health_items_price_nonneg constraint (allow negative prices for discounts)")
+        except Exception as e:
+            logger.warning("[Startup] Could not drop price constraint: %s", _sanitize_for_log(repr(e)))
 
 
 @app.on_event("shutdown")
