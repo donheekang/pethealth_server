@@ -526,7 +526,13 @@ def _call_gemini_generate_content(
 ) -> str:
     import urllib.request
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    gen_config: Dict[str, Any] = {"temperature": 0.0, "maxOutputTokens": 2048}
+    # ✅ Gemini 3: thinking에 토큰을 많이 쓰므로 maxOutputTokens를 크게 설정
+    # thinkingBudget으로 사고 토큰을 제한하고, 실제 응답에 충분한 여유 확보
+    gen_config: Dict[str, Any] = {
+        "temperature": 0.0,
+        "maxOutputTokens": 16384,
+        "thinkingConfig": {"thinkingBudget": 2048},
+    }
 
     payload = {
         "contents": [{"role": "user", "parts": parts}],
