@@ -708,7 +708,10 @@ RULES:
    - originalPrice = original amount before discount. null if no discount.
    - discount = discount amount as positive integer. null if no discount.
    - discountAmount at top level = total discount across all items.
+   - 절사할인/단수할인/할인 등 할인 항목이 별도 라인으로 있으면, 반드시 items에 포함.
+     itemName은 영수증 그대로 (예: "절사할인"), price는 음수 (예: -200).
 7. Extract ALL items — do not skip any line item, even if you are unsure what it is.
+   Include discount lines (절사할인, 할인, 쿠폰할인 etc.) as items with negative price.
 8. If an item has quantity (수량) > 1, still report it as a single item with the total price.
 """
 
