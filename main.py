@@ -1601,8 +1601,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     p = int(it.price)
                 except Exception:
                     raise HTTPException(status_code=400, detail="item price must be a number")
-                if p < 0:
-                    raise HTTPException(status_code=400, detail="item price must be >= 0")
+                # 음수 가격 허용 (절사할인, 쿠폰할인 등 할인 항목)
                 has_any_price = True
                 items_sum += p
     tags = _clean_tags(req.tags)
@@ -1914,9 +1913,10 @@ def process_receipt(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(petId, "petId")
-    pet = db_fetchone("SELECT id, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+    pet = db_fetchone("SELECT id, name, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
+    selected_pet_name = (pet.get("name") or "").strip()
 
     raw = _read_upload_limited(file, int(settings.MAX_RECEIPT_IMAGE_BYTES))
     if not raw:
@@ -1964,6 +1964,37 @@ def process_receipt(
 
     # Gemini may have already provided tags via ocr_policy
     gemini_tags: List[str] = meta.get("tags") or []
+
+    # --- 다두 영수증: 선택된 pet 이름으로 항목 필터링 ---
+    receipt_pet_names: List[str] = meta.get("petNames") or []
+    is_multi_pet = len(receipt_pet_names) >= 2
+    _dlog.warning(f"[MULTI-PET] petNames={receipt_pet_names}, selectedPet='{selected_pet_name}', isMultiPet={is_multi_pet}")
+
+    if is_multi_pet and selected_pet_name:
+        # 선택된 pet 이름이 영수증의 pet 이름 중 하나와 매칭되는지 확인
+        matched_pet_name = None
+        sel_clean = selected_pet_name.replace(" ", "").lower()
+        for rpn in receipt_pet_names:
+            rpn_clean = rpn.replace(" ", "").lower()
+            if sel_clean == rpn_clean or sel_clean in rpn_clean or rpn_clean in sel_clean:
+                matched_pet_name = rpn
+                break
+        _dlog.warning(f"[MULTI-PET] matchedPetName={matched_pet_name}")
+
+        if matched_pet_name:
+            # 매칭된 pet의 항목만 + petName이 null인 항목(할인 등 공통) 필터링
+            filtered = []
+            for it in items_raw:
+                item_pet = (it.get("petName") or "").strip()
+                if not item_pet:
+                    # petName이 없는 항목 (할인 등) → 포함
+                    filtered.append(it)
+                elif item_pet.replace(" ", "").lower() == matched_pet_name.replace(" ", "").lower():
+                    filtered.append(it)
+            _dlog.warning(f"[MULTI-PET] filtered {len(items_raw)} → {len(filtered)} items for '{matched_pet_name}'")
+            items_raw = filtered
+        else:
+            _dlog.warning(f"[MULTI-PET] selectedPet '{selected_pet_name}' not found in receipt petNames {receipt_pet_names} — keeping all items")
 
     # --- Apply tag_policy / item mapping ---
     record_tags: List[str] = []
