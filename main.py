@@ -1980,37 +1980,6 @@ def process_receipt(
     # Gemini may have already provided tags via ocr_policy
     gemini_tags: List[str] = meta.get("tags") or []
 
-    # --- 다두 영수증: 선택된 pet 이름으로 항목 필터링 ---
-    receipt_pet_names: List[str] = meta.get("petNames") or []
-    is_multi_pet = len(receipt_pet_names) >= 2
-    _dlog.warning(f"[MULTI-PET] petNames={receipt_pet_names}, selectedPet='{selected_pet_name}', isMultiPet={is_multi_pet}")
-
-    if is_multi_pet and selected_pet_name:
-        # 선택된 pet 이름이 영수증의 pet 이름 중 하나와 매칭되는지 확인
-        matched_pet_name = None
-        sel_clean = selected_pet_name.replace(" ", "").lower()
-        for rpn in receipt_pet_names:
-            rpn_clean = rpn.replace(" ", "").lower()
-            if sel_clean == rpn_clean or sel_clean in rpn_clean or rpn_clean in sel_clean:
-                matched_pet_name = rpn
-                break
-        _dlog.warning(f"[MULTI-PET] matchedPetName={matched_pet_name}")
-
-        if matched_pet_name:
-            # 매칭된 pet의 항목만 + petName이 null인 항목(할인 등 공통) 필터링
-            filtered = []
-            for it in items_raw:
-                item_pet = (it.get("petName") or "").strip()
-                if not item_pet:
-                    # petName이 없는 항목 (할인 등) → 포함
-                    filtered.append(it)
-                elif item_pet.replace(" ", "").lower() == matched_pet_name.replace(" ", "").lower():
-                    filtered.append(it)
-            _dlog.warning(f"[MULTI-PET] filtered {len(items_raw)} → {len(filtered)} items for '{matched_pet_name}'")
-            items_raw = filtered
-        else:
-            _dlog.warning(f"[MULTI-PET] selectedPet '{selected_pet_name}' not found in receipt petNames {receipt_pet_names} — keeping all items")
-
     # --- Apply tag_policy / item mapping ---
     record_tags: List[str] = []
     final_items: List[Dict[str, Any]] = []
@@ -2049,6 +2018,14 @@ def process_receipt(
         if not cat_tag:
             cat_tag = _fallback_classify_item(mapped)
             _dlog.warning(f"[TAG] fallback_classify_item('{mapped}') → {cat_tag}")
+
+        # 할인 태그 항목은 가격을 음수로 강제 (Gemini가 양수로 반환하는 경우 대비)
+        _DISCOUNT_TAGS = {"etc_discount"}
+        _DISCOUNT_KEYWORDS = {"할인", "절사", "감면", "환급", "조정", "discount", "쿠폰"}
+        is_discount_item = (cat_tag in _DISCOUNT_TAGS) or any(kw in mapped for kw in _DISCOUNT_KEYWORDS)
+        if is_discount_item and price is not None and price > 0:
+            price = -price
+            _dlog.warning(f"[DISCOUNT] forced negative price for '{mapped}': {price}")
 
         final_items.append({
             "itemName": mapped,
@@ -2098,7 +2075,8 @@ def process_receipt(
     # --- draft (DB 저장 없이 OCR 결과만 반환) ---
     draft_id = str(uuid.uuid4())
 
-    total_amount = sum(fi.get("price") or 0 for fi in final_items if fi.get("price") is not None and fi["price"] >= 0)
+    # 할인 항목(음수 가격)도 합산하여 실제 결제 금액 계산
+    total_amount = sum(fi.get("price") or 0 for fi in final_items if fi.get("price") is not None)
 
     pet_weight = None
     try:
@@ -2263,7 +2241,7 @@ def commit_receipt(
 
     total_amount = req.totalAmount if req.totalAmount is not None else 0
     if total_amount <= 0:
-        total_amount = sum(it.price or 0 for it in req.items if it.price is not None and it.price >= 0)
+        total_amount = sum(it.price or 0 for it in req.items if it.price is not None)
 
     pet_weight = req.petWeightAtVisit
     if pet_weight is None:
