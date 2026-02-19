@@ -1649,8 +1649,7 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                         price = it.price
                         if price is not None:
                             price = int(price)
-                            if price < 0:
-                                raise HTTPException(status_code=400, detail="item price must be >= 0")
+                            # 음수 가격 허용 (절사할인, 쿠폰할인 등 할인 항목)
                         category_tag = it.category_tag.strip() if isinstance(it.category_tag, str) and it.category_tag.strip() else None
                         cur.execute("INSERT INTO public.health_items (record_id, item_name, price, category_tag) VALUES (%s, %s, %s, %s)", (record_uuid, item_name, price, category_tag))
                 cur.execute("SELECT id, record_id, item_name, price, category_tag, created_at, updated_at FROM public.health_items WHERE record_id=%s ORDER BY created_at ASC", (record_uuid,))
