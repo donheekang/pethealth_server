@@ -276,6 +276,9 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "복용","경구투여",
         "고가약물","고가약","약물","캡슐조제","캡슐조제료","내복약조제","내복약조제료",
         "조제비","약제료","처방조제","조제약",
+        "zonisamide","leflunomide","gabapentin","phenobarbital","prednisolone",
+        "cyclosporine","oclacitinib","apoquel","atopica","metronidazole",
+        "amoxicillin","cephalexin","enrofloxacin","doxycycline","clindamycin",
     ]},
     # === 처치/수액/응급/수혈 ===
     {"code": "care_injection", "group": "checkup", "aliases": [
