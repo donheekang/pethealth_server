@@ -102,8 +102,8 @@ class Settings(BaseSettings):
     GEMINI_MODEL_NAME: str = "gemini-3-flash-preview"  # ✅ 2.5-flash→3-flash: OCR 정확도 대폭 향상
     GEMINI_TIMEOUT_SECONDS: int = 60      # ✅ 10→60: Gemini 3 이미지 thinking 시간 충분히 확보
 
-    TAG_RECORD_THRESHOLD: int = 125
-    TAG_ITEM_THRESHOLD: int = 140
+    TAG_RECORD_THRESHOLD: int = 90
+    TAG_ITEM_THRESHOLD: int = 90
 
     DB_ENABLED: bool = True
     DATABASE_URL: str = ""
