@@ -61,8 +61,8 @@ _NOISE_TOKENS = [
     "청구", "청구금액", "결제", "결제요청", "결제요청:", "결제예정",
     "거래", "거래일", "거래 일",
     "날짜", "일자", "방문일", "방문 일", "진료일", "진료 일", "발행", "발행일", "발행 일",
-    "입원", "퇴원",
-    "항목", "단가", "수량", "금액",
+    "퇴원",
+    "항목", "단가", "수량",
     "동물명", "환자", "환자명", "품종",
     "경기도", "서울", "인천", "부산", "대구", "대전", "광주", "울산", "세종",
     "충북", "충남", "전북", "전남", "경북", "경남", "강원", "제주",
@@ -528,11 +528,6 @@ def _call_gemini_generate_content(
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     gen_config: Dict[str, Any] = {"temperature": 0.0, "maxOutputTokens": 2048}
 
-    # ✅ Gemini 3: media_resolution으로 이미지 해상도 제어
-    # "media_resolution_high" → 세밀한 텍스트(영수증) 인식에 최적
-    if media_resolution:
-        gen_config["mediaResolution"] = media_resolution
-
     payload = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": gen_config,
@@ -603,7 +598,7 @@ def _gemini_parse_receipt(
     if (ocr_text or "").strip():
         parts.append({"text": "OCR text (may be noisy):\n" + (ocr_text or "")[:6000]})
     try:
-        out = _call_gemini_generate_content(api_key=api_key, model=model, parts=parts, timeout_seconds=timeout_seconds, media_resolution="media_resolution_high")
+        out = _call_gemini_generate_content(api_key=api_key, model=model, parts=parts, timeout_seconds=timeout_seconds)
         j = _extract_json_from_model_text(out)
         if isinstance(j, dict):
             return j
@@ -850,7 +845,7 @@ def _gemini_parse_receipt_full(
             model=model,
             parts=parts,
             timeout_seconds=timeout_seconds,
-            media_resolution="media_resolution_high",  # ✅ Gemini 3: 고해상도 이미지 분석
+            # media_resolution 제거 — API 호환성 문제로 Gemini 호출 실패 원인
         )
         import logging
         _glog = logging.getLogger("ocr_policy")
@@ -1185,7 +1180,7 @@ def process_receipt_image(
     max_pixels: int = 20_000_000,
     receipt_max_width: int = 2048,       # ✅ 1024→2048
     receipt_webp_quality: int = 85,
-    gemini_enabled: bool = False,
+    gemini_enabled: bool = True,
     gemini_api_key: str = "",
     gemini_model_name: str = "gemini-3-flash-preview",
     gemini_timeout: int = 20,            # ✅ 10→20: Gemini 3 thinking 시간 확보
