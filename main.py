@@ -729,6 +729,16 @@ def _receipt_original_path(uid: str, pet_id: str, record_id: str) -> str:
     return f"{_user_prefix(uid, pet_id)}/receipts/{record_id}_original.webp"
 
 
+def _receipt_draft_path(uid: str, pet_id: str, draft_id: str) -> str:
+    """드래프트 마스킹본 경로 (OCR 후 커밋 전)"""
+    return f"{_user_prefix(uid, pet_id)}/draft_receipts/{draft_id}.webp"
+
+
+def _receipt_draft_original_path(uid: str, pet_id: str, draft_id: str) -> str:
+    """드래프트 원본 경로"""
+    return f"{_user_prefix(uid, pet_id)}/draft_receipts/{draft_id}_original.webp"
+
+
 def _doc_pdf_path(uid: str, pet_id: str, doc_type: str, doc_id: str) -> str:
     return f"{_user_prefix(uid, pet_id)}/{doc_type}/{doc_id}.pdf"
 
@@ -2085,8 +2095,8 @@ def process_receipt(
     if not hosp_name and ocr_hospital_name_raw:
         hosp_name = ocr_hospital_name_raw.strip()
 
-    # --- record upsert ---
-    record_uuid = _uuid_or_new(existingRecordId, "existingRecordId")
+    # --- draft (DB 저장 없이 OCR 결과만 반환) ---
+    draft_id = str(uuid.uuid4())
 
     total_amount = sum(fi.get("price") or 0 for fi in final_items if fi.get("price") is not None and fi["price"] >= 0)
 
@@ -2097,10 +2107,11 @@ def process_receipt(
     except Exception:
         pass
 
-    file_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
+    # 드래프트 경로 (/draft_receipts/) — iOS isDraftReceiptPath() 판별용
+    file_path = _receipt_draft_path(uid, str(pet_uuid), draft_id)
     file_size = int(len(webp_bytes))
 
-    logger.info("[receipt] original_webp present=%s, size=%s, webp_bytes size=%s",
+    logger.info("[receipt-draft] original_webp present=%s, size=%s, webp_bytes size=%s",
                 original_webp is not None,
                 len(original_webp) if original_webp else 0,
                 len(webp_bytes))
@@ -2110,19 +2121,190 @@ def process_receipt(
         upload_bytes_to_storage(file_path, webp_bytes, content_type)
         # 원본 (보험 청구 PDF용)
         if original_webp:
-            orig_path = _receipt_original_path(uid, str(pet_uuid), str(record_uuid))
-            logger.info("[receipt] uploading original to %s (%d bytes)", orig_path, len(original_webp))
+            orig_path = _receipt_draft_original_path(uid, str(pet_uuid), draft_id)
+            logger.info("[receipt-draft] uploading original to %s (%d bytes)", orig_path, len(original_webp))
             try:
                 upload_bytes_to_storage(orig_path, original_webp, content_type)
-                # verify upload
-                b = get_bucket()
-                blob = b.blob(orig_path)
-                exists = blob.exists()
-                logger.info("[receipt] original upload verify: exists=%s, path=%s", exists, orig_path)
             except Exception as orig_err:
-                logger.error("[receipt] original upload FAILED: %s", orig_err)
+                logger.error("[receipt-draft] original upload FAILED: %s", orig_err)
     except Exception as e:
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Storage error"))
+
+    # --- hospital candidate 검색 (DB 저장 없이 조회만) ---
+    resp_candidates = []
+    auto_hosp_mgmt = hosp_mgmt
+    try:
+        candidate_limit = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
+        if hosp_name and not hosp_mgmt and candidate_limit > 0:
+            like = f"%{hosp_name}%"
+            clean_name = hosp_name.replace(" ", "")
+            like_clean = f"%{clean_name}%"
+            cands = db_fetchall(
+                """SELECT hospital_mgmt_no, name, road_address, jibun_address, lat, lng, is_custom_entry,
+                   similarity(name, %s) AS score
+                FROM public.hospitals
+                WHERE (is_custom_entry = false OR created_by_uid = %s)
+                  AND (search_vector ILIKE %s
+                       OR REPLACE(name, ' ', '') ILIKE %s
+                       OR REPLACE(%s, ' ', '') ILIKE '%%' || REPLACE(name, ' ', '') || '%%')
+                ORDER BY score DESC
+                LIMIT %s""",
+                (hosp_name, uid, like, like_clean, hosp_name, candidate_limit),
+            )
+            for rank, c in enumerate(cands or [], start=1):
+                resp_candidates.append({
+                    "rank": rank,
+                    "score": float(c.get("score") or 0),
+                    "hospitalMgmtNo": c["hospital_mgmt_no"],
+                    "name": c["name"],
+                    "roadAddress": c.get("road_address"),
+                    "jibunAddress": c.get("jibun_address"),
+                    "lat": c.get("lat"),
+                    "lng": c.get("lng"),
+                    "isCustomEntry": bool(c.get("is_custom_entry")),
+                })
+            if resp_candidates:
+                auto_hosp_mgmt = resp_candidates[0]["hospitalMgmtNo"]
+    except Exception as cand_err:
+        logger.warning("[receipt-draft] hospital candidate search failed (ignored): %s", _sanitize_for_log(repr(cand_err)))
+
+    # ── Response: iOS ReceiptDraftResponseDTO 포맷 (DB 저장 없음) ──
+    resp_items = []
+    for fi in final_items:
+        resp_items.append({
+            "itemName": fi.get("itemName") or "",
+            "price": fi.get("price"),
+            "categoryTag": fi.get("categoryTag"),
+            "standardName": fi.get("standardName"),
+        })
+
+    draft_response = {
+        "mode": "draft",
+        "draftId": draft_id,
+        "petId": str(pet_uuid),
+        "petName": selected_pet_name or None,
+        "petSpecies": (pet.get("species") or "").strip() or None,
+        "draftReceiptPath": file_path,
+        "fileSizeBytes": file_size,
+        "visitDate": vd.isoformat() if hasattr(vd, "isoformat") else str(vd),
+        "hospitalName": hosp_name,
+        "hospitalMgmtNo": auto_hosp_mgmt,
+        "totalAmount": int(total_amount),
+        "petWeightAtVisit": pet_weight,
+        "tags": record_tags,
+        "items": resp_items,
+        "hospitalCandidates": resp_candidates if resp_candidates else None,
+        "hospitalCandidateCount": len(resp_candidates),
+        "hospitalConfirmed": bool(auto_hosp_mgmt),
+        "tagEvidence": None,
+        "ocrText": ocr_text[:2000],
+        "ocrMeta": meta,
+    }
+
+    return draft_response
+
+
+# =========================================================
+# Receipt: Commit draft → DB save
+# =========================================================
+class ReceiptCommitItemDTO(BaseModel):
+    itemName: str
+    price: Optional[int] = None
+    categoryTag: Optional[str] = None
+    standardName: Optional[str] = None
+
+class ReceiptCommitRequestDTO(BaseModel):
+    petId: str
+    draftReceiptPath: str
+    visitDate: str
+    hospitalName: Optional[str] = None
+    hospitalMgmtNo: Optional[str] = None
+    totalAmount: Optional[int] = None
+    petWeightAtVisit: Optional[float] = None
+    tags: List[str] = []
+    items: List[ReceiptCommitItemDTO] = []
+    replaceItems: bool = True
+
+
+@app.post("/api/receipts/commit")
+def commit_receipt(
+    req: ReceiptCommitRequestDTO,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """드래프트를 확정하여 DB에 저장하고 이미지를 최종 경로로 이동"""
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    desired = _infer_membership_tier_from_token(user)
+    db_touch_user(uid, desired_tier=desired)
+
+    pet_uuid = _uuid_or_400(req.petId, "petId")
+    pet = db_fetchone("SELECT id, name, species, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+    if not pet:
+        raise HTTPException(status_code=404, detail="pet not found")
+
+    draft_path = (req.draftReceiptPath or "").strip()
+    if not draft_path:
+        raise HTTPException(status_code=400, detail="draftReceiptPath is required")
+
+    # visit date
+    vd: Optional[date] = None
+    if req.visitDate:
+        try:
+            vd = date.fromisoformat(req.visitDate)
+        except Exception:
+            pass
+    if vd is None:
+        vd = date.today()
+
+    hosp_name = req.hospitalName.strip() if isinstance(req.hospitalName, str) and req.hospitalName.strip() else None
+    hosp_mgmt = req.hospitalMgmtNo.strip() if isinstance(req.hospitalMgmtNo, str) and req.hospitalMgmtNo.strip() else None
+
+    total_amount = req.totalAmount if req.totalAmount is not None else 0
+    if total_amount <= 0:
+        total_amount = sum(it.price or 0 for it in req.items if it.price is not None and it.price >= 0)
+
+    pet_weight = req.petWeightAtVisit
+    if pet_weight is None:
+        try:
+            wkg = pet.get("weight_kg")
+            pet_weight = float(wkg) if wkg is not None else None
+        except Exception:
+            pet_weight = None
+
+    tags = _clean_tags(req.tags)
+
+    # 새 record UUID 생성
+    record_uuid = uuid.uuid4()
+
+    # 드래프트 이미지를 최종 경로로 복사(이동)
+    final_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
+    file_size = 0
+    try:
+        b = get_bucket()
+        src_blob = b.blob(draft_path)
+        if src_blob.exists():
+            b.copy_blob(src_blob, b, final_path)
+            src_blob.delete()
+            dest_blob = b.blob(final_path)
+            dest_blob.reload()
+            file_size = dest_blob.size or 0
+            logger.info("[commit] moved draft %s → %s (%d bytes)", draft_path, final_path, file_size)
+
+            # 원본도 이동 (있으면)
+            draft_orig = draft_path.replace(".webp", "_original.webp")
+            final_orig = _receipt_original_path(uid, str(pet_uuid), str(record_uuid))
+            src_orig = b.blob(draft_orig)
+            if src_orig.exists():
+                b.copy_blob(src_orig, b, final_orig)
+                src_orig.delete()
+                logger.info("[commit] moved draft original %s → %s", draft_orig, final_orig)
+        else:
+            logger.warning("[commit] draft blob not found: %s — proceeding without image", draft_path)
+    except Exception as e:
+        logger.error("[commit] storage move failed: %s", _sanitize_for_log(repr(e)))
+        # 이미지 이동 실패해도 레코드는 저장 진행
 
     try:
         with db_conn() as conn:
@@ -2132,40 +2314,28 @@ def process_receipt(
                     INSERT INTO public.health_records
                         (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path, file_size_bytes)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
-                        hospital_name = EXCLUDED.hospital_name,
-                        visit_date = EXCLUDED.visit_date,
-                        total_amount = EXCLUDED.total_amount,
-                        pet_weight_at_visit = EXCLUDED.pet_weight_at_visit,
-                        tags = EXCLUDED.tags,
-                        receipt_image_path = EXCLUDED.receipt_image_path,
-                        file_size_bytes = EXCLUDED.file_size_bytes
-                    WHERE public.health_records.deleted_at IS NULL
-                        AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = public.health_records.pet_id AND p.user_uid = %s)
                     RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
                         receipt_image_path, file_size_bytes, created_at, updated_at
                     """,
-                    (record_uuid, pet_uuid, hosp_mgmt, hosp_name, vd, total_amount, pet_weight, record_tags, file_path, file_size, uid),
+                    (record_uuid, pet_uuid, hosp_mgmt, hosp_name, vd, total_amount, pet_weight, tags, final_path, file_size),
                 )
                 rec_row = cur.fetchone()
                 if not rec_row:
-                    raise HTTPException(status_code=500, detail=_internal_detail("receipt record upsert failed", kind="DB error"))
+                    raise HTTPException(status_code=500, detail=_internal_detail("commit record insert failed", kind="DB error"))
 
-                cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
-                for fi in final_items:
-                    iname = (fi.get("itemName") or "").strip()
+                # items 저장
+                for it in req.items:
+                    iname = (it.itemName or "").strip()
                     if not iname:
                         continue
-                    iprice = fi.get("price")
-                    if iprice is not None:
-                        iprice = int(iprice)
-                    cur.execute("INSERT INTO public.health_items (record_id, item_name, price, category_tag) VALUES (%s, %s, %s, %s)", (record_uuid, iname, iprice, fi.get("categoryTag")))
+                    iprice = int(it.price) if it.price is not None else None
+                    cat_tag = it.categoryTag.strip() if isinstance(it.categoryTag, str) and it.categoryTag.strip() else None
+                    cur.execute("INSERT INTO public.health_items (record_id, item_name, price, category_tag) VALUES (%s, %s, %s, %s)", (record_uuid, iname, iprice, cat_tag))
 
                 cur.execute("SELECT id, record_id, item_name, price, category_tag, created_at, updated_at FROM public.health_items WHERE record_id=%s ORDER BY created_at ASC", (record_uuid,))
                 items_rows = cur.fetchall() or []
 
-                # --- hospital candidates ---
+                # hospital candidates
                 candidate_limit = int(settings.OCR_HOSPITAL_CANDIDATE_LIMIT or 3)
                 if hosp_name and not hosp_mgmt and candidate_limit > 0:
                     like = f"%{hosp_name}%"
@@ -2193,8 +2363,7 @@ def process_receipt(
                                 )
                             except Exception as ce:
                                 logger.info("[DB] candidate insert failed (ignored): %s", _sanitize_for_log(_pg_message(ce)))
-
-                        # ✅ v2.3.1: Auto-select rank 1 candidate into health_records
+                        # Auto-select rank 1 candidate
                         top_mgmt_no = cands[0]["hospital_mgmt_no"]
                         try:
                             cur.execute(
@@ -2203,80 +2372,56 @@ def process_receipt(
                             )
                             rec_row = dict(rec_row)
                             rec_row["hospital_mgmt_no"] = top_mgmt_no
-                            logger.info("[receipt] Auto-matched hospital: record=%s, mgmt_no=%s", record_uuid, top_mgmt_no)
                         except Exception as am_err:
-                            logger.warning("[receipt] Auto-match failed (ignored): %s", _sanitize_for_log(_pg_message(am_err)))
+                            logger.warning("[commit] Auto-match failed (ignored): %s", _sanitize_for_log(_pg_message(am_err)))
 
-                # Build hospital candidates list for response
-                resp_candidates = []
-                if hosp_name and not hosp_mgmt:
-                    cur.execute(
-                        "SELECT c.rank, c.score, h.hospital_mgmt_no, h.name, h.road_address, h.jibun_address, h.lat, h.lng, h.is_custom_entry FROM public.health_record_hospital_candidates c JOIN public.hospitals h ON h.hospital_mgmt_no = c.hospital_mgmt_no WHERE c.record_id = %s ORDER BY c.rank ASC",
-                        (record_uuid,),
-                    )
-                    cand_rows = cur.fetchall() or []
-                    for cr in cand_rows:
-                        resp_candidates.append({
-                            "rank": int(cr["rank"]),
-                            "score": float(cr["score"]) if cr.get("score") is not None else None,
-                            "hospitalMgmtNo": cr["hospital_mgmt_no"],
-                            "name": cr["name"],
-                            "roadAddress": cr.get("road_address"),
-                            "jibunAddress": cr.get("jibun_address"),
-                            "lat": cr.get("lat"),
-                            "lng": cr.get("lng"),
-                            "isCustomEntry": bool(cr.get("is_custom_entry")),
-                        })
-
-                # ── Response: iOS ReceiptDraftResponseDTO 포맷 ──
-                # Build standardName lookup from final_items
-                std_name_map: Dict[str, str] = {}
-                for fi in final_items:
-                    fn = (fi.get("itemName") or "").strip().lower()
-                    sn = fi.get("standardName") or ""
-                    if fn and sn:
-                        std_name_map[fn] = sn
-
-                resp_items = []
-                for x in items_rows:
-                    iname = (x.get("item_name") or "").strip()
-                    resp_items.append({
-                        "itemName": iname,
-                        "price": x.get("price"),
-                        "categoryTag": x.get("category_tag"),
-                        "standardName": std_name_map.get(iname.lower()),
-                    })
-
-                draft_response = {
-                    "mode": "direct",
-                    "draftId": str(rec_row["id"]),
-                    "petId": str(rec_row["pet_id"]),
-                    "petName": selected_pet_name or None,
-                    "petSpecies": (pet.get("species") or "").strip() or None,
-                    "draftReceiptPath": rec_row.get("receipt_image_path") or file_path,
-                    "fileSizeBytes": int(rec_row.get("file_size_bytes") or file_size),
-                    "visitDate": rec_row["visit_date"].isoformat() if hasattr(rec_row.get("visit_date"), "isoformat") else str(rec_row.get("visit_date") or vd),
-                    "hospitalName": rec_row.get("hospital_name"),
-                    "hospitalMgmtNo": rec_row.get("hospital_mgmt_no"),
-                    "totalAmount": int(rec_row.get("total_amount") or 0),
-                    "petWeightAtVisit": float(rec_row["pet_weight_at_visit"]) if rec_row.get("pet_weight_at_visit") is not None else None,
-                    "tags": rec_row.get("tags") or [],
-                    "items": resp_items,
-                    "hospitalCandidates": resp_candidates if resp_candidates else None,
-                    "hospitalCandidateCount": len(resp_candidates) if resp_candidates else 0,
-                    "hospitalConfirmed": bool(rec_row.get("hospital_mgmt_no")),
-                    "tagEvidence": None,
-                    "ocrText": ocr_text[:2000],
-                    "ocrMeta": meta,
-                }
-
-                return draft_response
+                # HealthRecordRowDTO 포맷 응답
+                payload = dict(rec_row)
+                payload["items"] = [dict(x) for x in items_rows]
+                # pet 정보 추가
+                payload["pet_name"] = pet.get("name")
+                payload["pet_species"] = pet.get("species")
+                return jsonable_encoder(payload)
 
     except HTTPException:
         raise
     except Exception as e:
         _raise_mapped_db_error(e)
         raise
+
+
+# =========================================================
+# Receipt: Delete draft (storage only)
+# =========================================================
+@app.delete("/api/receipts/draft/delete")
+def delete_receipt_draft(
+    draftReceiptPath: str = Query(...),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """드래프트 이미지를 스토리지에서 삭제 (DB 레코드 없음)"""
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    path = (draftReceiptPath or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="draftReceiptPath is required")
+
+    # 보안: 본인 경로인지 확인
+    if not path.startswith(f"users/{uid}/"):
+        raise HTTPException(status_code=403, detail="not your draft")
+
+    deleted = False
+    try:
+        deleted = delete_storage_object_if_exists(path)
+        # 원본도 삭제
+        orig_path = path.replace(".webp", "_original.webp")
+        delete_storage_object_if_exists(orig_path)
+        logger.info("[draft-delete] deleted=%s path=%s", deleted, path)
+    except Exception as e:
+        logger.warning("[draft-delete] error: %s", _sanitize_for_log(repr(e)))
+
+    return {"ok": True, "deleted": deleted, "draftReceiptPath": path}
 
 
 # =========================================================
