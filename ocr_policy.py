@@ -895,6 +895,113 @@ def _gemini_parse_receipt_full(
 
 
 # =========================================================
+# ✅ Claude API를 이용한 영수증 OCR (Gemini 대체)
+# =========================================================
+def _claude_parse_receipt(
+    *,
+    image_bytes: bytes,
+    api_key: str,
+    model: str = "claude-sonnet-4-20250514",
+    timeout_seconds: int = 60,
+    ocr_text: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Claude Vision API로 영수증 이미지를 분석하여 구조화된 JSON 반환."""
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return None
+
+    import logging
+    _clog = logging.getLogger("ocr_policy.claude")
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    mime = "image/png"
+    if image_bytes[:4] == b"RIFF":
+        mime = "image/webp"
+    elif image_bytes[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+
+    # Claude용 프롬프트 (Gemini와 동일한 구조)
+    user_content: List[Dict[str, Any]] = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime, "data": b64},
+        },
+        {
+            "type": "text",
+            "text": _GEMINI_RECEIPT_PROMPT,  # 같은 프롬프트 재사용
+        },
+    ]
+
+    # Vision OCR 텍스트 참고자료 추가
+    if (ocr_text or "").strip():
+        user_content.append({
+            "type": "text",
+            "text": (
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "MANDATORY REFERENCE: Google Vision OCR text\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "CRITICAL: Cross-check EVERY price and item name against this text.\n"
+                "This OCR text is machine-read and highly accurate for NUMBERS.\n"
+                "If any item in this text is missing from your extraction, ADD IT.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                + (ocr_text or "").strip()[:6000]
+            ),
+        })
+
+    import urllib.request
+
+    payload = {
+        "model": model,
+        "max_tokens": 8192,
+        "messages": [
+            {"role": "user", "content": user_content}
+        ],
+    }
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_seconds)) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+        j = json.loads(data)
+
+        # Claude 응답에서 텍스트 추출
+        content_blocks = j.get("content", [])
+        txt_parts = []
+        for block in content_blocks:
+            if block.get("type") == "text":
+                txt_parts.append(block.get("text", ""))
+
+        raw_text = "\n".join(txt_parts).strip()
+        _clog.info(f"[Claude-call] raw_len={len(raw_text)}, preview={repr(raw_text[:300])}")
+
+        # JSON 추출
+        result = _extract_json_from_model_text(raw_text)
+        _clog.info(f"[Claude-call] parsed={'ok' if isinstance(result, dict) else 'FAIL'}")
+
+        if isinstance(result, dict):
+            return result
+
+    except Exception as e:
+        _clog.error(f"[Claude-call] EXCEPTION: {type(e).__name__}: {e}")
+
+    return None
+
+
+# =========================================================
 # ✅ Valid standard tag codes (ReceiptTags.swift 완전 동기화)
 # =========================================================
 _VALID_TAG_CODES: set = {
@@ -1316,18 +1423,24 @@ def process_receipt(
     g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")) or "gemini-3-flash-preview"
     g_timeout = max(60, int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60") or "60")))
 
+    # ✅ Claude API 설정
+    c_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    c_model = os.getenv("CLAUDE_OCR_MODEL", "claude-sonnet-4-20250514").strip()
+    c_timeout = max(60, int(os.getenv("CLAUDE_OCR_TIMEOUT", "90") or "90"))
+    c_enabled = bool(c_key)  # API 키가 있으면 자동 활성화
+
     hints: Dict[str, Any] = {
         "ocrEngine": "none",
         "geminiUsed": False,
-        "pipeline": "gemini_first",
+        "pipeline": "claude_first" if c_enabled else "gemini_first",
     }
 
-    gemini_parsed = None
-    gemini_tags: List[str] = []
+    ai_parsed = None
+    ai_tags: List[str] = []
 
     import logging
     _log = logging.getLogger("ocr_policy")
-    _log.info(f"[Gemini] enabled={g_enabled}, key_present={bool(g_key.strip())}, model={g_model}")
+    _log.info(f"[AI] claude_enabled={c_enabled}, gemini_enabled={g_enabled}, claude_model={c_model}, gemini_model={g_model}")
 
     # ✅ Step 1: Google Vision OCR 먼저 실행 (텍스트 추출)
     ocr_text = ""
@@ -1359,9 +1472,35 @@ def process_receipt(
             except Exception:
                 pass
 
-    # ✅ Step 2: Gemini 실행 (이미지 + Vision OCR 텍스트 동시 전달)
-    if g_enabled and g_key.strip():
+    # ✅ Step 2: AI 영수증 분석 (Claude 우선 → Gemini 폴백)
+    ai_result_json = None
+
+    # --- 2a: Claude API 시도 ---
+    if c_enabled:
         try:
+            _log.info(f"[Claude] calling model={c_model}, timeout={c_timeout}")
+            cj = _claude_parse_receipt(
+                image_bytes=ocr_image_bytes,
+                api_key=c_key,
+                model=c_model,
+                timeout_seconds=c_timeout,
+                ocr_text=ocr_text,
+            )
+            if isinstance(cj, dict):
+                ai_result_json = cj
+                hints["ocrEngine"] = f"claude:{c_model}"
+                hints["claudeUsed"] = True
+                _log.info(f"[Claude] SUCCESS: items={len(cj.get('items', []))}")
+            else:
+                _log.warning("[Claude] returned non-dict, falling back to Gemini")
+        except Exception as e:
+            _log.error(f"[Claude] ERROR: {type(e).__name__}: {e}")
+            hints["claudeError"] = str(e)[:200]
+
+    # --- 2b: Gemini 폴백 (Claude 실패 시) ---
+    if ai_result_json is None and g_enabled and g_key.strip():
+        try:
+            _log.info(f"[Gemini] fallback: model={g_model}, timeout={g_timeout}")
             gj = _gemini_parse_receipt_full(
                 image_bytes=ocr_image_bytes,
                 api_key=g_key,
@@ -1369,41 +1508,46 @@ def process_receipt(
                 timeout_seconds=g_timeout,
                 ocr_text=ocr_text,
             )
-            _log.info(f"[Gemini] raw result type={type(gj).__name__}, keys={list(gj.keys()) if isinstance(gj, dict) else 'N/A'}")
             if isinstance(gj, dict):
-                gemini_parsed, gemini_tags = _normalize_gemini_full_result(gj)
-                hints["geminiUsed"] = True
+                ai_result_json = gj
                 hints["ocrEngine"] = f"gemini:{g_model}"
-                _log.info(f"[Gemini] items={len(gemini_parsed.get('items', []))}, tags={gemini_tags}")
-
-                # ✅ Step 3: Gemini ↔ Vision OCR 가격 교차검증
-                if ocr_text and gemini_parsed.get("items"):
-                    before_count = len(gemini_parsed["items"])
-                    gemini_parsed["items"] = _cross_validate_prices(
-                        gemini_parsed["items"], ocr_text
-                    )
-                    corrected_count = sum(
-                        1 for it in gemini_parsed["items"] if it.get("_price_corrected")
-                    )
-                    if corrected_count > 0:
-                        _log.warning(f"[XVAL] {corrected_count}/{before_count} prices corrected by Vision OCR")
-                        hints["xval_corrected"] = corrected_count
-
-                    # ✅ Step 4: 누락 항목 복구 (Vision OCR에서 보충)
-                    total_amt = gemini_parsed.get("totalAmount")
-                    before_recover = len(gemini_parsed["items"])
-                    gemini_parsed["items"] = _recover_missing_items(
-                        gemini_parsed["items"], ocr_text, total_amt
-                    )
-                    recovered_count = len(gemini_parsed["items"]) - before_recover
-                    if recovered_count > 0:
-                        _log.warning(f"[RECOVER] {recovered_count} items recovered from Vision OCR")
-                        hints["recovered_items"] = recovered_count
+                hints["geminiUsed"] = True
+                _log.info(f"[Gemini] fallback SUCCESS: items={len(gj.get('items', []))}")
         except Exception as e:
             _log.error(f"[Gemini] ERROR: {e}")
             hints["geminiError"] = str(e)[:200]
-    else:
-        _log.warning(f"[Gemini] SKIPPED: enabled={g_enabled}, key_present={bool(g_key.strip())}")
+
+    if ai_result_json is None:
+        _log.warning("[AI] both Claude and Gemini failed or disabled")
+
+    # --- 정규화 + 후처리 ---
+    if isinstance(ai_result_json, dict):
+        ai_parsed, ai_tags = _normalize_gemini_full_result(ai_result_json)
+        _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}")
+
+        # ✅ Step 3: AI ↔ Vision OCR 가격 교차검증
+        if ocr_text and ai_parsed.get("items"):
+            before_count = len(ai_parsed["items"])
+            ai_parsed["items"] = _cross_validate_prices(
+                ai_parsed["items"], ocr_text
+            )
+            corrected_count = sum(
+                1 for it in ai_parsed["items"] if it.get("_price_corrected")
+            )
+            if corrected_count > 0:
+                _log.warning(f"[XVAL] {corrected_count}/{before_count} prices corrected by Vision OCR")
+                hints["xval_corrected"] = corrected_count
+
+            # ✅ Step 4: 누락 항목 복구 (Vision OCR에서 보충)
+            total_amt = ai_parsed.get("totalAmount")
+            before_recover = len(ai_parsed["items"])
+            ai_parsed["items"] = _recover_missing_items(
+                ai_parsed["items"], ocr_text, total_amt
+            )
+            recovered_count = len(ai_parsed["items"]) - before_recover
+            if recovered_count > 0:
+                _log.warning(f"[RECOVER] {recovered_count} items recovered from Vision OCR")
+                hints["recovered_items"] = recovered_count
 
     # ✅ 저장/표시용은 display 이미지 사용 (용량 절약)
     original_webp = _to_webp_bytes(img_display, quality=int(receipt_webp_quality or 85))
@@ -1411,22 +1555,22 @@ def process_receipt(
     redacted_webp = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
     webp_bytes = redacted_webp
 
-    if gemini_parsed and gemini_parsed.get("items"):
-        parsed = gemini_parsed
+    if ai_parsed and ai_parsed.get("items"):
+        parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
-        hints["pipeline"] = "gemini_primary"
+        hints["pipeline"] = hints.get("pipeline", "ai_primary")
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
         hints["pipeline"] = "vision_regex_fallback"
 
-        if gemini_parsed:
-            if not parsed.get("hospitalName") and gemini_parsed.get("hospitalName"):
-                parsed["hospitalName"] = gemini_parsed["hospitalName"]
-            if not parsed.get("visitDate") and gemini_parsed.get("visitDate"):
-                parsed["visitDate"] = gemini_parsed["visitDate"]
-            if not parsed.get("totalAmount") and gemini_parsed.get("totalAmount"):
-                parsed["totalAmount"] = gemini_parsed["totalAmount"]
+        if ai_parsed:
+            if not parsed.get("hospitalName") and ai_parsed.get("hospitalName"):
+                parsed["hospitalName"] = ai_parsed["hospitalName"]
+            if not parsed.get("visitDate") and ai_parsed.get("visitDate"):
+                parsed["visitDate"] = ai_parsed["visitDate"]
+            if not parsed.get("totalAmount") and ai_parsed.get("totalAmount"):
+                parsed["totalAmount"] = ai_parsed["totalAmount"]
 
     if not isinstance(parsed.get("items"), list):
         parsed["items"] = []
@@ -1438,7 +1582,7 @@ def process_receipt(
             parsed["totalAmount"] = None
     parsed["ocrText"] = (ocr_text or "")[:8000]
 
-    hints["tags"] = gemini_tags if gemini_tags else []
+    hints["tags"] = ai_tags if ai_tags else []
 
     return webp_bytes, original_webp, parsed, hints
 
