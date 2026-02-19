@@ -1344,7 +1344,7 @@ def process_receipt(
     # ✅ 원본 해상도 보존 (저장/표시용)
     img_display = _resize_to_width(img.copy(), int(receipt_max_width or 0))
 
-    # ✅ OCR용 이미지: 더 높은 해상도 유지 + 전처리 적용
+    # ✅ OCR용 이미지: 더 높은 해상도 유지 + 전처리 적용 (Vision OCR 전용)
     ocr_max_w = max(int(receipt_max_width or 0), 2048)  # OCR엔 최소 2048px 보장
     img_ocr = _resize_to_width(img.copy(), ocr_max_w)
     img_ocr = _preprocess_for_ocr(img_ocr)
@@ -1352,6 +1352,12 @@ def process_receipt(
     ocr_buf = io.BytesIO()
     img_ocr.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
+
+    # ✅ Claude용 이미지: 원본 컬러 그대로 (전처리 없음 — Claude Vision은 원본이 더 정확)
+    claude_buf = io.BytesIO()
+    img_claude = _resize_to_width(img.copy(), ocr_max_w)
+    img_claude.save(claude_buf, format="PNG")
+    claude_image_bytes = claude_buf.getvalue()
 
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
     g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
@@ -1410,16 +1416,16 @@ def process_receipt(
     # ✅ Step 2: AI 영수증 분석 (Claude 우선 → Gemini 폴백)
     ai_result_json = None
 
-    # --- 2a: Claude API 시도 ---
+    # --- 2a: Claude API 시도 (원본 컬러 이미지 사용) ---
     if c_enabled:
         try:
             _log.info(f"[Claude] calling model={c_model}, timeout={c_timeout}")
             cj = _claude_parse_receipt(
-                image_bytes=ocr_image_bytes,
+                image_bytes=claude_image_bytes,  # ✅ 원본 컬러 이미지 (전처리 없음)
                 api_key=c_key,
                 model=c_model,
                 timeout_seconds=c_timeout,
-                ocr_text=ocr_text,
+                ocr_text="",  # ✅ OCR 텍스트 안 보냄 — Claude가 이미지만 직접 읽음
             )
             if isinstance(cj, dict):
                 ai_result_json = cj
