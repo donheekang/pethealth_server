@@ -1,872 +1,1527 @@
-# tag_policy.py (PetHealth+)
+# ocr_policy.py (PetHealth+)
+# OCR + minimal redaction + receipt parsing
+# Returns: (webp_bytes, parsed_dict, hints_dict)
 from __future__ import annotations
+import os
+import io
 import re
+import json
+import math
+import base64
+import threading
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
 
-TAG_CATALOG: List[Dict[str, Any]] = [
-    # === 검사 — 영상 ===
-    {"code": "exam_xray", "group": "exam", "aliases": [
-        "x-ray","xray","xr","x ray","radiograph","radiology","radiographic",
-        "엑스레이","방사선","x선","x선촬영","치아 방사선","dental xray","dental x-ray",
-        "방사선촬영","방사선검사","흉부방사선","복부방사선","흉부촬영","복부촬영",
-        "사지촬영","골반촬영","척추촬영","두부촬영","전신촬영","vd","dv","lateral",
-    ]},
-    {"code": "exam_ct", "group": "exam", "aliases": [
-        "ct","ct촬영","ct검사","ct조영","ct scan","computed tomography",
-        "컴퓨터단층촬영","씨티","조영ct","contrast ct","ct스캔",
-    ]},
-    {"code": "exam_mri", "group": "exam", "aliases": [
-        "mri","mri촬영","mri검사","mri scan","magnetic resonance","자기공명","엠알아이",
-    ]},
-    {"code": "exam_endoscope", "group": "exam", "aliases": [
-        "내시경","endoscopy","endoscope","gastroscopy","위내시경","장내시경",
-        "기관지내시경","비강내시경","방광경","arthroscopy","관절경","내시경검사",
-        "내시경생검","이물내시경","식도내시경","직장내시경","비내시경",
-    ]},
-    {"code": "exam_biopsy", "group": "exam", "aliases": [
-        "생검","조직검사","biopsy","tissue biopsy","fna","fine needle",
-        "세침흡인","병리검사","조직병리","histopathology","pathology",
-        "세포검사","세포학","세포진","세포학적검사",
-    ]},
-    # === 초음파 세분화 ===
-    {"code": "exam_echo", "group": "exam", "aliases": [
-        "심장초음파","심초음파","심장 초음파","cardiac ultrasound","cardiac us",
-        "echocardiogram","echocardiography","echo","ecco","심장 에코","에코",
-        "심장us","심장 us",
-    ]},
-    {"code": "exam_us_abdomen", "group": "exam", "aliases": [
-        "복부초음파","복부 초음파","abdominal ultrasound","abdominal us",
-        "abd us","abd sono","복부에코","복부us","abd초음파",
-    ]},
-    {"code": "exam_us_general", "group": "exam", "aliases": [
-        "ultrasound","sono","sonography","us","초음파","초음파검사",
-        "근골격초음파","경부초음파","갑상선초음파","방광초음파","신장초음파",
-    ]},
-    # === 혈액검사 세분화 ===
-    {"code": "exam_blood_cbc", "group": "exam", "aliases": [
-        "cbc","complete blood count","혈구검사","혈구","CBC검사","blood count",
-        "혈구계산","혈구분석","전혈구","전혈구검사","혈구측정",
-    ]},
-    {"code": "exam_blood_chem", "group": "exam", "aliases": [
-        "chemistry","biochem","biochemistry","생화학","생화학검사",
-        "간수치","신장수치","간기능","신장기능","chemistry panel","chem",
-        "간기능검사","신기능검사","신장기능검사","간패널","chem10","chem17","chem12",
-        "간효소","alt","ast","bun","creatinine","크레아티닌","알부민","albumin",
-        "총단백","빌리루빈","bilirubin","알피","alp","ggt","gpt","got",
-    ]},
-    {"code": "exam_blood_general", "group": "exam", "aliases": [
-        "blood test","profile","혈액","혈액검사","피검사","피검","blood work",
-        "bloodwork","혈액프로필","혈액 프로필","혈액 패널","혈액종합","종합혈액",
-        "혈액정밀","idexx","vcheck","catalyst","프로켐","prochem","혈액검사비",
-    ]},
-    {"code": "exam_blood_type", "group": "exam", "aliases": [
-        "혈액형","혈액형검사","blood type","blood typing","crossmatch","교차시험",
-        "교차적합","혈액형판정",
-    ]},
-    {"code": "exam_coagulation", "group": "exam", "aliases": [
-        "응고검사","응고","coagulation","pt","aptt","pt/aptt","프로트롬빈",
-        "피브리노겐","fibrinogen","응고시간","출혈시간",
-    ]},
-    {"code": "exam_electrolyte", "group": "exam", "aliases": [
-        "전해질","전해질검사","electrolyte","나트륨","칼륨","칼슘",
-        "calcium","phosphorus","인","마그네슘","magnesium","na","cl","전해질패널",
-    ]},
-    {"code": "exam_crp", "group": "exam", "aliases": [
-        "crp","c-reactive protein","염증수치","염증검사","염증마커","crp검사","씨알피",
-        "saa","혈청아밀로이드",
-    ]},
-    # === 심장검사 세분화 ===
-    {"code": "exam_ecg", "group": "exam", "aliases": [
-        "ecg","ekg","심전도","electrocardiogram","electrocardiography","심전도검사","12 lead",
-    ]},
-    {"code": "exam_heart_general", "group": "exam", "aliases": [
-        "cardiac","heart","심장검사","심장 검사","심장","heart check","cardiac exam","심장평가",
-    ]},
-    # === 호르몬 ===
-    {"code": "exam_hormone", "group": "exam", "aliases": [
-        "호르몬","호르몬검사","hormone","hormone test","t4","t3","ft4","tsh",
-        "갑상선","갑상선검사","thyroid","cortisol","코르티솔","acth","부신","부신검사","adrenal",
-        "갑상선기능","갑상선호르몬","에스트로겐","프로게스테론","testosterone","테스토스테론",
-        "인슐린","insulin","성장호르몬","growth hormone",
-    ]},
-    # === 기타 검사 ===
-    {"code": "exam_lab_panel", "group": "exam", "aliases": [
-        "lab panel","screening","health check","종합검사","종합검진","패널검사",
-        "건강검진","건강검사","정기검진","종합건강","기본검진","annual check",
-        "예방검진","스크리닝","건강진단",
-    ]},
-    {"code": "exam_urine", "group": "exam", "aliases": [
-        "urinalysis","ua","urine test","요검사","소변검사","뇨검사","요분석",
-        "요비중","upc","소변배양","urine culture","요침사","요시험지",
-    ]},
-    {"code": "exam_fecal", "group": "exam", "aliases": [
-        "fecal","stool test","대변검사","분변검사","배변검사","변검사",
-        "분변부유","분변직접","분변도말","기생충검사",
-    ]},
-    {"code": "exam_fecal_pcr", "group": "exam", "aliases": [
-        "fecal pcr","stool pcr","gi pcr","panel pcr","대변pcr","대변 pcr","분변 pcr",
-        "gi패널","장패널","소화기패널",
-    ]},
-    {"code": "exam_sdma", "group": "exam", "aliases": [
-        "sdma","symmetrical dimethylarginine","idexx sdma","신장마커","신장검사",
-        "신기능마커","조기신장",
-    ]},
-    {"code": "exam_probnp", "group": "exam", "aliases": [
-        "probnp","pro bnp","pro-bnp","ntprobnp","nt-probnp","bnp","cardiopet",
-        "심장마커","프로비엔피","심장바이오마커",
-    ]},
-    {"code": "exam_fructosamine", "group": "exam", "aliases": [
-        "fructosamine","fru","glycated albumin","ga","프럭토사민","당화알부민",
-    ]},
-    {"code": "exam_glucose_curve", "group": "exam", "aliases": [
-        "glucose curve","blood glucose curve","bg curve","혈당곡선","혈당커브","연속혈당",
-        "혈당모니터링","glucose monitoring","혈당측정",
-    ]},
-    {"code": "exam_blood_gas", "group": "exam", "aliases": [
-        "blood gas","bga","bgas","i-stat","istat","혈액가스","가스분석",
-        "동맥혈가스","정맥혈가스","abg","vbg",
-    ]},
-    {"code": "exam_allergy", "group": "exam", "aliases": [
-        "allergy test","ige","atopy","알러지검사","알레르기검사","알러지","알레르기",
-        "아토피검사","아토피","알레르겐","allergen","식이알러지","환경알러지",
-    ]},
-    {"code": "exam_eye", "group": "exam", "aliases": [
-        "schirmer","fluorescein","iop","ophthalmic exam","안압","형광염색",
-        "안과검사","안과","눈검사","안압측정","눈물량검사","쉬르머","안저검사",
-        "세극등","slit lamp","슬릿램프","안구초음파","망막검사",
-    ]},
-    {"code": "exam_skin", "group": "exam", "aliases": [
-        "skin scraping","cytology","fungal test","malassezia","피부스크래핑",
-        "피부검사","진균","곰팡이","말라세지아","피부사상균","피부도말",
-        "피부세포","tape cytology","테이프도말","우드램프","wood lamp","dtm",
-        "피부배양","진균배양","피부조직검사",
-    ]},
-    {"code": "exam_ear", "group": "exam", "aliases": [
-        "귀검사","이경","검이경","이경검사","otoscope","otoscopy","이도검사",
-        "귀내시경","이도내시경","ear exam","ear examination","ear check",
-        "검사-귀","귀-set","귀set","이경+현미경","귀검진","이도검진",
-        "귀진찰","외이도검사","이개검사",
-        "검사귀set","검사귀","귀현미경","귀현미경도말",
-    ]},
-    {"code": "exam_microscope", "group": "exam", "aliases": [
-        "현미경","현미경검사","현미경도말","도말검사","도말","microscopy",
-        "microscope","현미경관찰","도말표본","smear","smear test","도말시험",
-        "현미경분석","현미경판독",
-    ]},
-    # === 감염병 검사 (snap test 등) ===
-    {"code": "exam_snap_test", "group": "exam", "aliases": [
-        "snap","snap test","snap4dx","4dx","snap fiv","snap felv","fiv","felv",
-        "fiv/felv","심장사상충검사","hw검사","hw test","heartworm test","항원검사",
-        "항체검사","pcr","pcr검사","파보","디스템퍼","파보바이러스",
-        "parvovirus","distemper","panleukopenia","범백","코로나검사","giardia","지아디아",
-        "snap combo","combo test","키트검사","신속검사","rapid test",
-    ]},
-    # === 기본 신체검사 / 활력징후 ===
-    {"code": "exam_vitals", "group": "exam", "aliases": [
-        "혈압","혈압측정","혈압검사","blood pressure","bp측정","bp",
-        "체온","체온측정","체중","체중측정","몸무게","체중계",
-        "심박","심박수","맥박","활력징후","vitals","vital sign",
-        "신체검사","이학적검사","physical exam","physical examination","pe",
-        "기본검사","기본신체","바이탈","바이탈사인","bcs","체형평가",
-    ]},
-    # === 예방접종 ===
-    {"code": "vaccine_comprehensive", "group": "vaccine", "aliases": [
-        "dhpp","dhppi","dhlpp","5-in-1","6-in-1","fvrcp","combo vaccine",
-        "종합백신","혼합백신","5종백신","6종백신","5종접종","6종접종",
-        "5종","6종","7종","8종","종합접종","종합예방접종","예방접종",
-        "혼합예방접종","기본접종","기본예방접종","puppy shot","kitty shot",
-        "5종혼합","6종혼합","종합예방","종합주사","dhppl","dapp","접종",
-    ]},
-    {"code": "vaccine_rabies", "group": "vaccine", "aliases": [
-        "rabies","rabbies","rabie","rabis","rab","rabi","ra","rabies vac","rabies vaccine",
-        "광견병","광견","광견병백신","광견병접종","광견병주사",
-    ]},
-    {"code": "vaccine_kennel", "group": "vaccine", "aliases": [
-        "kennel cough","bordetella","켄넬코프","기관지염백신","보르데텔라",
-        "kennel","kc","기관지보르데텔라",
-    ]},
-    {"code": "vaccine_corona", "group": "vaccine", "aliases": [
-        "corona","coronavirus","corona enteritis","코로나","코로나장염",
-        "코로나바이러스","코로나백신","코로나접종",
-    ]},
-    {"code": "vaccine_lepto", "group": "vaccine", "aliases": [
-        "lepto","leptospirosis","leptospira","lepto2","lepto4","l2","l4",
-        "렙토","렙토2","렙토4","렙토스피라",
-    ]},
-    {"code": "vaccine_parainfluenza", "group": "vaccine", "aliases": [
-        "parainfluenza","cpiv","cpi","pi","파라인플루엔자","파라인","파라",
-    ]},
-    {"code": "vaccine_fip", "group": "vaccine", "aliases": [
-        "fip","primucell","feline infectious peritonitis","전염성복막염","복막염",
-        "복막염백신",
-    ]},
-    # === 예방약 ===
-    {"code": "prevent_heartworm", "group": "preventive_med", "aliases": [
-        "heartworm","hw","dirofilaria","heartgard","심장사상충","하트가드",
-        "넥스가드스펙트라","simparica trio","revolution","심장사상충예방",
-        "하트가드플러스","하트가드정","인터셉터","interceptor","밀베마이신",
-        "프로하트","proheart","모시덱틴","moxidectin","셀라멕틴","selamectin",
-        "사상충","사상충예방","사상충약",
-    ]},
-    {"code": "prevent_external", "group": "preventive_med", "aliases": [
-        "flea","tick","bravecto","nexgard","frontline","revolution",
-        "벼룩","진드기","외부기생충","넥스가드","브라벡토","프론트라인",
-        "어드밴티지","advantage","advantix","세레스토","seresto","외부구충",
-        "레볼루션","크레델리오","credelio","simparica","심파리카","벼룩약","진드기약",
-    ]},
-    {"code": "prevent_deworming", "group": "preventive_med", "aliases": [
-        "deworm","deworming","drontal","milbemax","fenbendazole","panacur",
-        "구충","구충제","내부기생충","드론탈","밀베맥스","펜벤다졸",
-        "내부구충","회충","촌충","편충","구충약","기생충약","프라지콴텔","praziquantel",
-    ]},
-    # === 처방약 ===
-    {"code": "medicine_antibiotic", "group": "medicine", "aliases": [
-        "antibiotic","abx","amoxicillin","clavamox","augmentin","cephalexin",
-        "convenia","doxycycline","metronidazole","baytril","항생제",
-        "아목시실린","세팔렉신","독시사이클린","메트로니다졸","엔로플록사신",
-        "enrofloxacin","marbofloxacin","마보플록사신","항생","클라바목스",
-        "세파졸린","cefazolin","아지스로마이신","azithromycin","린코마이신","lincomycin",
-        "클린다마이신","clindamycin",
-    ]},
-    {"code": "medicine_anti_inflammatory", "group": "medicine", "aliases": [
-        "nsaid","anti-inflammatory","meloxicam","metacam","carprofen","rimadyl",
-        "onsior","galliprant","소염","소염제","멜록시캄","카프로펜","온시올","갈리프란트",
-        "소염진통","소염진통제","firocoxib","피록시캄","로베나콕시브","robenacoxib",
-    ]},
-    {"code": "medicine_painkiller", "group": "medicine", "aliases": [
-        "analgesic","tramadol","gabapentin","buprenorphine","진통","진통제",
-        "트라마돌","가바펜틴","부프레노르핀","펜타닐","fentanyl","모르핀","morphine",
-        "통증관리","통증치료","pain","painkiller",
-    ]},
-    {"code": "medicine_steroid", "group": "medicine", "aliases": [
-        "steroid","prednisone","prednisolone","dexamethasone","스테로이드",
-        "프레드니손","프레드니솔론","덱사메타손","부데소니드","budesonide",
-        "트리암시놀론","triamcinolone","코르티코","corticosteroid",
-    ]},
-    {"code": "medicine_gi", "group": "medicine", "aliases": [
-        "famotidine","pepcid","omeprazole","sucralfate","cerenia","ondansetron",
-        "reglan","위장약","구토","설사","장염","위장관","소화제","지사제",
-        "파모티딘","오메프라졸","세레니아","수크랄페이트","메토클로프라미드",
-        "정장제","프로바이오틱스","probiotics","유산균","소화효소",
-    ]},
-    {"code": "medicine_eye", "group": "medicine", "aliases": [
-        "eye drop","ophthalmic","tobramycin","ofloxacin","cyclosporine",
-        "안약","점안","결막염","각막","점안액","안연고","눈약","안과약",
-        "인공눈물","타크로리무스","tacrolimus","tobra","겐타마이신","gentamicin",
-    ]},
-    {"code": "medicine_ear", "group": "medicine", "aliases": [
-        "ear drop","otic","otitis","otomax","surolan","posatex","easotic",
-        "귀약","이염","외이염","점이액","귀연고","이도약","중이염","이개",
-        "오토맥스","수로란","포사텍스","이소틱",
-    ]},
-    {"code": "medicine_skin", "group": "medicine", "aliases": [
-        "dermatitis","chlorhexidine","ketoconazole","miconazole","피부약","피부염",
-        "클로르헥시딘","케토코나졸","미코나졸","피부연고","연고","외용제","외용약",
-        "샴푸","medicated shampoo","약용샴푸","항진균제","antifungal",
-    ]},
-    {"code": "medicine_allergy", "group": "medicine", "aliases": [
-        "apoquel","cytopoint","cetirizine","zyrtec","benadryl","알러지","알레르기","가려움",
-        "아포퀠","사이토포인트","세티리진","항히스타민","antihistamine",
-        "아토피치료","아토피약","오클라시티닙","oclacitinib",
-    ]},
-    {"code": "medicine_oral", "group": "medicine", "aliases": [
-        "내복약","경구약","먹는약","oral","oral med","oral medication","po","per os",
-        "처방약","약값","처방료","조제료","약제비","약제","투약","투약료","복약",
-        "약비","처방전","처방","조제","약국","약","medicine","medication","med",
-        "복용","경구투여",
-        "고가약물","고가약","약물","캡슐조제","캡슐조제료","내복약조제","내복약조제료",
-        "조제비","약제료","처방조제","조제약",
-        "zonisamide","leflunomide","gabapentin","phenobarbital","prednisolone",
-        "cyclosporine","oclacitinib","apoquel","atopica","metronidazole",
-        "amoxicillin","cephalexin","enrofloxacin","doxycycline","clindamycin",
-    ]},
-    # === 처치/수액/응급/수혈 ===
-    {"code": "care_injection", "group": "checkup", "aliases": [
-        "inj","injection","shot","sc","im","iv","주사","주사제","피하주사",
-        "근육주사","정맥주사","주사료","주사비","주사처치",
-        "피하","근육","정맥","주사투여","주사비용","예방주사",
-    ]},
-    {"code": "care_fluid", "group": "checkup", "aliases": [
-        "수액","링거","iv fluid","fluid therapy","수액처치","수액치료",
-        "피하수액","정맥수액","lactated ringer","생리식염수","normal saline",
-        "수액세트","링거액","hartmann","수액비","수액료",
-        "수액제","링거세트","수액팩","보충수액","유지수액","lr","ns",
-    ]},
-    {"code": "care_transfusion", "group": "checkup", "aliases": [
-        "수혈","transfusion","blood transfusion","전혈","packed rbc","혈장",
-        "plasma","수혈비","혈액제제","fresh frozen plasma","ffp",
-        "적혈구농축액","prbc","혈소판","platelet","수혈료",
-    ]},
-    {"code": "care_oxygen", "group": "checkup", "aliases": [
-        "산소","산소치료","산소방","산소텐트","oxygen","oxygen therapy","o2",
-        "산소공급","산소케이지","산소실","네뷸라이저","nebulizer","네블라이저",
-    ]},
-    {"code": "care_emergency", "group": "checkup", "aliases": [
-        "응급","응급처치","응급진료","emergency","ER","응급비","응급진료비",
-        "야간진료","야간응급","심폐소생","CPR","cpr","야간","야간비",
-        "야간진료비","공휴일진료","휴일진료","특수시간",
-    ]},
-    {"code": "care_catheter", "group": "checkup", "aliases": [
-        "카테터","도뇨관","유치도뇨관","catheter","urinary catheter",
-        "정맥카테터","iv catheter","도뇨","방광세척","요도카테터",
-        "방광천자","cystocentesis","복강천자","흉강천자","배액","드레인","drain",
-    ]},
-    {"code": "care_procedure_fee", "group": "checkup", "aliases": [
-        "procedure fee","treatment fee","handling fee","처치료","시술료",
-        "처치비","시술비","처치","시술","관리료","관리비","관리",
-    ]},
-    {"code": "care_dressing", "group": "checkup", "aliases": [
-        "dressing","bandage","gauze","wrap","disinfection","드레싱","붕대",
-        "거즈","소독","세척","상처처치","상처관리","상처소독","창상처치",
-        "반창고","테이핑","taping","스플린트","splint","부목",
-    ]},
-    {"code": "care_anal_gland", "group": "checkup", "aliases": [
-        "항문낭","항문낭짜기","항문낭세척","anal gland","anal sac","항문선","항문낭 압출",
-        "항문","항문낭압출","항문낭배출",
-    ]},
-    {"code": "care_ear_flush", "group": "checkup", "aliases": [
-        "귀세척","이도세척","ear flush","ear cleaning","ear irrigation","귀청소",
-        "귀관리","이도관리","외이도세정","외이도세척","이도세정","귀세정",
-        "ear wash","외이세정","외이세척",
-    ]},
-    # === 입원 ===
-    {"code": "hospitalization", "group": "checkup", "aliases": [
-        "입원","입원비","입원료","hospitalization","hospital stay","icu",
-        "중환자","중환자실","집중치료","입원관리","입원케어","케이지","cage",
-        "입원실","입원1일","입원관찰","데이케어","day care","반일입원","1일입원",
-        "입원치료","관찰입원","모니터링입원","입원모니터링",
-    ]},
-    # === 수술 세분화 ===
-    {"code": "surgery_general", "group": "surgery", "aliases": [
-        "surgery","operation","수술","봉합","마취","마취료","마취-호흡",
-        "흡입마취","전신마취","국소마취","수술비","수술료","수술재료","수술재료비","봉합사",
-        "수술준비","수술세트","수술전처치","수술후관리","마취관리","마취감시",
-        "마취모니터링","마취유지","삽관","기관삽관","수술후처치","수술처치",
-    ]},
-    {"code": "surgery_spay_neuter", "group": "surgery", "aliases": [
-        "중성화","spay","neuter","castration","ovariohysterectomy","ohe",
-        "수컷 중성화","암컷 중성화","자궁적출","난소적출","고환적출","중성화수술",
-        "불임수술","피임수술","거세","난소자궁적출","ovh","잠복고환",
-        "cryptorchid","복강내고환",
-    ]},
-    {"code": "surgery_tumor", "group": "surgery", "aliases": [
-        "종양","종양제거","종양수술","tumor","tumor removal","mass removal",
-        "mass","lump","혹제거","혹","종괴","종괴제거","절제","절제술",
-        "피부종양","유선종양","림프종","lymphoma","비만세포종","mct",
-    ]},
-    {"code": "surgery_foreign_body", "group": "surgery", "aliases": [
-        "이물","이물제거","이물수술","foreign body","foreign body removal",
-        "이물질","위절개","장절개","gastrotomy","enterotomy","이물적출",
-    ]},
-    {"code": "surgery_cesarean", "group": "surgery", "aliases": [
-        "제왕절개","cesarean","c-section","caesarean","제왕","제왕절개수술",
-    ]},
-    {"code": "surgery_hernia", "group": "surgery", "aliases": [
-        "탈장","탈장수술","hernia","hernia repair","회음부탈장","서혜부탈장",
-        "perineal hernia","inguinal hernia","배꼽탈장","umbilical hernia",
-        "횡격막탈장","diaphragmatic hernia",
-    ]},
-    {"code": "surgery_eye", "group": "surgery", "aliases": [
-        "안과수술","eye surgery","체리아이","cherry eye","백내장","백내장수술",
-        "cataract","안구적출","enucleation","안구","눈수술","각막수술",
-        "안검수술","entropion","ectropion","내안각","안검내반","안검외반",
-    ]},
-    {"code": "surgery_orthopedic", "group": "surgery", "aliases": [
-        "정형수술","정형외과","orthopedic surgery","fracture repair","골절",
-        "골절수술","골절정복","핀삽입","핀고정","플레이트","plate","뼈수술",
-        "관절수술","십자인대","ccl","tplo","tta","관절경수술",
-    ]},
-    # === 치과 ===
-    {"code": "dental_scaling", "group": "dental", "aliases": [
-        "scaling","dental cleaning","tartar","스케일링","치석","치석제거","스켈링",
-        "dental prophylaxis","치과스케일링","초음파스케일링","폴리싱","polishing",
-    ]},
-    {"code": "dental_extraction", "group": "dental", "aliases": [
-        "extraction","dental extraction","발치","발치술","치아발치","tooth extraction",
-        "발거","치아발거","치아제거","잔근","잔근제거","영구치발치","유치발치",
-    ]},
-    {"code": "dental_treatment", "group": "dental", "aliases": [
-        "잇몸","잇몸치료","치주","치주치료","periodontal","gingival","불소","불소도포",
-        "fluoride","치아치료","root canal","신경치료","치과","치과치료","구강","구강검진",
-        "치과진료","구강관리","치과처치","구강처치","치은","치은절제","gingivectomy",
-    ]},
-    # === 관절/정형 ===
-    {"code": "ortho_patella", "group": "orthopedic", "aliases": [
-        "mpl","lpl","patella","patellar luxation","슬개골탈구","슬탈","파행",
-        "슬개골","무릎","슬개골수술","슬관절",
-    ]},
-    {"code": "ortho_arthritis", "group": "orthopedic", "aliases": [
-        "arthritis","oa","osteoarthritis","관절염","퇴행성관절",
-        "관절","관절관리","관절영양","관절보조제","글루코사민","glucosamine",
-        "콘드로이틴","chondroitin","관절주사","관절치료",
-    ]},
-    # === 재활 ===
-    {"code": "rehab_therapy", "group": "checkup", "aliases": [
-        "재활","재활치료","물리치료","rehabilitation","physical therapy","physio",
-        "수중치료","수중런닝머신","underwater treadmill","hydrotherapy",
-        "레이저","레이저치료","laser therapy","cold laser",
-        "침","침치료","acupuncture","전기침","electroacupuncture",
-        "초음파치료","ultrasound therapy","체외충격파","eswt","도수치료",
-        "운동치료","재활운동","밸런스볼","수영치료",
-    ]},
-    # === 마이크로칩 ===
-    {"code": "microchip", "group": "etc", "aliases": [
-        "마이크로칩","microchip","chip","칩","내장형칩","동물등록","동물 등록",
-        "pet registration","칩삽입","등록","반려동물등록","인식칩",
-    ]},
-    # === 안락사/장례 ===
-    {"code": "euthanasia", "group": "etc", "aliases": [
-        "안락사","euthanasia","peaceful passing","임종","임종처치","안락사처치",
-    ]},
-    {"code": "funeral", "group": "etc", "aliases": [
-        "장례","화장","cremation","funeral","pet funeral","장례비","화장비",
-        "반려동물장례","개별화장","합동화장","유골","납골","장례식","추모",
-    ]},
-    # === 기타 ===
-    {"code": "care_e_collar", "group": "etc", "aliases": [
-        "e-collar","ecollar","cone","elizabethan collar","넥카라","넥칼라",
-        "엘리자베스카라","보호카라","보호대","깔대기","목카라","목칼라",
-        "넥카라 소","넥카라 중","넥카라 대","넥칼라 소","넥칼라 중","넥칼라 대",
-    ]},
-    {"code": "care_prescription_diet", "group": "etc", "aliases": [
-        "prescription diet","rx diet","therapeutic diet","처방식","처방사료",
-        "병원사료","hill's","hills","royal canin","k/d","c/d","i/d","z/d",
-        "처방전용사료","의료용사료","치료식","치료용사료","로얄캐닌","힐스",
-        "처방식이","처방용사료","처방캔","처방파우치","처방간식",
-        "로얄","로얄독","로얄캣","하이포알러지","하이포알러제닉","hypoallergenic",
-        "스몰독","미디엄독","라지독","가수분해","hydrolyzed",
-        "소화기케어","유리너리","레날","hepatic","스킨케어","뉴트리드",
-        "sensitivity control","sensitivity","세인시티비티",
-        "로얄독하이포","로얄독하이포알러지","독하이포알러지","하이포알러지스몰",
-        "인도어","라이프스테이지","스킨앤코트","skin&coat",
-        "로얄 독 하이포","독 하이포 알러지",
-    ]},
-    {"code": "supply_food", "group": "etc", "aliases": [
-        "사료","건사료","습식사료","캔","캔사료","간식","간식류","트릿","treat",
-        "food","pet food","dog food","cat food","kibble","wet food","dry food",
-        "사료비","사료구매","사료대","파우치","토퍼","습식","건식","자연식",
-        "생식","화식","수제사료","수제간식",
-        "일반사료","일반간식",
-    ]},
-    {"code": "supply_supplement", "group": "etc", "aliases": [
-        "영양제","보조제","supplement","nutritional supplement","비타민","vitamin",
-        "오메가3","omega","유산균","프로바이오틱","프리바이오틱","관절영양제",
-        "관절보조","피부영양제","면역보조","영양보조","건강보조식품","건강보조",
-        "종합영양제","멀티비타민","눈영양제","간영양제","신장영양제",
-    ]},
-    {"code": "supply_goods", "group": "etc", "aliases": [
-        "용품","pet supply","pet supplies","펫용품","반려동물용품",
-        "장난감","toy","리드줄","목줄","하네스","harness","leash","collar",
-        "식기","밥그릇","물그릇","배변패드","패드","배변","pet pad",
-        "케이지","캐리어","carrier","이동장","방석","침대","pet bed",
-    ]},
-    {"code": "checkup_general", "group": "checkup", "aliases": [
-        "checkup","consult","opd","진료","상담","초진","재진","진찰",
-        "진료비","초진료","재진료","진찰료","상담료","진료비용","진찰비",
-        "consultation","진료료","외래","진료상담","내원","방문",
-        "일반진료","기본진료","진료비","외래진료","통원",
-    ]},
-    {"code": "grooming_basic", "group": "grooming", "aliases": [
-        "grooming","bath","trim","미용","목욕","클리핑","발톱","발톱깎기",
-        "nail trim","nail clip","귀털","귀털제거","위생미용","부분미용",
-        "발바닥","발바닥털","패드관리","항문주위","위생컷",
-    ]},
-    {"code": "etc_fee", "group": "etc", "aliases": [
-        "재료비","재료대","소모품","소모품비","위생비","위생용품","일회용품",
-        "material fee","supply fee","수납","수납비","부대비","부대비용",
-        "소모품대","위생재료","일회용","일회용재료","기타재료",
-    ]},
-    {"code": "etc_discount", "group": "etc", "aliases": [
-        "할인","절사할인","절사","단수할인","단수절사","단수조정","절사조정",
-        "할인금액","할인액","환급","감면","조정금액","조정","금액조정",
-        "discount","절사 할인","단수 할인","반올림할인","끝전할인",
-        "쿠폰할인","쿠폰","회원할인","보호자할인","다두할인","소개할인",
-    ]},
-    {"code": "etc_other", "group": "etc", "aliases": ["기타","etc","other","기타비용","기타비"]},
+
+# =========================================================
+# Custom exception classes (used by main.py)
+# =========================================================
+class OCRTimeoutError(Exception):
+    pass
+
+class OCRConcurrencyError(Exception):
+    pass
+
+class OCRImageError(Exception):
+    pass
+
+
+# -----------------------------
+# Regex / constants
+# -----------------------------
+_DATE_RE_1 = re.compile(r"\b(20\d{2})\s*[.\-/]\s*(\d{1,2})\s*[.\-/]\s*(\d{1,2})\b")
+_DATE_RE_2 = re.compile(r"\b(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\b")
+_AMOUNT_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b|\b\d{3,}\b")
+_HOSP_RE = re.compile(r"(병원\s*명|원\s*명)\s*[:：]?\s*(.+)$")
+_PHONE_RE = re.compile(r"\b\d{2,3}-\d{3,4}-\d{4}\b")
+_BIZ_RE = re.compile(r"\b\d{3}-\d{2}-\d{5}\b")
+_CARD_RE = re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b")
+_KOREAN_NAME_RE = re.compile(r"^[가-힣]{2,4}$")
+_NAME_LABEL_KEYWORDS = {
+    "고객명", "고객이름", "고객 이름", "보호자", "보호자명",
+    "이름", "성명", "수신인", "수납자", "환자명",
+    "대표자", "대표", "원장",
+}
+_RABIES_RE = re.compile(
+    r"(rabies|rabbies|rabie|rabis|rabiess|rables|rabeis|ra\b|r\s*[/\-\._ ]\s*a\b|광견병|광견)",
+    re.IGNORECASE,
+)
+
+# -----------------------------
+# Noise tokens (for filtering non-item lines)
+# -----------------------------
+_NOISE_TOKENS = [
+    "고객", "고객번호", "고객 번호", "고객명", "고객 이름",
+    "사업자", "사업자등록", "사업자 등록", "대표",
+    "전화", "연락처", "주소",
+    "serial", "sign", "승인", "카드", "현금",
+    "부가세", "vat", "면세", "과세",
+    "공급가", "공급가액", "과세공급가액", "부가세액",
+    "소계", "합계", "총", "총액", "총 금액", "총금액",
+    "청구", "청구금액", "결제", "결제요청", "결제요청:", "결제예정",
+    "거래", "거래일", "거래 일",
+    "날짜", "일자", "방문일", "방문 일", "진료일", "진료 일", "발행", "발행일", "발행 일",
+    "퇴원",
+    "항목", "단가", "수량",
+    "동물명", "환자", "환자명", "품종",
+    "경기도", "서울", "인천", "부산", "대구", "대전", "광주", "울산", "세종",
+    "충북", "충남", "전북", "전남", "경북", "경남", "강원", "제주",
 ]
 
-_alnum = re.compile(r"[0-9a-zA-Z가-힣]+")
-def _normalize(s: str) -> str:
-    s = (s or "").lower()
-    return "".join(ch for ch in s if ch.isalnum() or ("가" <= ch <= "힣"))
-def _tokenize(s: str) -> List[str]:
-    return [t for t in re.findall(r"[0-9a-zA-Z가-힣]+", s or "") if t]
-def _is_short_ascii_token(norm: str) -> bool:
-    if len(norm) > 3: return False
-    return all(("0" <= c <= "9") or ("a" <= c <= "z") for c in norm)
-def _is_single_latin_char(s: str) -> bool:
-    if len(s) != 1: return False
-    return "a" <= s.lower() <= "z"
+_ADDRESS_RE = re.compile(
+    r"(경기도|서울|인천|부산|대구|대전|광주|울산|세종|충청|전라|경상|강원|제주)"
+    r"|(\S+시\s+\S+구)"
+    r"|(\S+[시군구]\s+\S+[동읍면로길])"
+    r"|(\d+번지)"
+    r"|(\(\S+동[,\s])"
+)
 
-_RABIES_RA_RE = re.compile(r"(?<![0-9a-z])ra(?![0-9a-z])", re.IGNORECASE)
-_RABIES_R_A_RE = re.compile(r"\br\s*[/\-\._ ]\s*a\b", re.IGNORECASE)
-_TAG_NOISE = ["사업자","대표","전화","주소","고객","승인","카드","현금","합계","총액","총금액","청구","결제","소계","vat","부가세","면세","과세","serial","sign","발행","발행일","날짜","일자"]
-_TAG_NOISE_N = [_normalize(x) for x in _TAG_NOISE if _normalize(x)]
 
-def _is_noise_textline(line: str) -> bool:
-    t = (line or "").strip()
-    if not t: return True
-    n = _normalize(t)
-    if len(n) < 2: return True
-    if re.search(r"\b20\d{2}[.\-/]\d{1,2}[.\-/]\d{1,2}\b", t): return True
-    for x in _TAG_NOISE_N:
-        if x in n: return True
+def _norm(s: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z가-힣]", "", (s or "").lower())
+
+
+_NOISE_TOKENS_NORM = [_norm(x) for x in _NOISE_TOKENS if _norm(x)]
+
+
+def _looks_like_date_line(t: str) -> bool:
+    if not t:
+        return False
+    if _DATE_RE_1.search(t) or _DATE_RE_2.search(t):
+        return True
+    k = _norm(t)
+    if re.fullmatch(r"20\d{2}(0?\d|1[0-2])(0?\d|[12]\d|3[01])", k):
+        return True
+    if re.fullmatch(r"20\d{2}(0?\d|1[0-2])(0?\d|[12]\d|3[01])\d{0,6}", k) and len(k) <= 12:
+        return True
     return False
 
-# =========================================================
-# ✅ 영수증 항목명 → 매칭 가능한 변형 자동 생성 (경우의수 최소화)
-# =========================================================
 
-# 1) 접두어: "검사 - ", "치과(별도 추가)", "수술:", "처방 " 등
-_PREFIX_WORDS = [
-    "검사","처치","수술","치과","예방","처방","주사","약제","진료","기본",
-    "추가","별도","특수","응급","야간","일반","정밀","정기","긴급","외래",
-    "입원","퇴원","재진","초진","당일","익일","심화","종합","기초","확인",
-    "재검","추적","경과","관찰","상담","의뢰","협진","세부","상세","간이",
-    "혈액","영상","임상","병리","처방전","처방전달","약국","조제","약국조제",
-    "수납","청구","보험","비보험","급여","비급여","본인부담","감면",
-    "소동물","대동물","강아지","고양이","소형견","중형견","대형견",
-    "cat","dog","canine","feline",
-    # 영수증 카테고리 접두어 (구체 항목이 우선되도록)
-    "초음파","방사선","엑스레이","혈액검사","소변","대변","분변",
-    "예방접종","접종","백신","수액","링거","내복","외용","안과","피부과",
-    "정형","재활","미용","위생",
-]
-_PREFIX_RE = re.compile(
-    r"^(?:" + "|".join(re.escape(w) for w in _PREFIX_WORDS) + r")\s*[-·:()（）\s]*",
-    re.IGNORECASE,
-)
-
-# 2) 접미어: 괄호, 체중, 수량, 시간, 횟수 등
-_SUFFIX_PATTERNS = [
-    r"\s*\(.*?\)\s*$",                          # (10kg이하), (~5kg)
-    r"\s*（.*?）\s*$",                            # 전각 괄호
-    r"\s*\[.*?\]\s*$",                           # [참고], [추가]
-    r"\s*[-·:]\s*\d+\s*$",                       # 끝에 숫자
-    r"\s+\d+\s*kg.*$",                           # 10kg이하
-    r"\s+~?\d+\s*kg.*$",                         # ~10kg
-    r"\s+\d+\s*[회건개번차일분시].*$",            # 1회, 2건, 3개, 1일
-    r"\s+[0-9]+\s*시간.*$",                      # 1시간 미만
-    r"\s+\d+\s*[mM][lL].*$",                     # 100ml
-    r"\s+\d+\s*[cC][cC].*$",                     # 100cc
-    r"\s+x\s*\d+.*$",                            # x3, x 2
-    r"\s+\d+[차].*$",                            # 1차, 2차
-    r"\s*#\d+.*$",                               # #1, #2
-    r"\s+\d+\s*[tT].*$",                         # 1T, 2T (정제 수량)
-    r"\s+\d+\s*[cC].*$",                         # 1C, 2C (캡슐 수량)
-    r"\s+\d+\s*[eE][aA].*$",                     # 1ea, 2EA
-    r"\s+\d+\s*매.*$",                           # 1매, 2매
-    r"\s+\d+\s*[pP][aA][cC][kK].*$",            # 1pack
-    r"\s+\d+\s*세트.*$",                         # 1세트
-    r"\s+\d+\s*[bB][oO][xX].*$",                # 1box
-    r"\s+이상$",                                  # 이상
-    r"\s+이하$",                                  # 이하
-    r"\s+미만$",                                  # 미만
-    r"\s+초과$",                                  # 초과
-]
-_SUFFIX_RE = re.compile("|".join(_SUFFIX_PATTERNS))
-
-# 3) 분리 기호: 하이픈, 슬래시, 플러스, 쉼표, 공백+대시
-_SPLIT_RE = re.compile(r"\s*[-–—·/+,&]\s*")
-
-# 4) 무의미한 수식어 (제거해도 의미 유지)
-_FILLER_WORDS = re.compile(
-    r"(?:별도|추가|기본|일반|특수|정밀|간이|긴급|당일|익일|재|소형|중형|대형"
-    r"|소동물|대동물|강아지|고양이|dog|cat|canine|feline"
-    r"|좌|우|양측|단측|전신|국소|부분|전체|좌측|우측|앞|뒤|상|하"
-    r"|경구|외용|주사용|주사제|제제|액제|정제|캡슐|연고|크림|용액"
-    r"|1차|2차|3차|4차|5차|1회|2회|3회)\s*",
-    re.IGNORECASE,
-)
+def _is_noise_line(s: str) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return True
+    low = t.lower()
+    k = _norm(t)
+    if len(k) < 2:
+        return True
+    if _looks_like_date_line(t):
+        return True
+    if _ADDRESS_RE.search(t):
+        return True
+    has_letter = any(("a" <= ch.lower() <= "z") or ("가" <= ch <= "힣") for ch in t)
+    has_digit = any(ch.isdigit() for ch in t)
+    if has_digit and (not has_letter) and len(k) <= 12:
+        return True
+    for xn in _NOISE_TOKENS_NORM:
+        if xn and xn in k:
+            return True
+    for w in ("serial", "sign", "vat"):
+        if w in low:
+            return True
+    return False
 
 
-def _generate_variants(s: str) -> List[str]:
-    """
-    영수증 항목명 하나로부터 매칭 가능한 변형 문자열들을 자동 생성.
-    예: "치과(별도 추가)스케일링 추가+폴리싱 (-10kg이하)"
-    → ["치과(별도 추가)스케일링 추가+폴리싱 (-10kg이하)",
-       "스케일링 추가+폴리싱",
-       "스케일링", "폴리싱",
-       ...]
-    """
-    raw = (s or "").strip()
-    if not raw:
-        return []
-
-    seen = set()
-    variants = []
-
-    def _add(v):
-        v = v.strip()
-        if v and len(v) >= 2 and v not in seen:
-            seen.add(v)
-            variants.append(v)
-
-    # 원본
-    _add(raw)
-
-    # 접두어 제거 (반복: "검사 - 혈액 - CBC" → "혈액 - CBC" → "CBC")
-    cur = raw
-    for _ in range(4):
-        prev = cur
-        cur = _PREFIX_RE.sub("", cur).strip()
-        _add(cur)
-        if cur == prev:
-            break
-    no_prefix = cur
-
-    # 접미어 제거 (반복 적용)
-    for base in [raw, no_prefix]:
-        cleaned = base
-        for _ in range(5):
-            prev = cleaned
-            cleaned = _SUFFIX_RE.sub("", cleaned).strip()
-            if cleaned == prev:
-                break
-        _add(cleaned)
-
-    # 접두어+접미어 동시 제거
-    combined = no_prefix
-    for _ in range(5):
-        prev = combined
-        combined = _SUFFIX_RE.sub("", combined).strip()
-        if combined == prev:
-            break
-    _add(combined)
-
-    # 괄호 내용 모두 제거: "치과(별도 추가)스케일링" → "치과스케일링" → "스케일링"
-    no_parens = re.sub(r"\(.*?\)|（.*?）|\[.*?\]", "", raw).strip()
-    _add(no_parens)
-    no_parens_no_prefix = no_parens
-    for _ in range(4):
-        prev = no_parens_no_prefix
-        no_parens_no_prefix = _PREFIX_RE.sub("", no_parens_no_prefix).strip()
-        _add(no_parens_no_prefix)
-        if no_parens_no_prefix == prev:
-            break
-
-    # 분리 기호 기준 각 파트
-    for base in [raw, no_prefix, no_parens, no_parens_no_prefix]:
-        parts = _SPLIT_RE.split(base)
-        clean_parts = []
-        for part in parts:
-            part = part.strip()
-            part = re.sub(r"\(.*?\)|（.*?）|\[.*?\]", "", part).strip()
-            part = _SUFFIX_RE.sub("", part).strip()
-            _add(part)
-            # 파트에서도 접두어 제거
-            part_no_prefix = _PREFIX_RE.sub("", part).strip()
-            _add(part_no_prefix)
-            if part:
-                clean_parts.append(part)
-        # 역순 연결: "초음파 - 복부" → "복부초음파"
-        if len(clean_parts) == 2:
-            _add(clean_parts[1] + clean_parts[0])
-            _add(clean_parts[0] + clean_parts[1])
-
-    # 수식어 제거 버전
-    for base in list(variants)[:15]:
-        no_filler = _FILLER_WORDS.sub("", base).strip()
-        _add(no_filler)
-
-    # 콜론(:) 뒤 부분: "발치-영구치 발치 (1개당) : 앞니" → "앞니"
-    if ":" in raw or "：" in raw:
-        after_colon = re.split(r"\s*[:：]\s*", raw)[-1].strip()
-        after_colon = re.sub(r"\(.*?\)", "", after_colon).strip()
-        _add(after_colon)
-        # 콜론 앞 부분도 추가
-        before_colon = re.split(r"\s*[:：]\s*", raw)[0].strip()
-        before_colon = re.sub(r"\(.*?\)", "", before_colon).strip()
-        _add(before_colon)
-        bc_no_prefix = _PREFIX_RE.sub("", before_colon).strip()
-        _add(bc_no_prefix)
-
-    # 공백으로 분리된 한글 토큰 중 2글자 이상인 것들 (마지막 수단)
-    for base in [no_prefix, combined]:
-        kr_tokens = re.findall(r"[가-힣]{2,}", base)
-        for tk in kr_tokens:
-            _add(tk)
-
-    return variants
-
-
-# 접두어 단어 자체는 너무 일반적 → 매칭에서 큰 감점
-_PREFIX_WORD_SET = set(_PREFIX_WORDS)
-
-def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
-    q_raw = (query or "").strip()
-    if not q_raw: return 0, {}
-    if _is_single_latin_char(q_raw): return 0, {}
-
-    # ✅ 원본 + 접두어/접미어 제거 변형 모두에 대해 매칭 시도
-    variants = _generate_variants(q_raw)
-    if not variants:
-        variants = [q_raw]
-
-    # 구체적(비접두어) variant가 1개라도 있으면 접두어 variant 억제
-    has_non_prefix = any(v.strip() not in _PREFIX_WORD_SET for v in variants)
-
-    best_overall = 0
-    best_why: List[str] = []
-
-    for variant in variants:
-        score, ev = _match_score_single(tag, variant)
-        # 접두어 단어 자체("검사","처치","수술","처방" 등)는 너무 generic
-        # → 구체적 variant가 있을 때만 감점
-        v_stripped = variant.strip()
-        if v_stripped in _PREFIX_WORD_SET and has_non_prefix:
-            score = min(score, 80)  # threshold(90) 미만으로 억제
-        if score > best_overall:
-            best_overall = score
-            best_why = ev.get("why", [])
-
-    return best_overall, {"why": best_why[:10]}
-
-
-def _match_score_single(tag: Dict[str, Any], q_raw: str) -> Tuple[int, Dict[str, Any]]:
-    """단일 문자열에 대한 태그 매칭 점수 계산."""
-    q_norm = _normalize(q_raw)
-    if not q_norm: return 0, {}
-    tokens = [_normalize(t) for t in _tokenize(q_raw)]
-    token_set = set(t for t in tokens if t)
-    best = 0; hit = 0; strong = False; why: List[str] = []
-    code_norm = _normalize(tag["code"])
-    if code_norm == q_norm: return 230, {"why": ["code==query"]}
-    if tag.get("code") == "vaccine_rabies":
-        if _RABIES_RA_RE.search(q_raw) or _RABIES_R_A_RE.search(q_raw):
-            best = max(best, 170); hit += 1; strong = True; why.append("regex:ra_or_r/a")
-    for alias in tag.get("aliases", []):
-        a = str(alias or "").strip()
-        if not a: continue
-        a_norm = _normalize(a)
-        if not a_norm: continue
-        if _is_short_ascii_token(a_norm):
-            if a_norm == q_norm or a_norm in token_set:
-                best = max(best, 160); hit += 1; strong = True; why.append(f"shortEqOrToken:{a}")
-            continue
-        if a_norm == q_norm:
-            best = max(best, 180); hit += 1; strong = True; why.append(f"eq:{a}")
-        elif q_norm.find(a_norm) >= 0:
-            s = 120 + min(60, len(a_norm) * 2)
-            best = max(best, s); hit += 1; strong = True; why.append(f"inQuery:{a}")
-        elif a_norm.find(q_norm) >= 0:
-            kr_bonus = 10 if len(q_norm) <= 4 and any("가" <= c <= "힣" for c in q_norm) else 0
-            s = 90 + min(40, len(q_norm) * 2) + kr_bonus
-            best = max(best, s); hit += 1; why.append(f"queryInAlias:{a}")
-    if hit >= 2: best += min(35, hit * (8 if strong else 5)); why.append(f"bonus:{hit}")
-    return best, {"why": why[:10]}
-
-def _build_record_query(items, hospital_name, ocr_text=None):
-    parts = []
-    if hospital_name: parts.append(str(hospital_name))
-    for it in (items or [])[:200]:
-        nm = (it.get("itemName") or it.get("item_name") or "").strip()
-        if nm: parts.append(nm)
-    if ocr_text:
-        ocr_lines = []
-        for ln in (ocr_text or "").splitlines()[:160]:
-            ln = ln.strip()
-            if not ln or _is_noise_textline(ln): continue
-            if len(_normalize(re.sub(r"\d+", "", ln))) < 2: continue
-            ocr_lines.append(ln)
-            if len(ocr_lines) >= 40: break
-        if ocr_lines: parts.append(" | ".join(ocr_lines)[:2000])
-    return " | ".join(parts)[:4000]
-
-def resolve_record_tags(*, items, hospital_name=None, ocr_text=None, record_thresh=120, item_thresh=100, max_tags=8, return_item_tags=True, **kw):
-    query = _build_record_query(items or [], hospital_name, ocr_text=ocr_text)
-    if not query.strip(): return {"tags": [], "itemCategoryTags": [], "evidence": {"policy": "catalog", "reason": "empty_query"}}
-    scored = []
-    for tag in TAG_CATALOG:
-        s, ev = _match_score(tag, query)
-        if s > 0: scored.append((tag["code"], s, ev))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    picked = []; evidence = {"policy": "catalog", "query": query[:600], "recordThresh": int(record_thresh), "itemThresh": int(item_thresh), "candidates": []}
-    for code, score, ev in scored[:30]:
-        evidence["candidates"].append({"code": code, "score": score, **(ev or {})})
-        if score >= int(record_thresh) and code not in picked:
-            if code == "etc_other": continue
-            picked.append(code)
-        if len(picked) >= int(max_tags): break
-    if not picked:
-        for code, score, _ in scored[:50]:
-            if code == "etc_other" and score >= 90: picked.append("etc_other"); break
-    item_tags = []
-    if return_item_tags:
-        for idx, it in enumerate((items or [])[:250]):
-            nm = (it.get("itemName") or "").strip()
-            if not nm: continue
-            bc = None; bs = 0; be = {}
-            for tag in TAG_CATALOG:
-                s, ev = _match_score(tag, nm)
-                if s > bs: bs = s; bc = tag["code"]; be = ev or {}
-            if bc and bs >= int(item_thresh):
-                if bc == "etc_other": continue
-                item_tags.append({"idx": idx, "itemName": nm, "categoryTag": bc, "score": bs, **(be or {})})
-    return {"tags": picked, "itemCategoryTags": item_tags, "evidence": evidence}
-
-
-# =========================================================
-# main.py 호환 함수: classify_item / classify_record
-# =========================================================
-_PRESCRIPTION_KEYWORDS = {"처방", "rx", "prescription", "therapeutic", "치료용"}
-
-def classify_item(item_name: str, threshold: int = 100) -> Optional[str]:
-    """단일 항목명 → 최적 태그 코드 반환. 매칭 안 되면 None."""
-    if not (item_name or "").strip():
+def _parse_date_from_text(text: str) -> Optional[date]:
+    if not text:
         return None
-    best_code = None
-    best_score = 0
-    second_code = None
-    second_score = 0
-    for tag in TAG_CATALOG:
-        s, _ = _match_score(tag, item_name)
-        if s > best_score:
-            second_code, second_score = best_code, best_score
-            best_score = s
-            best_code = tag["code"]
-        elif s > second_score:
-            second_score = s
-            second_code = tag["code"]
-
-    # 처방식 우선: supply_food가 1등이지만 "처방" 키워드가 있으면 care_prescription_diet 우선
-    if best_code == "supply_food":
-        nm_lower = _normalize(item_name)
-        if any(_normalize(kw) in nm_lower for kw in _PRESCRIPTION_KEYWORDS):
-            # care_prescription_diet가 후보에 있으면 교체
-            if second_code == "care_prescription_diet" and second_score >= threshold:
-                best_code = second_code
-                best_score = second_score
-            else:
-                # 직접 검색
-                for tag in TAG_CATALOG:
-                    if tag["code"] == "care_prescription_diet":
-                        s, _ = _match_score(tag, item_name)
-                        if s >= threshold:
-                            best_code = "care_prescription_diet"
-                            best_score = s
-                        break
-
-    if best_code and best_score >= threshold:
-        if best_code == "etc_other":
-            return None
-        return best_code
+    m = _DATE_RE_1.search(text)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mo, d)
+        except Exception:
+            pass
+    m = _DATE_RE_2.search(text)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mo, d)
+        except Exception:
+            pass
     return None
 
 
-def classify_record(items: list, ocr_text: str = "", threshold: int = 120) -> List[str]:
-    """항목 리스트 + OCR 텍스트 → 레코드 수준 태그 코드 리스트 반환."""
-    converted = []
-    for it in (items or []):
-        nm = (it.get("name") or it.get("itemName") or "").strip()
-        if nm:
-            converted.append({"itemName": nm})
-    result = resolve_record_tags(
-        items=converted,
-        ocr_text=ocr_text,
-        record_thresh=threshold,
-        item_thresh=max(80, threshold - 20),
-        return_item_tags=False,
+def _coerce_int_amount(s: Any) -> Optional[int]:
+    if s is None:
+        return None
+    if isinstance(s, bool):
+        return None
+    if isinstance(s, int):
+        return int(s)
+    if isinstance(s, float):
+        try:
+            return int(s)
+        except Exception:
+            return None
+    if isinstance(s, str):
+        cleaned = s.replace(" ", "")
+        # 음수 처리: "-88,000" or "-88000"
+        is_negative = cleaned.startswith("-")
+        if is_negative:
+            cleaned = cleaned[1:]
+        m = _AMOUNT_RE.search(cleaned)
+        if not m:
+            return None
+        try:
+            val = int(m.group(0).replace(",", ""))
+            return -val if is_negative else val
+        except Exception:
+            return None
+    return None
+
+
+# -----------------------------
+# Concurrency guard
+# -----------------------------
+_SEMA_LOCK = threading.Lock()
+_SEMA_BY_N: Dict[int, threading.BoundedSemaphore] = {}
+
+
+def _get_sema(n: int) -> threading.BoundedSemaphore:
+    nn = max(1, min(int(n or 1), 32))
+    with _SEMA_LOCK:
+        if nn not in _SEMA_BY_N:
+            _SEMA_BY_N[nn] = threading.BoundedSemaphore(nn)
+        return _SEMA_BY_N[nn]
+
+
+# -----------------------------
+# Image processing (PIL)
+# -----------------------------
+def _load_pil():
+    try:
+        from PIL import Image, ImageOps, ImageDraw
+        return Image, ImageOps, ImageDraw
+    except Exception as e:
+        raise RuntimeError("Pillow is required for receipt image processing. Install: pip install pillow") from e
+
+
+def _ensure_max_pixels(img, max_pixels: int):
+    w, h = img.size
+    if max_pixels and (w * h) > int(max_pixels):
+        scale = math.sqrt(float(max_pixels) / float(w * h))
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+        img = img.resize((nw, nh))
+    return img
+
+
+def _resize_to_width(img, max_width: int):
+    if not max_width:
+        return img
+    w, h = img.size
+    if w <= int(max_width):
+        return img
+    scale = float(max_width) / float(w)
+    nw = int(max_width)
+    nh = max(1, int(h * scale))
+    return img.resize((nw, nh))
+
+
+def _to_webp_bytes(img, quality: int = 85) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", quality=int(max(30, min(int(quality or 85), 95))), method=6)
+    return buf.getvalue()
+
+
+# -----------------------------
+# ✅ v2.6.0: 영수증 이미지 전처리 (OCR 인식률 향상)
+# -----------------------------
+def _preprocess_for_ocr(img):
+    """
+    감열지 영수증 대비 강화 + 선명도 + 노이즈 제거.
+    Pillow의 ImageEnhance/ImageFilter만 사용 (추가 의존성 없음).
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter
+
+        # 1) 그레이스케일 변환 → 색상 노이즈 제거
+        gray = img.convert("L")
+
+        # 2) 대비 강화 (감열지는 대비가 낮음)
+        enhancer = ImageEnhance.Contrast(gray)
+        gray = enhancer.enhance(1.8)  # 1.8배 대비 강화
+
+        # 3) 밝기 살짝 올림 (어두운 영수증 보정)
+        enhancer = ImageEnhance.Brightness(gray)
+        gray = enhancer.enhance(1.1)
+
+        # 4) 선명도 강화 (흐릿한 글씨 대응)
+        enhancer = ImageEnhance.Sharpness(gray)
+        gray = enhancer.enhance(2.0)
+
+        # 5) 가벼운 노이즈 제거
+        gray = gray.filter(ImageFilter.MedianFilter(size=3))
+
+        # 다시 RGB로 (OCR API 호환)
+        return gray.convert("RGB")
+    except Exception:
+        return img
+
+
+# -----------------------------
+# Google Vision OCR (optional)
+# -----------------------------
+def _build_vision_client(google_credentials: str):
+    from google.cloud import vision
+    from google.oauth2 import service_account
+    gc = (google_credentials or "").strip()
+    if not gc:
+        env1 = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+        env2 = (os.getenv("GOOGLE_APPLICATION_CREDENTIALIALS") or "").strip()
+        gc = env1 or env2
+    if not gc:
+        return vision.ImageAnnotatorClient()
+    if gc.startswith("{") and gc.endswith("}"):
+        info = json.loads(gc)
+        pk = info.get("private_key")
+        if isinstance(pk, str) and "\\n" in pk:
+            info["private_key"] = pk.replace("\\n", "\n")
+        creds = service_account.Credentials.from_service_account_info(info)
+        return vision.ImageAnnotatorClient(credentials=creds)
+    if os.path.exists(gc):
+        return vision.ImageAnnotatorClient.from_service_account_file(gc)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gc
+    return vision.ImageAnnotatorClient()
+
+
+def _vision_ocr(
+    image_bytes: bytes,
+    google_credentials: str,
+    timeout_seconds: int,
+) -> Tuple[str, Any]:
+    from google.cloud import vision  # type: ignore
+    client = _build_vision_client(google_credentials)
+    img = vision.Image(content=image_bytes)
+    resp = client.document_text_detection(image=img, timeout=float(timeout_seconds or 12))
+    full_text = ""
+    try:
+        if resp and resp.full_text_annotation and resp.full_text_annotation.text:
+            full_text = resp.full_text_annotation.text
+    except Exception:
+        full_text = ""
+    return full_text, resp
+
+
+# -----------------------------
+# Redaction (best-effort)
+# -----------------------------
+def _redact_image_with_vision_tokens(img, vision_response) -> Any:
+    Image, ImageOps, ImageDraw = _load_pil()
+    if vision_response is None:
+        return img
+    try:
+        anns = getattr(vision_response, "text_annotations", None)
+        if not anns or len(anns) <= 1:
+            return img
+        draw = ImageDraw.Draw(img)
+
+        for a in anns[1:]:
+            desc = str(getattr(a, "description", "") or "")
+            if not desc:
+                continue
+            if not (_PHONE_RE.search(desc) or _BIZ_RE.search(desc) or _CARD_RE.search(desc)):
+                continue
+            _fill_rect(draw, a)
+
+        tokens = list(anns[1:])
+        label_indices: set = set()
+
+        for i, a in enumerate(tokens):
+            desc = str(getattr(a, "description", "") or "").strip()
+            desc_clean = desc.replace(" ", "")
+            if desc_clean in _NAME_LABEL_KEYWORDS or desc_clean.rstrip(":：") in _NAME_LABEL_KEYWORDS:
+                label_indices.add(i)
+                continue
+            if i > 0:
+                prev = str(getattr(tokens[i - 1], "description", "") or "").strip()
+                combo = (prev + desc).replace(" ", "")
+                if combo in _NAME_LABEL_KEYWORDS or combo.rstrip(":：") in _NAME_LABEL_KEYWORDS:
+                    label_indices.add(i)
+
+        for li in label_indices:
+            for offset in range(1, 4):
+                ni = li + offset
+                if ni >= len(tokens):
+                    break
+                nd = str(getattr(tokens[ni], "description", "") or "").strip()
+                if nd in (":", "：", "-", ")", "(", "/", "·"):
+                    continue
+                if _KOREAN_NAME_RE.match(nd):
+                    _fill_rect(draw, tokens[ni])
+                    break
+                break
+
+        return img
+    except Exception:
+        return img
+
+
+def _fill_rect(draw, annotation) -> None:
+    poly = getattr(annotation, "bounding_poly", None)
+    if not poly or not getattr(poly, "vertices", None):
+        return
+    xs: List[int] = []
+    ys: List[int] = []
+    for v in poly.vertices:
+        x = getattr(v, "x", None)
+        y = getattr(v, "y", None)
+        if x is None or y is None:
+            continue
+        xs.append(int(x))
+        ys.append(int(y))
+    if not xs or not ys:
+        return
+    x0, x1 = max(0, min(xs)), max(xs)
+    y0, y1 = max(0, min(ys)), max(ys)
+    draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
+
+
+# -----------------------------
+# Text parsing
+# -----------------------------
+def _clean_item_name(name: str) -> str:
+    s = (name or "").strip()
+    s = s.replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.lstrip("*•·-—").strip()
+    return s[:200]
+
+
+def _canonicalize_item_name(name: str) -> str:
+    s = (name or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    if _RABIES_RE.search(s):
+        return "Rabies"
+    if re.search(r"\bx\s*[- ]?\s*ray\b", low):
+        return "X-ray"
+    return s
+
+
+def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for ln in lines:
+        if not ln:
+            continue
+        if _is_noise_line(ln):
+            continue
+        nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(ln)]
+        nums = [n for n in nums if n >= 100]
+        if not nums:
+            continue
+        price = nums[-1]
+        name_part = _AMOUNT_RE.sub(" ", ln)
+        name_part = re.sub(r"\b\d{1,2}\b", " ", name_part)
+        name_part = _clean_item_name(name_part)
+        if not name_part:
+            continue
+        if _is_noise_line(name_part):
+            continue
+        name_part = _canonicalize_item_name(name_part)
+        key = (_norm(name_part), int(price))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"itemName": name_part, "price": int(price), "categoryTag": None})
+    return out[:120]
+
+
+def _extract_total_amount(text: str) -> Optional[int]:
+    if not text:
+        return None
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    candidates: List[int] = []
+    for ln in lines:
+        if not ln:
+            continue
+        low = ln.lower()
+        if any(k in low for k in ["합계", "총", "총액", "총금액", "청구", "결제", "소계", "grand", "total"]):
+            nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(ln)]
+            nums = [n for n in nums if n >= 100]
+            candidates.extend(nums)
+    if not candidates:
+        nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(text)]
+        nums = [n for n in nums if n >= 100]
+        candidates = nums
+    if not candidates:
+        return None
+    return int(max(candidates))
+
+
+def _extract_hospital_name(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines[:40]:
+        m = _HOSP_RE.search(ln)
+        if m:
+            v = m.group(2).strip()
+            v = re.split(r"\s{2,}|/|\||,", v)[0].strip()
+            if v:
+                return v[:80]
+    for ln in lines[:60]:
+        if "동물병원" in ln:
+            return ln[:80]
+    return None
+
+
+def _extract_address_hint(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        if "주소" in ln:
+            return ln[:120]
+    for ln in lines:
+        if any(tok in ln for tok in ["시 ", "시", "구 ", "구", "동 ", "로 ", "길 ", "번지", "도 "]):
+            if len(ln) >= 10 and any(ch.isdigit() for ch in ln):
+                return ln[:120]
+    return None
+
+
+def _parse_receipt_from_text(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    parsed: Dict[str, Any] = {
+        "hospitalName": _extract_hospital_name(text),
+        "visitDate": None,
+        "totalAmount": _extract_total_amount(text),
+        "items": [],
+        "ocrText": (text or "")[:8000],
+    }
+    vd = _parse_date_from_text(text)
+    if vd:
+        parsed["visitDate"] = vd.isoformat()
+    items = _extract_items_from_text(text)
+    low = (text or "").lower()
+    has_rabies = bool(_RABIES_RE.search(text or ""))
+    if has_rabies:
+        has_any = any(_RABIES_RE.search(str(it.get("itemName") or "")) for it in (items or []))
+        if not has_any:
+            ta = parsed.get("totalAmount")
+            price = int(ta) if isinstance(ta, int) and ta >= 100 else None
+            items = (items or []) + [{"itemName": "Rabies", "price": price, "categoryTag": None}]
+    parsed["items"] = items[:120]
+    hints: Dict[str, Any] = {
+        "addressHint": _extract_address_hint(text),
+        "ocrTextPreview": (text or "")[:400],
+    }
+    return parsed, hints
+
+
+# -----------------------------
+# Gemini (Generative Language API)
+# -----------------------------
+def _env_bool(name: str) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+def _call_gemini_generate_content(
+    *,
+    api_key: str,
+    model: str,
+    parts: List[Dict[str, Any]],
+    timeout_seconds: int = 10,
+    media_resolution: Optional[str] = None,
+) -> str:
+    import urllib.request
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    # ✅ Gemini 3: thinking에 토큰을 많이 쓰므로 maxOutputTokens를 크게 설정
+    # thinkingBudget으로 사고 토큰을 제한하고, 실제 응답에 충분한 여유 확보
+    gen_config: Dict[str, Any] = {
+        "temperature": 0.0,
+        "maxOutputTokens": 16384,
+        "thinkingConfig": {"thinkingBudget": 2048},
+    }
+
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": gen_config,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=float(timeout_seconds or 10)) as resp:
+        data = resp.read().decode("utf-8", errors="replace")
+    j = json.loads(data)
+    # ✅ Gemini 3: thinking part를 건너뛰고 실제 응답 텍스트 추출
+    parts_out = (
+        (j.get("candidates") or [{}])[0]
+        .get("content", {})
+        .get("parts", [])
     )
-    return result.get("tags", [])
+    txt_parts = []
+    for p in parts_out:
+        # thought=true인 파트는 건너뛰기 (Gemini 3 thinking 모드)
+        if p.get("thought") or p.get("thinking"):
+            continue
+        t = p.get("text", "")
+        if t:
+            txt_parts.append(t)
+    # thinking 파트밖에 없으면 마지막 파트라도 사용
+    if not txt_parts and parts_out:
+        last = parts_out[-1].get("text", "")
+        if last:
+            txt_parts.append(last)
+    return "\n".join(txt_parts).strip()
+
+
+def _extract_json_from_model_text(s: str) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+    t = s.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+    i = t.find("{")
+    j = t.rfind("}")
+    if i < 0 or j < 0 or j <= i:
+        return None
+    blob = t[i : j + 1]
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
+def _gemini_parse_receipt(
+    *,
+    image_bytes: bytes,
+    ocr_text: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: int = 10,
+) -> Optional[Dict[str, Any]]:
+    api_key = (api_key or "").strip()
+    model = (model or "gemini-3-flash-preview").strip()
+    if not api_key or not model:
+        return None
+    prompt = (
+        "You are a receipt parser for Korean veterinary receipts.\n"
+        "Return ONLY valid JSON with keys:\n"
+        '  hospitalName (string|null), visitDate (YYYY-MM-DD|null), totalAmount (integer|null),\n'
+        '  items (array of {itemName:string, price:integer|null}).\n'
+        "Rules:\n"
+        "- items must be REAL treatment/vaccine/medicine line-items only.\n"
+        "- Do NOT include date lines (e.g. '날짜: 2025-11-28') as items.\n"
+        "- Do NOT include totals/taxes/payment lines as items.\n"
+        "- Do NOT include addresses (시/구/동/로/길) as items.\n"
+        "- Do NOT include phone numbers, business registration numbers as items.\n"
+        "- Do NOT include hospital name/address as items.\n"
+        "- If you see 'Rabies' but OCR typo like 'Rabbies' or abbreviation 'RA'/'R/A', normalize itemName to 'Rabies'.\n"
+        "- If uncertain, best guess.\n"
+    )
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    parts = [
+        {"text": prompt},
+        {"inline_data": {"mime_type": "image/webp", "data": b64}},
+    ]
+    if (ocr_text or "").strip():
+        parts.append({"text": "OCR text (may be noisy):\n" + (ocr_text or "")[:6000]})
+    try:
+        out = _call_gemini_generate_content(api_key=api_key, model=model, parts=parts, timeout_seconds=timeout_seconds)
+        j = _extract_json_from_model_text(out)
+        if isinstance(j, dict):
+            return j
+    except Exception:
+        try:
+            parts2 = [{"text": prompt + "\n\nHere is OCR text:\n" + (ocr_text or "")[:6000]}]
+            out = _call_gemini_generate_content(api_key=api_key, model=model, parts=parts2, timeout_seconds=timeout_seconds)
+            j = _extract_json_from_model_text(out)
+            if isinstance(j, dict):
+                return j
+        except Exception:
+            return None
+    return None
+
+
+def _is_items_suspicious(items: List[Dict[str, Any]]) -> bool:
+    if not items:
+        return True
+    bad = 0
+    for it in items[:20]:
+        nm = str((it or {}).get("itemName") or "")
+        if _is_noise_line(nm):
+            bad += 1
+    return bad >= max(1, min(3, len(items)))
+
+
+def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"hospitalName": None, "visitDate": None, "totalAmount": None, "items": []}
+    hn = j.get("hospitalName")
+    if isinstance(hn, str) and hn.strip():
+        out["hospitalName"] = hn.strip()[:80]
+    vd = j.get("visitDate")
+    if isinstance(vd, str) and vd.strip():
+        d = _parse_date_from_text(vd.strip())
+        out["visitDate"] = d.isoformat() if d else vd.strip()[:20]
+    ta = _coerce_int_amount(j.get("totalAmount"))
+    out["totalAmount"] = ta if ta and ta > 0 else None
+    items = j.get("items")
+    if isinstance(items, list):
+        cleaned: List[Dict[str, Any]] = []
+        for it in items[:120]:
+            if not isinstance(it, dict):
+                continue
+            nm = str(it.get("itemName") or "").strip()
+            if not nm:
+                continue
+            nm = _canonicalize_item_name(_clean_item_name(nm))
+            if not nm or _is_noise_line(nm):
+                continue
+            pr = _coerce_int_amount(it.get("price"))
+            if pr is not None and pr < 0:
+                pr = None
+            cleaned.append({"itemName": nm, "price": pr, "categoryTag": None})
+        out["items"] = cleaned
+    return out
+
+
+# =========================================================
+# ✅ Gemini-first receipt parsing prompt (세분화 태그 동기화)
+# =========================================================
+_GEMINI_RECEIPT_PROMPT = """\
+You are a precision OCR data extractor for Korean veterinary hospital receipts.
+Your ONLY job: read the receipt image and output a JSON object with EXACT data from the receipt.
+Do NOT interpret, rename, translate, standardize, or infer anything. Just copy what you see.
+
+Return ONLY valid JSON (no markdown, no code fences, no explanation):
+
+{
+  "hospitalName": "exact hospital name from receipt" or null,
+  "visitDate": "YYYY-MM-DD" or null,
+  "totalAmount": integer or null,
+  "discountAmount": integer or null,
+  "items": [
+    {
+      "itemName": "exact item text from receipt",
+      "price": integer_or_null,
+      "originalPrice": integer_or_null,
+      "discount": integer_or_null
+    }
+  ]
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 1: EXTRACT EVERY LINE ITEM — ZERO EXCEPTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Read the receipt TOP to BOTTOM. Every row that has a name + price = one item.
+- Include ALL categories found on receipts:
+  · 진료비/진찰료/재진/초진 (consultation fees)
+  · 검사 (tests): 혈액, CBC, 화학, 전해질, CRP, X-ray, 초음파, 심전도, 세포검사 등
+  · 처치 (procedures): 수액, 주사, 소독, 드레싱, 천자, 카테터 등
+  · 수술 (surgery): 마취, 중성화, 발치, 정형외과 등
+  · 약 (medication): 내복약, 외용제, 연고, 점안액, 귀약, 주사약, 항생제 등
+  · 미용 (grooming): 목욕, 미용, 발바닥 밀기 등
+  · 용품 (supplies): 넥칼라, 사료, 캔, 간식, 보조제 등
+  · 입원 (hospitalization): 입원비, 식이 관리, 모니터링 등
+  · 할인 (discounts): 절사할인, 쿠폰할인, 회원할인 등
+  · 기타: 제증명, 진단서, 기타 비용
+- Items with *, **, †, brackets [], or any symbol → STILL extract them.
+- If the receipt has MULTIPLE SECTIONS (e.g. "진료 내역", "용품 내역") → extract from ALL sections.
+- TABLE FORMAT: Many receipts have table columns (항목명 | 수량 | 단가 | 금액).
+  → Extract EVERY ROW in the table. Do NOT skip rows just because they look similar.
+  → 예: "혈액(혈청)-기본(7항목)" and "혈액(혈청)-Chemistry 1항" are DIFFERENT items — extract BOTH.
+- SIMILAR NAMES: Items may have similar names but different details (e.g. 혈액 검사 types).
+  → Each row is a SEPARATE item. Never merge similar-looking rows.
+  → CRITICAL EXAMPLE: A receipt may have ALL of these as separate items:
+    · *혈액(혈구)-CBC → 30,000
+    · *혈액(혈액가스분석) → 50,000
+    · *혈액(혈청)-기본(7항목) → 60,000
+    · *혈액(혈청)-Chemistry 1항 → 30,000
+    · *혈액-젖산측정(Lactate) → 15,000
+  → These are 5 DIFFERENT items! Extract ALL of them, not just 1-2.
+  → Similarly, multiple "고가약물-XXX" lines are each separate items.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 2: itemName = EXACT COPY FROM RECEIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Copy the item name CHARACTER BY CHARACTER from the receipt.
+- 예시:
+  · "진찰료-초진" → "진찰료-초진" (NOT "진료비", NOT "기본진료")
+  · "*병리검사(혈액-CRP)" → "*병리검사(혈액-CRP)"
+  · "검사-귀-set(검이경,현미경도말)" → "검사-귀-set(검이경,현미경도말)" (NOT "귀검사")
+  · "처치-복수천자(복수 제거 목적)" → "처치-복수천자(복수 제거 목적)" (NOT "처치료")
+  · "내복약 1일 2회 (5~10kg)" → "내복약 1일 2회 (5~10kg)"
+  · "로얄- cat) 마더앤 베이비캣 소프트 무스" → "로얄- cat) 마더앤 베이비캣 소프트 무스"
+- Keep ALL: parentheses (), brackets [], asterisks *, hyphens -, slashes /, dots.
+- Do NOT shorten, summarize, translate to English, or replace with a category name.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Copy the EXACT integer from the receipt. Do NOT round, guess, or approximate.
+- 예시: receipt shows "77,000" → price: 77000 (NOT 71000, NOT 70000)
+       receipt shows "9,900" → price: 9900 (NOT 5500, NOT 10000)
+       receipt shows "2,600" → price: 2600 (NOT 2000)
+- QUANTITY HANDLING:
+  · If receipt shows "수량: 4 × 단가: 22,000 = 88,000" → price: 88000 (use the total)
+  · If receipt shows "내복약 1일 × 7 = 31,500" → price: 31500 (use the total)
+  · If only unit price visible with quantity → multiply: price = 수량 × 단가
+  · IMPORTANT: Some receipts show columns like "항목 | 수량 | 단가 | 금액"
+    → Always use the FINAL 금액 column, not 단가.
+    → If 수량 > 1 and only 단가 is shown → price = 수량 × 단가.
+- price = null ONLY if truly no price is visible for that item.
+- CRITICAL: Read every digit carefully. Similar-looking digits:
+  · 3 vs 8, 5 vs 6, 0 vs 8, 1 vs 7 — zoom in and verify.
+  · If the total doesn't match your items sum, re-read the prices digit by digit.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 4: DISCOUNT ITEMS → NEGATIVE PRICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Discount lines are separate items with NEGATIVE price.
+- ANY item containing: 할인, 절사, 감면, 환급, 쿠폰, discount → price MUST be negative.
+- 예시:
+  · "동물종합검진B코스 할인" → price: -88000
+  · "쿠폰 할인 뼈없는소고기캔" → price: -12600
+  · "절사할인" → price: -200
+  · "할인/할증" line showing -100,600 → price: -100600
+- originalPrice and discount fields: for regular items that received a discount.
+  · originalPrice = amount before discount. null if no discount on this item.
+  · discount = discount amount as positive integer. null if no discount.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 5: totalAmount = FINAL PAYMENT AMOUNT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- totalAmount = the amount the customer actually pays.
+- Look for: 결제요청, 청구금액, 합계, 총액, 결제금액, 수납액.
+- If multiple totals exist (소계 vs 청구금액), use the FINAL one (결제요청/청구금액).
+- discountAmount = total discount amount (할인/할증 합계). null if none.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 6: SELF-VERIFICATION (필수 검증)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Before returning your JSON, perform these checks:
+
+CHECK 1 — Item count:
+  Count the number of line items visible on the receipt.
+  Your items array must have the SAME count (± discount lines).
+  If you have fewer items than visible lines → you MISSED items. Re-read the receipt.
+  IMPORTANT: Count EACH row separately, even if names look similar.
+  A receipt with 16 visible rows must produce ~16 items in your output.
+
+CHECK 2 — Price sum (CRITICAL):
+  Calculate: sum of all your item prices (including negative discount prices).
+  Compare to totalAmount.
+  If |sum - totalAmount| > 500 → you have WRONG prices or MISSING items.
+  Go back and fix before returning.
+  This is the MOST IMPORTANT check. If the sum is off by thousands, you definitely missed items.
+
+CHECK 3 — Name accuracy:
+  For each item, verify the itemName matches the receipt text exactly.
+  If you wrote a generic name like "진료비" but the receipt says "진찰료-초진" → fix it.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 7: DO NOT INCLUDE THESE AS ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- 합계/소계/총액 summary lines
+- 부가세/VAT lines
+- 주소, 전화번호, 사업자등록번호
+- 날짜, 시간
+- 병원명, 수의사명, 환자명/보호자명
+- 카드 결제 정보, 승인번호
+"""
+
+
+def _gemini_parse_receipt_full(
+    *,
+    image_bytes: bytes,
+    api_key: str,
+    model: str,
+    timeout_seconds: int = 15,
+    ocr_text: str = "",
+) -> Optional[Dict[str, Any]]:
+    api_key = (api_key or "").strip()
+    model = (model or "gemini-3-flash-preview").strip()
+    if not api_key or not model:
+        return None
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    mime = "image/png"
+    if image_bytes[:4] == b"RIFF":
+        mime = "image/webp"
+    elif image_bytes[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+
+    parts = [
+        {"text": _GEMINI_RECEIPT_PROMPT},
+        {"inline_data": {"mime_type": mime, "data": b64}},
+    ]
+
+    # ✅ Google Vision OCR 텍스트가 있으면 Gemini에 참고자료로 전달
+    if (ocr_text or "").strip():
+        parts.append({"text": (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "MANDATORY REFERENCE: Google Vision OCR text\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CRITICAL: You MUST cross-check EVERY price and item name against this OCR text.\n"
+            "If your extracted price differs from what appears in this text, USE THE OCR TEXT NUMBER.\n"
+            "The OCR text below is machine-read and highly accurate for NUMBERS.\n"
+            "Steps:\n"
+            "1. For each item you extract, find the matching line in this OCR text.\n"
+            "2. Compare your price with the number in the OCR text.\n"
+            "3. If they differ, trust the OCR text number.\n"
+            "4. Check if you missed any items that appear in the OCR text but not in your extraction.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + (ocr_text or "").strip()[:6000]
+        )})
+
+    try:
+        out = _call_gemini_generate_content(
+            api_key=api_key,
+            model=model,
+            parts=parts,
+            timeout_seconds=timeout_seconds,
+            # media_resolution 제거 — API 호환성 문제로 Gemini 호출 실패 원인
+        )
+        import logging
+        _glog = logging.getLogger("ocr_policy")
+        _glog.info(f"[Gemini-call] raw_out_len={len(out) if out else 0}, preview={repr((out or '')[:300])}")
+        j = _extract_json_from_model_text(out)
+        _glog.info(f"[Gemini-call] parsed_json={'ok' if isinstance(j, dict) else 'FAIL'}, type={type(j).__name__}")
+        if isinstance(j, dict):
+            return j
+    except Exception as e:
+        import logging
+        logging.getLogger("ocr_policy").error(f"[Gemini-call] EXCEPTION: {type(e).__name__}: {e}")
+    return None
+
+
+# =========================================================
+# ✅ Valid standard tag codes (ReceiptTags.swift 완전 동기화)
+# =========================================================
+_VALID_TAG_CODES: set = {
+    # 검사 — 영상
+    "exam_xray", "exam_ct", "exam_mri", "exam_endoscope", "exam_biopsy",
+    # 검사 — 초음파 (세분화)
+    "exam_echo", "exam_us_abdomen", "exam_us_general",
+    # 검사 — 혈액 (세분화)
+    "exam_blood_cbc", "exam_blood_chem", "exam_blood_general",
+    "exam_blood_type", "exam_coagulation", "exam_electrolyte", "exam_crp",
+    # 검사 — 심장 (세분화)
+    "exam_ecg", "exam_heart_general",
+    # 검사 — 활력징후
+    "exam_vitals",
+    # 검사 — 호르몬
+    "exam_hormone",
+    # 검사 — 기타
+    "exam_lab_panel", "exam_urine", "exam_fecal", "exam_fecal_pcr",
+    "exam_sdma", "exam_probnp", "exam_fructosamine", "exam_glucose_curve",
+    "exam_blood_gas", "exam_allergy", "exam_eye", "exam_skin", "exam_general",
+    "exam_ear", "exam_microscope",
+    # 예방접종
+    "vaccine_rabies", "vaccine_comprehensive", "vaccine_corona",
+    "vaccine_kennel", "vaccine_fip", "vaccine_parainfluenza", "vaccine_lepto",
+    # 예방약/구충
+    "prevent_heartworm", "prevent_external", "prevent_deworming",
+    # 처방약 (medicine_ prefix — iOS ReceiptTag 기준)
+    "medicine_antibiotic", "medicine_anti_inflammatory", "medicine_allergy",
+    "medicine_gi", "medicine_ear", "medicine_skin", "medicine_eye",
+    "medicine_painkiller", "medicine_steroid", "medicine_oral",
+    # 처치/진료/입원
+    "care_injection", "care_fluid", "care_transfusion", "care_oxygen",
+    "care_emergency", "care_catheter", "care_procedure_fee", "care_dressing",
+    "care_anal_gland", "care_ear_flush",
+    "hospitalization",
+    # 수술 (세분화)
+    "surgery_general", "surgery_spay_neuter", "surgery_tumor",
+    "surgery_foreign_body", "surgery_cesarean", "surgery_hernia", "surgery_eye",
+    # 치과
+    "dental_scaling", "dental_extraction", "dental_treatment",
+    # 관절
+    "ortho_patella", "ortho_arthritis",
+    # 재활
+    "rehab_therapy",
+    # 기타
+    "microchip", "euthanasia", "funeral",
+    "care_e_collar", "care_prescription_diet",
+    "supply_food", "supply_supplement", "supply_goods",
+    "checkup_general", "grooming_basic", "etc_fee", "etc_discount", "etc_other",
+}
+
+# ✅ 레거시 태그 → 새 태그 자동 변환 (Gemini가 옛 코드 리턴 시)
+_TAG_MIGRATION: Dict[str, str] = {
+    # 옛 통합 태그 → 새 일반 태그
+    "exam_blood": "exam_blood_general",
+    "exam_ultrasound": "exam_us_general",
+    "exam_heart": "exam_heart_general",
+    # drug_ → medicine_ (Gemini 프롬프트에 drug_ 안 쓰지만 혹시)
+    "drug_antibiotic": "medicine_antibiotic",
+    "drug_pain_antiinflammatory": "medicine_anti_inflammatory",
+    "drug_steroid": "medicine_steroid",
+    "drug_gi": "medicine_gi",
+    "drug_allergy": "medicine_allergy",
+    "drug_eye": "medicine_eye",
+    "drug_ear": "medicine_ear",
+    "drug_skin": "medicine_skin",
+    "drug_general": "medicine_oral",
+    # 기타 레거시
+    "grooming": "grooming_basic",
+    "surgery": "surgery_general",
+    "dental": "dental_scaling",
+    "checkup": "checkup_general",
+    "medicine": "medicine_oral",
+    "emergency": "care_emergency",
+}
+
+
+def _migrate_tag(code: str) -> Optional[str]:
+    """태그 코드를 정규화: valid면 그대로, 레거시면 변환, 아니면 None."""
+    if not code:
+        return None
+    c = code.strip().lower()
+    if c in _VALID_TAG_CODES:
+        return c
+    migrated = _TAG_MIGRATION.get(c)
+    if migrated and migrated in _VALID_TAG_CODES:
+        return migrated
+    return None
+
+
+# =========================================================
+# ✅ Gemini ↔ Vision OCR 교차검증 (가격 교정)
+# =========================================================
+def _cross_validate_prices(
+    gemini_items: List[Dict[str, Any]],
+    ocr_text: str,
+) -> List[Dict[str, Any]]:
+    """
+    Gemini가 추출한 항목의 가격을 Vision OCR 텍스트와 교차검증.
+    OCR 텍스트에서 항목명 근처 라인의 숫자를 찾아 Gemini 가격과 비교.
+    불일치 시 OCR 숫자로 교정.
+    """
+    if not ocr_text or not gemini_items:
+        return gemini_items
+
+    import logging
+    _xlog = logging.getLogger("ocr_policy.xval")
+
+    # OCR 텍스트를 라인별로 파싱: (라인텍스트, [숫자들])
+    ocr_lines: List[Tuple[str, List[int]]] = []
+    for raw_ln in ocr_text.splitlines():
+        ln = re.sub(r"\s+", " ", raw_ln).strip()
+        if not ln:
+            continue
+        nums = [int(x.replace(",", "")) for x in re.findall(r"[\d,]+\d", ln)]
+        nums = [n for n in nums if 100 <= abs(n) <= 50_000_000]
+        ocr_lines.append((ln, nums))
+
+    # OCR 텍스트에 등장하는 모든 가격 집합
+    all_ocr_prices: set = set()
+    for _, nums in ocr_lines:
+        for n in nums:
+            all_ocr_prices.add(n)
+            all_ocr_prices.add(-n)  # 할인 항목 대비
+
+    def _normalize_for_match(s: str) -> str:
+        s = re.sub(r"[^가-힣a-zA-Z0-9]", "", s.lower())
+        return s
+
+    corrected = []
+    for item in gemini_items:
+        nm = (item.get("itemName") or "").strip()
+        pr = item.get("price")
+        if not nm or pr is None:
+            corrected.append(item)
+            continue
+
+        # 가격이 OCR 텍스트에 존재하면 → OK
+        if pr in all_ocr_prices:
+            corrected.append(item)
+            continue
+
+        # 가격 불일치 → OCR 라인에서 항목명 매칭 후 올바른 가격 찾기
+        nm_norm = _normalize_for_match(nm)
+        # 항목명의 핵심 키워드 추출 (2글자 이상)
+        keywords = [w for w in re.findall(r"[가-힣a-zA-Z]{2,}", nm) if len(w) >= 2]
+
+        best_line_idx = -1
+        best_match_score = 0
+
+        for i, (ln_text, ln_nums) in enumerate(ocr_lines):
+            if not ln_nums:
+                continue
+            ln_norm = _normalize_for_match(ln_text)
+            # 전체 이름 포함 체크
+            if nm_norm and nm_norm in ln_norm:
+                score = len(nm_norm) * 3
+            else:
+                # 키워드 매칭 점수
+                score = sum(3 for kw in keywords if kw.lower() in ln_text.lower())
+            if score > best_match_score:
+                best_match_score = score
+                best_line_idx = i
+
+        if best_line_idx >= 0 and best_match_score >= 4:
+            _, candidate_nums = ocr_lines[best_line_idx]
+            # 후보 숫자 중 Gemini 가격과 가장 가까운 것 선택
+            if candidate_nums:
+                # 금액 컬럼: 보통 마지막 숫자가 최종 금액
+                # 단가×수량인 경우도 있으니, Gemini 가격과 가장 가까운 것 우선
+                closest = min(candidate_nums, key=lambda n: abs(abs(n) - abs(pr)))
+                # 할인 항목이면 부호 유지
+                if pr < 0:
+                    closest = -abs(closest)
+                if closest != pr:
+                    _xlog.warning(
+                        f"[XVAL] price corrected: '{nm}' "
+                        f"gemini={pr} → ocr={closest} "
+                        f"(line: {ocr_lines[best_line_idx][0][:60]})"
+                    )
+                    item = dict(item)
+                    item["price"] = closest
+                    item["_price_corrected"] = True
+
+        corrected.append(item)
+
+    return corrected
+
+
+# =========================================================
+# ✅ 누락 항목 복구: Vision OCR → Gemini 보충
+# =========================================================
+def _recover_missing_items(
+    gemini_items: List[Dict[str, Any]],
+    ocr_text: str,
+    total_amount: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Vision OCR 텍스트에서 추출한 항목 중 Gemini 결과에 없는 것을 보충.
+    특히 비슷한 이름의 항목(혈액 검사 등)이 누락될 때 유효.
+    """
+    if not ocr_text or not gemini_items:
+        return gemini_items
+
+    import logging
+    _rlog = logging.getLogger("ocr_policy.recover")
+
+    # Vision OCR 텍스트에서 항목 추출
+    ocr_items = _extract_items_from_text(ocr_text)
+    if not ocr_items:
+        return gemini_items
+
+    # Gemini 합계 vs totalAmount 비교 → 누락 여부 판단
+    gemini_sum = sum(it.get("price") or 0 for it in gemini_items)
+    if total_amount and abs(gemini_sum - total_amount) < 500:
+        # 합계 거의 맞음 → 누락 없음
+        _rlog.info(f"[RECOVER] sum matches: gemini={gemini_sum}, total={total_amount}, skip")
+        return gemini_items
+
+    _rlog.warning(
+        f"[RECOVER] sum mismatch: gemini={gemini_sum}, total={total_amount}, "
+        f"diff={abs(gemini_sum - (total_amount or 0))}, "
+        f"gemini_count={len(gemini_items)}, ocr_count={len(ocr_items)}"
+    )
+
+    def _norm_name(s: str) -> str:
+        return re.sub(r"[^가-힣a-zA-Z0-9]", "", s.lower())
+
+    # Gemini 항목의 (정규화된이름, 가격) 집합
+    gemini_keys: set = set()
+    gemini_names_norm: set = set()
+    for it in gemini_items:
+        nm = _norm_name(it.get("itemName") or "")
+        pr = it.get("price") or 0
+        gemini_keys.add((nm, pr))
+        gemini_names_norm.add(nm)
+
+    # OCR 항목 중 Gemini에 없는 것 찾기
+    recovered: List[Dict[str, Any]] = []
+    for ocr_it in ocr_items:
+        ocr_nm = _norm_name(ocr_it.get("itemName") or "")
+        ocr_pr = ocr_it.get("price") or 0
+
+        if not ocr_nm or ocr_pr == 0:
+            continue
+
+        # 정확히 같은 (이름, 가격) 이미 있으면 스킵
+        if (ocr_nm, ocr_pr) in gemini_keys:
+            continue
+
+        # 이름이 같고 가격만 다른 경우 → 가격 차이가 크면 별도 항목일 수 있음
+        # 이름이 아예 없는 경우 → 누락된 항목
+        name_exists = False
+        for gn in gemini_names_norm:
+            # 서로 포함 관계인지 체크 (부분 매칭)
+            if ocr_nm and gn and (ocr_nm in gn or gn in ocr_nm):
+                # 이름은 비슷하지만 가격이 상당히 다르면 별도 항목
+                matching_prices = [
+                    it.get("price") or 0 for it in gemini_items
+                    if _norm_name(it.get("itemName") or "") == gn
+                    or ocr_nm in _norm_name(it.get("itemName") or "")
+                    or _norm_name(it.get("itemName") or "") in ocr_nm
+                ]
+                if any(abs(mp - ocr_pr) < max(500, abs(ocr_pr) * 0.1) for mp in matching_prices):
+                    name_exists = True
+                    break
+                # 가격이 많이 다르면 → 별도 항목으로 간주 (추가)
+
+        if not name_exists:
+            _rlog.warning(
+                f"[RECOVER] adding missing item: '{ocr_it.get('itemName')}' = {ocr_pr}"
+            )
+            recovered.append({
+                "itemName": ocr_it["itemName"],
+                "price": ocr_pr,
+                "categoryTag": None,
+                "_recovered_from_ocr": True,
+            })
+
+    if recovered:
+        result = list(gemini_items) + recovered
+        new_sum = sum(it.get("price") or 0 for it in result)
+        _rlog.warning(
+            f"[RECOVER] added {len(recovered)} items, "
+            f"new_sum={new_sum} (was {gemini_sum}, total={total_amount})"
+        )
+        # 새 합계가 totalAmount에서 너무 벗어나면 잘못된 복구 → 원래대로
+        if total_amount and abs(new_sum - total_amount) > abs(gemini_sum - total_amount):
+            _rlog.warning("[RECOVER] new sum is WORSE, reverting")
+            return gemini_items
+        return result
+
+    return gemini_items
+
+
+def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Normalize Gemini-first result into (parsed, tags)."""
+    parsed: Dict[str, Any] = {
+        "hospitalName": None,
+        "visitDate": None,
+        "totalAmount": None,
+        "items": [],
+        "ocrText": "",
+    }
+
+    hn = j.get("hospitalName")
+    if isinstance(hn, str) and hn.strip():
+        parsed["hospitalName"] = hn.strip()[:80]
+
+    vd = j.get("visitDate")
+    if isinstance(vd, str) and vd.strip():
+        d = _parse_date_from_text(vd.strip())
+        parsed["visitDate"] = d.isoformat() if d else vd.strip()[:20]
+
+    ta = _coerce_int_amount(j.get("totalAmount"))
+    parsed["totalAmount"] = ta if ta and ta > 0 else None
+
+    items = j.get("items")
+    tags_set: set = set()
+    cleaned: List[Dict[str, Any]] = []
+
+    if isinstance(items, list):
+        for it in items[:120]:
+            if not isinstance(it, dict):
+                continue
+            nm = str(it.get("itemName") or "").strip()
+            if not nm:
+                continue
+            nm = _canonicalize_item_name(_clean_item_name(nm))
+            if not nm or _is_noise_line(nm):
+                continue
+            pr = _coerce_int_amount(it.get("price"))
+            orig_pr = _coerce_int_amount(it.get("originalPrice"))
+            disc = _coerce_int_amount(it.get("discount"))
+            # 음수 금액은 할인 항목으로 허용
+
+            ct = (it.get("categoryTag") or "").strip() or None
+            sn = (it.get("standardName") or "").strip() or None
+
+            # ✅ 태그 마이그레이션 적용
+            if ct:
+                ct = _migrate_tag(ct)
+            if ct:
+                tags_set.add(ct)
+
+            item_entry = {
+                "itemName": nm,
+                "price": pr,
+                "categoryTag": ct,
+                "standardName": sn,
+            }
+            if orig_pr is not None:
+                item_entry["originalPrice"] = orig_pr
+            if disc is not None and disc > 0:
+                item_entry["discount"] = disc
+            cleaned.append(item_entry)
+
+    parsed["items"] = cleaned
+
+    raw_tags = j.get("tags")
+    if isinstance(raw_tags, list):
+        for t in raw_tags:
+            migrated = _migrate_tag(str(t).strip())
+            if migrated:
+                tags_set.add(migrated)
+
+    return parsed, list(tags_set)[:10]
+
+
+# =========================================================
+# Core function: process_receipt
+# =========================================================
+def process_receipt(
+    raw_bytes: bytes,
+    *,
+    google_credentials: str = "",
+    ocr_timeout_seconds: int = 12,
+    ocr_max_concurrency: int = 4,
+    ocr_sema_acquire_timeout_seconds: float = 1.0,
+    receipt_max_width: int = 2048,       # ✅ 1024→2048: OCR 해상도 대폭 향상
+    receipt_webp_quality: int = 85,
+    image_max_pixels: int = 20_000_000,
+    gemini_enabled: Optional[bool] = None,
+    gemini_api_key: Optional[str] = None,
+    gemini_model_name: Optional[str] = None,
+    gemini_timeout_seconds: Optional[int] = None,
+    **kwargs,
+) -> Tuple[bytes, Dict[str, Any], Dict[str, Any]]:
+    if not raw_bytes:
+        raise ValueError("empty raw bytes")
+
+    Image, ImageOps, ImageDraw = _load_pil()
+
+    img = Image.open(io.BytesIO(raw_bytes))
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    if img.mode == "RGBA":
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+
+    img = _ensure_max_pixels(img, int(image_max_pixels or 0))
+
+    # ✅ 원본 해상도 보존 (저장/표시용)
+    img_display = _resize_to_width(img.copy(), int(receipt_max_width or 0))
+
+    # ✅ OCR용 이미지: 더 높은 해상도 유지 + 전처리 적용
+    ocr_max_w = max(int(receipt_max_width or 0), 2048)  # OCR엔 최소 2048px 보장
+    img_ocr = _resize_to_width(img.copy(), ocr_max_w)
+    img_ocr = _preprocess_for_ocr(img_ocr)
+
+    ocr_buf = io.BytesIO()
+    img_ocr.save(ocr_buf, format="PNG")
+    ocr_image_bytes = ocr_buf.getvalue()
+
+    g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
+    g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
+    g_model = (gemini_model_name if gemini_model_name is not None else os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")) or "gemini-3-flash-preview"
+    g_timeout = max(60, int(gemini_timeout_seconds if gemini_timeout_seconds is not None else int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60") or "60")))
+
+    hints: Dict[str, Any] = {
+        "ocrEngine": "none",
+        "geminiUsed": False,
+        "pipeline": "gemini_first",
+    }
+
+    gemini_parsed = None
+    gemini_tags: List[str] = []
+
+    import logging
+    _log = logging.getLogger("ocr_policy")
+    _log.info(f"[Gemini] enabled={g_enabled}, key_present={bool(g_key.strip())}, model={g_model}")
+
+    # ✅ Step 1: Google Vision OCR 먼저 실행 (텍스트 추출)
+    ocr_text = ""
+    vision_resp = None
+
+    sema = _get_sema(int(ocr_max_concurrency or 4))
+    acquired = sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
+    if not acquired:
+        _log.warning("[Vision] semaphore busy, will try Gemini without OCR text")
+        hints["visionSkipped"] = "semaphore_busy"
+    else:
+        try:
+            try:
+                ocr_text, vision_resp = _vision_ocr(
+                    ocr_image_bytes,
+                    google_credentials=google_credentials,
+                    timeout_seconds=int(ocr_timeout_seconds or 12),
+                )
+                if hints["ocrEngine"] == "none":
+                    hints["ocrEngine"] = "google_vision"
+                _log.info(f"[Vision] ocr_text_len={len(ocr_text)}")
+            except Exception as e:
+                hints["visionError"] = str(e)[:200]
+                ocr_text = ""
+                vision_resp = None
+        finally:
+            try:
+                sema.release()
+            except Exception:
+                pass
+
+    # ✅ Step 2: Gemini 실행 (이미지 + Vision OCR 텍스트 동시 전달)
+    if g_enabled and g_key.strip():
+        try:
+            gj = _gemini_parse_receipt_full(
+                image_bytes=ocr_image_bytes,
+                api_key=g_key,
+                model=g_model,
+                timeout_seconds=g_timeout,
+                ocr_text=ocr_text,
+            )
+            _log.info(f"[Gemini] raw result type={type(gj).__name__}, keys={list(gj.keys()) if isinstance(gj, dict) else 'N/A'}")
+            if isinstance(gj, dict):
+                gemini_parsed, gemini_tags = _normalize_gemini_full_result(gj)
+                hints["geminiUsed"] = True
+                hints["ocrEngine"] = f"gemini:{g_model}"
+                _log.info(f"[Gemini] items={len(gemini_parsed.get('items', []))}, tags={gemini_tags}")
+
+                # ✅ Step 3: Gemini ↔ Vision OCR 가격 교차검증
+                if ocr_text and gemini_parsed.get("items"):
+                    before_count = len(gemini_parsed["items"])
+                    gemini_parsed["items"] = _cross_validate_prices(
+                        gemini_parsed["items"], ocr_text
+                    )
+                    corrected_count = sum(
+                        1 for it in gemini_parsed["items"] if it.get("_price_corrected")
+                    )
+                    if corrected_count > 0:
+                        _log.warning(f"[XVAL] {corrected_count}/{before_count} prices corrected by Vision OCR")
+                        hints["xval_corrected"] = corrected_count
+
+                    # ✅ Step 4: 누락 항목 복구 (Vision OCR에서 보충)
+                    total_amt = gemini_parsed.get("totalAmount")
+                    before_recover = len(gemini_parsed["items"])
+                    gemini_parsed["items"] = _recover_missing_items(
+                        gemini_parsed["items"], ocr_text, total_amt
+                    )
+                    recovered_count = len(gemini_parsed["items"]) - before_recover
+                    if recovered_count > 0:
+                        _log.warning(f"[RECOVER] {recovered_count} items recovered from Vision OCR")
+                        hints["recovered_items"] = recovered_count
+        except Exception as e:
+            _log.error(f"[Gemini] ERROR: {e}")
+            hints["geminiError"] = str(e)[:200]
+    else:
+        _log.warning(f"[Gemini] SKIPPED: enabled={g_enabled}, key_present={bool(g_key.strip())}")
+
+    # ✅ 저장/표시용은 display 이미지 사용 (용량 절약)
+    original_webp = _to_webp_bytes(img_display, quality=int(receipt_webp_quality or 85))
+    redacted = _redact_image_with_vision_tokens(img_display.copy(), vision_resp)
+    redacted_webp = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
+    webp_bytes = redacted_webp
+
+    if gemini_parsed and gemini_parsed.get("items"):
+        parsed = gemini_parsed
+        parsed["ocrText"] = (ocr_text or "")[:8000]
+        hints["pipeline"] = "gemini_primary"
+    else:
+        parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
+        hints.update(regex_hints)
+        hints["pipeline"] = "vision_regex_fallback"
+
+        if gemini_parsed:
+            if not parsed.get("hospitalName") and gemini_parsed.get("hospitalName"):
+                parsed["hospitalName"] = gemini_parsed["hospitalName"]
+            if not parsed.get("visitDate") and gemini_parsed.get("visitDate"):
+                parsed["visitDate"] = gemini_parsed["visitDate"]
+            if not parsed.get("totalAmount") and gemini_parsed.get("totalAmount"):
+                parsed["totalAmount"] = gemini_parsed["totalAmount"]
+
+    if not isinstance(parsed.get("items"), list):
+        parsed["items"] = []
+    parsed["items"] = parsed["items"][:120]
+    if parsed.get("totalAmount") is not None:
+        try:
+            parsed["totalAmount"] = int(parsed["totalAmount"])
+        except Exception:
+            parsed["totalAmount"] = None
+    parsed["ocrText"] = (ocr_text or "")[:8000]
+
+    hints["tags"] = gemini_tags if gemini_tags else []
+
+    return webp_bytes, original_webp, parsed, hints
+
+
+# =========================================================
+# Bridge function for main.py compatibility
+# =========================================================
+def process_receipt_image(
+    raw_bytes: bytes,
+    *,
+    timeout: int = 12,
+    max_concurrency: int = 4,
+    sema_timeout: float = 1.0,
+    max_pixels: int = 20_000_000,
+    receipt_max_width: int = 2048,       # ✅ 1024→2048
+    receipt_webp_quality: int = 85,
+    gemini_enabled: bool = True,
+    gemini_api_key: str = "",
+    gemini_model_name: str = "gemini-3-flash-preview",
+    gemini_timeout: int = 20,            # ✅ 10→20: Gemini 3 thinking 시간 확보
+    **kwargs,
+) -> dict:
+    if not raw_bytes:
+        raise OCRImageError("empty raw bytes")
+
+    try:
+        webp_bytes, original_webp, parsed, hints = process_receipt(
+            raw_bytes,
+            google_credentials="",
+            ocr_timeout_seconds=timeout,
+            ocr_max_concurrency=max_concurrency,
+            ocr_sema_acquire_timeout_seconds=sema_timeout,
+            receipt_max_width=receipt_max_width,
+            receipt_webp_quality=receipt_webp_quality,
+            image_max_pixels=max_pixels,
+            gemini_enabled=gemini_enabled,
+            gemini_api_key=gemini_api_key,
+            gemini_model_name=gemini_model_name,
+            gemini_timeout_seconds=gemini_timeout,
+        )
+    except OCRConcurrencyError:
+        raise
+    except OCRTimeoutError:
+        raise
+    except OCRImageError:
+        raise
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "semaphore" in msg or "busy" in msg:
+            raise OCRConcurrencyError(str(e)) from e
+        if "timeout" in msg:
+            raise OCRTimeoutError(str(e)) from e
+        raise
+    except ValueError as e:
+        raise OCRImageError(str(e)) from e
+
+    items_for_main = []
+    for it in (parsed.get("items") or []):
+        entry = {
+            "name": it.get("itemName") or "",
+            "price": it.get("price"),
+            "categoryTag": it.get("categoryTag"),
+            "standardName": it.get("standardName"),
+        }
+        items_for_main.append(entry)
+
+    meta = {
+        "hospital_name": parsed.get("hospitalName"),
+        "visit_date": parsed.get("visitDate"),
+        "total_amount": parsed.get("totalAmount"),
+        "address_hint": (hints or {}).get("addressHint"),
+        "ocr_engine": (hints or {}).get("ocrEngine"),
+        "gemini_used": (hints or {}).get("geminiUsed", False),
+        "pipeline": (hints or {}).get("pipeline", "unknown"),
+        "tags": (hints or {}).get("tags", []),
+    }
+
+    return {
+        "ocr_text": parsed.get("ocrText") or "",
+        "items": items_for_main,
+        "meta": meta,
+        "webp_bytes": webp_bytes,
+        "original_webp_bytes": original_webp,
+        "content_type": "image/webp",
+    }
 
