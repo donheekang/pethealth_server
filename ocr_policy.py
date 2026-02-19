@@ -937,28 +937,8 @@ def _claude_parse_receipt(
         },
     ]
 
-    # Vision OCR 텍스트: 가격(숫자) 검증 및 항목 수 확인용
-    if (ocr_text or "").strip():
-        user_content.append({
-            "type": "text",
-            "text": (
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "SUPPLEMENTARY: OCR text (for PRICE/NUMBER verification ONLY)\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "⚠️ WARNING: This OCR text often has GARBLED item names (e.g. '고기인물' instead of '고가약물').\n"
-                "DO NOT copy item names from this text. ALWAYS read item names from the IMAGE.\n"
-                "\n"
-                "USE THIS TEXT ONLY FOR:\n"
-                "1. Counting how many line items exist (to make sure you don't miss any)\n"
-                "2. Verifying NUMBERS/PRICES (the digits are usually accurate)\n"
-                "\n"
-                "DO NOT USE THIS TEXT FOR:\n"
-                "- Item names (read names from the IMAGE only)\n"
-                "- Replacing or modifying names you read from the image\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                + (ocr_text or "").strip()[:6000]
-            ),
-        })
+    # ✅ Claude는 이미지만 직접 봄 — OCR 텍스트 전달 안 함
+    # (Vision OCR 텍스트가 깨진 이름을 포함해서 오히려 방해됨)
 
     import urllib.request
 
@@ -1475,25 +1455,17 @@ def process_receipt(
     if ai_result_json is None:
         _log.warning("[AI] both Claude and Gemini failed or disabled")
 
-    # --- 정규화 + 후처리 ---
+    # --- 정규화 ---
     if isinstance(ai_result_json, dict):
         ai_parsed, ai_tags = _normalize_gemini_full_result(ai_result_json)
         _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}")
 
-        # ✅ Step 3: AI ↔ Vision OCR 가격 교차검증
-        if ocr_text and ai_parsed.get("items"):
-            before_count = len(ai_parsed["items"])
-            ai_parsed["items"] = _cross_validate_prices(
-                ai_parsed["items"], ocr_text
-            )
-            corrected_count = sum(
-                1 for it in ai_parsed["items"] if it.get("_price_corrected")
-            )
-            if corrected_count > 0:
-                _log.warning(f"[XVAL] {corrected_count}/{before_count} prices corrected by Vision OCR")
-                hints["xval_corrected"] = corrected_count
+        # Claude 사용 시: 이미지 직접 읽기 → 후처리 불필요 (Claude를 신뢰)
+        # Gemini 폴백 시: OCR 교차검증 + 누락 복구 적용
+        if not hints.get("claudeUsed") and ocr_text and ai_parsed.get("items"):
+            # Gemini 폴백인 경우만 OCR 기반 로깅
+            _cross_validate_prices(ai_parsed["items"], ocr_text)
 
-            # ✅ Step 4: 누락 항목 복구 (Vision OCR에서 보충)
             total_amt = ai_parsed.get("totalAmount")
             before_recover = len(ai_parsed["items"])
             ai_parsed["items"] = _recover_missing_items(
