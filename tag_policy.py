@@ -145,7 +145,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "귀검사","이경","검이경","이경검사","otoscope","otoscopy","이도검사",
         "귀내시경","이도내시경","ear exam","ear examination","ear check",
         "검사-귀","귀-set","귀set","이경+현미경","귀검진","이도검진",
-        "귀진찰","외이도검사","외이도","이개검사",
+        "귀진찰","외이도검사","이개검사",
         "검사귀set","검사귀","귀현미경","귀현미경도말",
     ]},
     {"code": "exam_microscope", "group": "exam", "aliases": [
@@ -274,6 +274,8 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "처방약","약값","처방료","조제료","약제비","약제","투약","투약료","복약",
         "약비","처방전","처방","조제","약국","약","medicine","medication","med",
         "복용","경구투여",
+        "고가약물","고가약","약물","캡슐조제","캡슐조제료","내복약조제","내복약조제료",
+        "조제비","약제료","처방조제","조제약",
     ]},
     # === 처치/수액/응급/수혈 ===
     {"code": "care_injection", "group": "checkup", "aliases": [
@@ -321,7 +323,8 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     ]},
     {"code": "care_ear_flush", "group": "checkup", "aliases": [
         "귀세척","이도세척","ear flush","ear cleaning","ear irrigation","귀청소",
-        "귀관리","이도관리",
+        "귀관리","이도관리","외이도세정","외이도세척","이도세정","귀세정",
+        "ear wash","외이세정","외이세척",
     ]},
     # === 입원 ===
     {"code": "hospitalization", "group": "checkup", "aliases": [
@@ -427,6 +430,13 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "병원사료","hill's","hills","royal canin","k/d","c/d","i/d","z/d",
         "처방전용사료","의료용사료","치료식","치료용사료","로얄캐닌","힐스",
         "처방식이","처방용사료","처방캔","처방파우치","처방간식",
+        "로얄","로얄독","로얄캣","하이포알러지","하이포알러제닉","hypoallergenic",
+        "스몰독","미디엄독","라지독","가수분해","hydrolyzed",
+        "소화기케어","유리너리","레날","hepatic","스킨케어","뉴트리드",
+        "sensitivity control","sensitivity","세인시티비티",
+        "로얄독하이포","로얄독하이포알러지","독하이포알러지","하이포알러지스몰",
+        "인도어","라이프스테이지","스킨앤코트","skin&coat",
+        "로얄 독 하이포","독 하이포 알러지",
     ]},
     {"code": "supply_food", "group": "etc", "aliases": [
         "사료","건사료","습식사료","캔","캔사료","간식","간식류","트릿","treat",
