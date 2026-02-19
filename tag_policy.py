@@ -94,6 +94,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "lab panel","screening","health check","종합검사","종합검진","패널검사",
         "건강검진","건강검사","정기검진","종합건강","기본검진","annual check",
         "예방검진","스크리닝","건강진단",
+        "검사료","검사비","검사비용","수가적","종합검사료",
     ]},
     {"code": "exam_urine", "group": "exam", "aliases": [
         "urinalysis","ua","urine test","요검사","소변검사","뇨검사","요분석",
@@ -411,8 +412,8 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     ]},
     # === 마이크로칩 ===
     {"code": "microchip", "group": "etc", "aliases": [
-        "마이크로칩","microchip","chip","칩","내장형칩","동물등록","동물 등록",
-        "pet registration","칩삽입","등록","반려동물등록","인식칩",
+        "마이크로칩","microchip","chip","내장형칩","동물등록","동물 등록",
+        "pet registration","칩삽입","반려동물등록","인식칩",
     ]},
     # === 안락사/장례 ===
     {"code": "euthanasia", "group": "etc", "aliases": [
@@ -747,8 +748,20 @@ def _match_score_single(tag: Dict[str, Any], q_raw: str) -> Tuple[int, Dict[str,
         if a_norm == q_norm:
             best = max(best, 180); hit += 1; strong = True; why.append(f"eq:{a}")
         elif q_norm.find(a_norm) >= 0:
-            s = 120 + min(60, len(a_norm) * 2)
-            best = max(best, s); hit += 1; strong = True; why.append(f"inQuery:{a}")
+            # ✅ 짧은 한글 별명(2~3글자)이 더 긴 단어의 일부로만 매칭되는 경우 감점
+            # 예: "사료" in "검사료" → 잘못된 매칭 (별도 단어가 아님)
+            idx = q_norm.find(a_norm)
+            is_false_substring = False
+            if len(a_norm) <= 3 and any("\uac00" <= c <= "\ud7a3" for c in a_norm):
+                # 앞 글자가 한글이면 → 독립 단어가 아님
+                if idx > 0 and "\uac00" <= q_norm[idx - 1] <= "\ud7a3":
+                    is_false_substring = True
+            if is_false_substring:
+                s = min(80, 60 + len(a_norm) * 2)  # threshold 미만으로 억제
+                best = max(best, s); why.append(f"falseSubstr:{a}")
+            else:
+                s = 120 + min(60, len(a_norm) * 2)
+                best = max(best, s); hit += 1; strong = True; why.append(f"inQuery:{a}")
         elif a_norm.find(q_norm) >= 0:
             kr_bonus = 10 if len(q_norm) <= 4 and any("가" <= c <= "힣" for c in q_norm) else 0
             s = 90 + min(40, len(q_norm) * 2) + kr_bonus
