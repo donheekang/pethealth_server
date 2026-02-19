@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     GEMINI_ENABLED: bool = True           # ✅ False→True: Gemini OCR 기본 활성화
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL_NAME: str = "gemini-3-flash-preview"  # ✅ 2.5-flash→3-flash: OCR 정확도 대폭 향상
-    GEMINI_TIMEOUT_SECONDS: int = 20      # ✅ 10→20: Gemini 3 thinking 시간 확보
+    GEMINI_TIMEOUT_SECONDS: int = 60      # ✅ 10→60: Gemini 3 이미지 thinking 시간 충분히 확보
 
     TAG_RECORD_THRESHOLD: int = 125
     TAG_ITEM_THRESHOLD: int = 140
@@ -1895,6 +1895,10 @@ def process_receipt(
     ocr_text = result.get("ocr_text") or ""
     items_raw = result.get("items") or []
     meta = result.get("meta") or {}
+    # 🔍 디버그: Gemini 파이프라인 상태 로깅
+    import logging as _logging
+    _dlog = _logging.getLogger("receipt_debug")
+    _dlog.warning(f"[OCR-RESULT] pipeline={meta.get('pipeline')}, geminiUsed={meta.get('geminiUsed')}, geminiError={meta.get('geminiError')}, items={len(items_raw)}, ocrEngine={meta.get('ocrEngine')}")
     webp_bytes = result.get("webp_bytes") or raw          # 마스킹본
     original_webp = result.get("original_webp_bytes")      # 원본
     content_type = result.get("content_type") or "image/webp"
