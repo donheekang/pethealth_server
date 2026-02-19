@@ -1664,6 +1664,11 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 items_rows = cur.fetchall() or []
                 payload = dict(row)
                 payload["items"] = [dict(x) for x in items_rows]
+                # pet 정보 추가 (종, 이름)
+                pet_info = db_fetchone("SELECT name, species FROM public.pets WHERE id=%s", (pet_uuid,))
+                if pet_info:
+                    payload["pet_name"] = pet_info.get("name")
+                    payload["pet_species"] = pet_info.get("species")
                 return jsonable_encoder(payload)
     except HTTPException:
         raise
@@ -1686,12 +1691,12 @@ def api_records_list(petId: Optional[str] = Query(None), includeItems: bool = Qu
         if petId:
             pet_uuid = _uuid_or_400(petId, "petId")
             rows = db_fetchall(
-                "SELECT r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.receipt_image_path, r.file_size_bytes, r.created_at, r.updated_at FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND p.id=%s AND r.deleted_at IS NULL ORDER BY r.visit_date DESC, r.created_at DESC",
+                "SELECT r.id, r.pet_id, p.name AS pet_name, p.species AS pet_species, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.receipt_image_path, r.file_size_bytes, r.created_at, r.updated_at FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND p.id=%s AND r.deleted_at IS NULL ORDER BY r.visit_date DESC, r.created_at DESC",
                 (uid, pet_uuid),
             )
         else:
             rows = db_fetchall(
-                "SELECT r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.receipt_image_path, r.file_size_bytes, r.created_at, r.updated_at FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.deleted_at IS NULL ORDER BY r.visit_date DESC, r.created_at DESC",
+                "SELECT r.id, r.pet_id, p.name AS pet_name, p.species AS pet_species, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.receipt_image_path, r.file_size_bytes, r.created_at, r.updated_at FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.deleted_at IS NULL ORDER BY r.visit_date DESC, r.created_at DESC",
                 (uid,),
             )
         if not includeItems:
@@ -1726,7 +1731,7 @@ def api_record_get(recordId: str = Query(...), user: Dict[str, Any] = Depends(ge
     try:
         record_uuid = _uuid_or_400(rid, "recordId")
         row = db_fetchone(
-            "SELECT r.id, r.pet_id, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.receipt_image_path, r.file_size_bytes, r.created_at, r.updated_at FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.id=%s AND r.deleted_at IS NULL",
+            "SELECT r.id, r.pet_id, p.name AS pet_name, p.species AS pet_species, r.hospital_mgmt_no, r.hospital_name, r.visit_date, r.total_amount, r.pet_weight_at_visit, r.tags, r.receipt_image_path, r.file_size_bytes, r.created_at, r.updated_at FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.id=%s AND r.deleted_at IS NULL",
             (uid, record_uuid),
         )
         if not row:
@@ -1913,7 +1918,7 @@ def process_receipt(
     db_touch_user(uid, desired_tier=desired)
 
     pet_uuid = _uuid_or_400(petId, "petId")
-    pet = db_fetchone("SELECT id, name, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
+    pet = db_fetchone("SELECT id, name, species, weight_kg FROM public.pets WHERE id=%s AND user_uid=%s", (pet_uuid, uid))
     if not pet:
         raise HTTPException(status_code=404, detail="pet not found")
     selected_pet_name = (pet.get("name") or "").strip()
@@ -2246,6 +2251,8 @@ def process_receipt(
                     "mode": "direct",
                     "draftId": str(rec_row["id"]),
                     "petId": str(rec_row["pet_id"]),
+                    "petName": selected_pet_name or None,
+                    "petSpecies": (pet.get("species") or "").strip() or None,
                     "draftReceiptPath": rec_row.get("receipt_image_path") or file_path,
                     "fileSizeBytes": int(rec_row.get("file_size_bytes") or file_size),
                     "visitDate": rec_row["visit_date"].isoformat() if hasattr(rec_row.get("visit_date"), "isoformat") else str(rec_row.get("visit_date") or vd),
