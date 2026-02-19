@@ -155,11 +155,17 @@ def _coerce_int_amount(s: Any) -> Optional[int]:
         except Exception:
             return None
     if isinstance(s, str):
-        m = _AMOUNT_RE.search(s.replace(" ", ""))
+        cleaned = s.replace(" ", "")
+        # 음수 처리: "-88,000" or "-88000"
+        is_negative = cleaned.startswith("-")
+        if is_negative:
+            cleaned = cleaned[1:]
+        m = _AMOUNT_RE.search(cleaned)
         if not m:
             return None
         try:
-            return int(m.group(0).replace(",", ""))
+            val = int(m.group(0).replace(",", ""))
+            return -val if is_negative else val
         except Exception:
             return None
     return None
@@ -679,17 +685,20 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
 # ✅ Gemini-first receipt parsing prompt (세분화 태그 동기화)
 # =========================================================
 _GEMINI_RECEIPT_PROMPT = """\
-You are analyzing a Korean veterinary hospital receipt image.
-Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
+You are a precision OCR data extractor for Korean veterinary hospital receipts.
+Your ONLY job: read the receipt image and output a JSON object with EXACT data from the receipt.
+Do NOT interpret, rename, translate, standardize, or infer anything. Just copy what you see.
+
+Return ONLY valid JSON (no markdown, no code fences, no explanation):
 
 {
-  "hospitalName": "병원이름" or null,
+  "hospitalName": "exact hospital name from receipt" or null,
   "visitDate": "YYYY-MM-DD" or null,
   "totalAmount": integer or null,
   "discountAmount": integer or null,
   "items": [
     {
-      "itemName": "진료항목명 (영수증에 적힌 그대로)",
+      "itemName": "exact item text from receipt",
       "price": integer_or_null,
       "originalPrice": integer_or_null,
       "discount": integer_or_null
@@ -697,36 +706,102 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
   ]
 }
 
-RULES:
-1. items = EVERY line item on the receipt. Include ALL: treatments, vaccines, medicines, tests, procedures, fees, injections, fluids, supplements, disposables.
-2. itemName = copy the EXACT text from the receipt. Do NOT translate, rename, or standardize.
-   - 예: "진료비" → "진료비" (NOT "진찰료"), "*병리검사(혈액-CRP)" → "*병리검사(혈액-CRP)"
-   - Keep asterisks (*), brackets [], parentheses () exactly as they appear.
-3. NEVER include as items: addresses, phone numbers, dates, totals/subtotals/합계 lines, tax lines, hospital info, patient info.
-4. totalAmount = the final payment amount (합계/총액/청구금액/결제요청금액), NOT sum of items.
-5. PRICE ACCURACY (매우 중요!!):
-   - Copy the EXACT price number from the receipt. Do NOT guess or approximate.
-   - 예: 77,000 → 77000 (NOT 71000), 9,900 → 9900 (NOT 5500)
-   - If a line shows "수량 x 단가 = 금액", use the 금액 (total for that line).
-   - If quantity > 1, report the TOTAL price (수량 × 단가), not the unit price.
-6. DISCOUNT HANDLING (중요!!):
-   - price = actual charged amount (할인 적용 후 금액).
-   - originalPrice = original amount before discount. null if no discount.
-   - discount = discount amount as positive integer. null if no discount.
-   - discountAmount at top level = total discount across all items.
-   - 할인 항목이 별도 라인으로 있으면 반드시 items에 포함하고, price는 반드시 음수!!
-     예시: "절사할인" → price: -200, "동물종합검진B코스 할인" → price: -88000
-     "쿠폰 할인 뼈없는소고기캔" → price: -12600
-   - CRITICAL: ANY item whose name contains "할인", "절사", "감면", "환급", "쿠폰", "discount"
-     MUST have a NEGATIVE price value (e.g. -88000, NOT 88000).
-   - The price field for discount lines represents the amount SUBTRACTED from the total.
-7. COMPLETENESS CHECK (항목 누락 방지 — 매우 중요!!):
-   - Extract EVERY SINGLE line item. Do NOT skip any item, even if unclear.
-   - After extracting, VERIFY: sum of all item prices should approximately equal totalAmount.
-   - If the sum is significantly different from totalAmount, you are MISSING items. Go back and re-read the receipt.
-   - Common missed items: 진료비/재진료, 주사료, 수액, 약값, 처치료, 검사비 등.
-   - Items with * or special markers are still valid items — do NOT skip them.
-8. If an item has quantity (수량) > 1, report the TOTAL price for that line (수량 × 단가).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 1: EXTRACT EVERY LINE ITEM — ZERO EXCEPTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Read the receipt TOP to BOTTOM. Every row that has a name + price = one item.
+- Include ALL categories found on receipts:
+  · 진료비/진찰료/재진/초진 (consultation fees)
+  · 검사 (tests): 혈액, CBC, 화학, 전해질, CRP, X-ray, 초음파, 심전도, 세포검사 등
+  · 처치 (procedures): 수액, 주사, 소독, 드레싱, 천자, 카테터 등
+  · 수술 (surgery): 마취, 중성화, 발치, 정형외과 등
+  · 약 (medication): 내복약, 외용제, 연고, 점안액, 귀약, 주사약, 항생제 등
+  · 미용 (grooming): 목욕, 미용, 발바닥 밀기 등
+  · 용품 (supplies): 넥칼라, 사료, 캔, 간식, 보조제 등
+  · 입원 (hospitalization): 입원비, 식이 관리, 모니터링 등
+  · 할인 (discounts): 절사할인, 쿠폰할인, 회원할인 등
+  · 기타: 제증명, 진단서, 기타 비용
+- Items with *, **, †, brackets [], or any symbol → STILL extract them.
+- If the receipt has MULTIPLE SECTIONS (e.g. "진료 내역", "용품 내역") → extract from ALL sections.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 2: itemName = EXACT COPY FROM RECEIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Copy the item name CHARACTER BY CHARACTER from the receipt.
+- 예시:
+  · "진찰료-초진" → "진찰료-초진" (NOT "진료비", NOT "기본진료")
+  · "*병리검사(혈액-CRP)" → "*병리검사(혈액-CRP)"
+  · "검사-귀-set(검이경,현미경도말)" → "검사-귀-set(검이경,현미경도말)" (NOT "귀검사")
+  · "처치-복수천자(복수 제거 목적)" → "처치-복수천자(복수 제거 목적)" (NOT "처치료")
+  · "내복약 1일 2회 (5~10kg)" → "내복약 1일 2회 (5~10kg)"
+  · "로얄- cat) 마더앤 베이비캣 소프트 무스" → "로얄- cat) 마더앤 베이비캣 소프트 무스"
+- Keep ALL: parentheses (), brackets [], asterisks *, hyphens -, slashes /, dots.
+- Do NOT shorten, summarize, translate to English, or replace with a category name.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Copy the EXACT integer from the receipt. Do NOT round, guess, or approximate.
+- 예시: receipt shows "77,000" → price: 77000 (NOT 71000, NOT 70000)
+       receipt shows "9,900" → price: 9900 (NOT 5500, NOT 10000)
+       receipt shows "2,600" → price: 2600 (NOT 2000)
+- QUANTITY HANDLING:
+  · If receipt shows "수량: 4 × 단가: 22,000 = 88,000" → price: 88000 (use the total)
+  · If receipt shows "내복약 1일 × 7 = 31,500" → price: 31500 (use the total)
+  · If only unit price visible with quantity → multiply: price = 수량 × 단가
+- price = null ONLY if truly no price is visible for that item.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 4: DISCOUNT ITEMS → NEGATIVE PRICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Discount lines are separate items with NEGATIVE price.
+- ANY item containing: 할인, 절사, 감면, 환급, 쿠폰, discount → price MUST be negative.
+- 예시:
+  · "동물종합검진B코스 할인" → price: -88000
+  · "쿠폰 할인 뼈없는소고기캔" → price: -12600
+  · "절사할인" → price: -200
+  · "할인/할증" line showing -100,600 → price: -100600
+- originalPrice and discount fields: for regular items that received a discount.
+  · originalPrice = amount before discount. null if no discount on this item.
+  · discount = discount amount as positive integer. null if no discount.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 5: totalAmount = FINAL PAYMENT AMOUNT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- totalAmount = the amount the customer actually pays.
+- Look for: 결제요청, 청구금액, 합계, 총액, 결제금액, 수납액.
+- If multiple totals exist (소계 vs 청구금액), use the FINAL one (결제요청/청구금액).
+- discountAmount = total discount amount (할인/할증 합계). null if none.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 6: SELF-VERIFICATION (필수 검증)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Before returning your JSON, perform these checks:
+
+CHECK 1 — Item count:
+  Count the number of line items visible on the receipt.
+  Your items array must have the SAME count (± discount lines).
+  If you have fewer items than visible lines → you MISSED items. Re-read the receipt.
+
+CHECK 2 — Price sum:
+  Calculate: sum of all your item prices (including negative discount prices).
+  Compare to totalAmount.
+  If |sum - totalAmount| > 1000 → you have WRONG prices or MISSING items.
+  Go back and fix before returning.
+
+CHECK 3 — Name accuracy:
+  For each item, verify the itemName matches the receipt text exactly.
+  If you wrote a generic name like "진료비" but the receipt says "진찰료-초진" → fix it.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 7: DO NOT INCLUDE THESE AS ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- 합계/소계/총액 summary lines
+- 부가세/VAT lines
+- 주소, 전화번호, 사업자등록번호
+- 날짜, 시간
+- 병원명, 수의사명, 환자명/보호자명
+- 카드 결제 정보, 승인번호
 """
 
 
