@@ -222,3 +222,41 @@ def resolve_record_tags(*, items, hospital_name=None, ocr_text=None, record_thre
                 item_tags.append({"idx": idx, "itemName": nm, "categoryTag": bc, "score": bs, **(be or {})})
     return {"tags": picked, "itemCategoryTags": item_tags, "evidence": evidence}
 
+
+# =========================================================
+# main.py 호환 함수: classify_item / classify_record
+# =========================================================
+def classify_item(item_name: str, threshold: int = 100) -> Optional[str]:
+    """단일 항목명 → 최적 태그 코드 반환. 매칭 안 되면 None."""
+    if not (item_name or "").strip():
+        return None
+    best_code = None
+    best_score = 0
+    for tag in TAG_CATALOG:
+        s, _ = _match_score(tag, item_name)
+        if s > best_score:
+            best_score = s
+            best_code = tag["code"]
+    if best_code and best_score >= threshold:
+        if best_code == "etc_other":
+            return None
+        return best_code
+    return None
+
+
+def classify_record(items: list, ocr_text: str = "", threshold: int = 120) -> List[str]:
+    """항목 리스트 + OCR 텍스트 → 레코드 수준 태그 코드 리스트 반환."""
+    converted = []
+    for it in (items or []):
+        nm = (it.get("name") or it.get("itemName") or "").strip()
+        if nm:
+            converted.append({"itemName": nm})
+    result = resolve_record_tags(
+        items=converted,
+        ocr_text=ocr_text,
+        record_thresh=threshold,
+        item_thresh=max(80, threshold - 20),
+        return_item_tags=False,
+    )
+    return result.get("tags", [])
+
