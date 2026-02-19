@@ -1004,7 +1004,16 @@ async def debug_gemini_test():
         if resp.status_code == 200:
             text = ""
             try:
-                text = body["candidates"][0]["content"]["parts"][0]["text"]
+                parts_list = body["candidates"][0]["content"]["parts"]
+                # Gemini 3: thinking 파트 건너뛰고 실제 응답만 추출
+                for p in parts_list:
+                    if p.get("thought") or p.get("thinking"):
+                        continue
+                    if p.get("text"):
+                        text = p["text"]
+                        break
+                if not text and parts_list:
+                    text = parts_list[-1].get("text", "(파싱 실패)")
             except Exception:
                 text = "(파싱 실패)"
             return {
