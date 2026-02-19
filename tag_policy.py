@@ -17,7 +17,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     # === 혈액검사 세분화 ===
     {"code": "exam_blood_cbc", "group": "exam", "aliases": ["cbc","complete blood count","혈구검사","혈구","CBC검사","blood count"]},
     {"code": "exam_blood_chem", "group": "exam", "aliases": ["chemistry","biochem","biochemistry","생화학","생화학검사","간수치","신장수치","간기능","신장기능","chemistry panel","chem"]},
-    {"code": "exam_blood_general", "group": "exam", "aliases": ["blood test","profile","혈액","혈액검사","피검사","피검","blood work","bloodwork"]},
+    {"code": "exam_blood_general", "group": "exam", "aliases": ["blood test","profile","혈액","혈액검사","피검사","피검","blood work","bloodwork","혈액프로필","혈액 프로필","혈액 패널"]},
     {"code": "exam_blood_type", "group": "exam", "aliases": ["혈액형","혈액형검사","blood type","blood typing","crossmatch","교차시험"]},
     {"code": "exam_coagulation", "group": "exam", "aliases": ["응고검사","응고","coagulation","pt","aptt","pt/aptt","프로트롬빈","피브리노겐","fibrinogen"]},
     {"code": "exam_electrolyte", "group": "exam", "aliases": ["전해질","전해질검사","electrolyte","나트륨","칼륨","칼슘","calcium","phosphorus"]},
@@ -38,8 +38,10 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "exam_glucose_curve", "group": "exam", "aliases": ["glucose curve","blood glucose curve","bg curve","혈당곡선","혈당커브","연속혈당"]},
     {"code": "exam_blood_gas", "group": "exam", "aliases": ["blood gas","bga","bgas","i-stat","istat","혈액가스","가스분석"]},
     {"code": "exam_allergy", "group": "exam", "aliases": ["allergy test","ige","atopy","알러지검사","알레르기검사","알러지","알레르기"]},
-    {"code": "exam_eye", "group": "exam", "aliases": ["schirmer","fluorescein","iop","ophthalmic exam","안압","형광염색","안과검사","안과","눈검사"]},
-    {"code": "exam_skin", "group": "exam", "aliases": ["skin scraping","cytology","fungal test","malassezia","피부스크래핑","피부검사","진균","곰팡이","말라세지아"]},
+    {"code": "exam_eye", "group": "exam", "aliases": ["schirmer","fluorescein","iop","ophthalmic exam","안압","형광염색","안과검사","안과","눈검사","안압측정"]},
+    {"code": "exam_skin", "group": "exam", "aliases": ["skin scraping","cytology","fungal test","malassezia","피부스크래핑","피부검사","진균","곰팡이","말라세지아","피부사상균"]},
+    # === 기본 신체검사 / 활력징후 ===
+    {"code": "exam_vitals", "group": "exam", "aliases": ["혈압","혈압측정","혈압검사","blood pressure","bp측정","bp","체온","체온측정","체중","체중측정","몸무게","체중계","심박","심박수","맥박","활력징후","vitals","vital sign"]},
     # === 예방접종 ===
     {"code": "vaccine_comprehensive", "group": "vaccine", "aliases": ["dhpp","dhppi","dhlpp","5-in-1","6-in-1","fvrcp","combo vaccine","종합백신","혼합백신","5종백신","6종백신","5종접종","6종접종"]},
     {"code": "vaccine_rabies", "group": "vaccine", "aliases": ["rabies","rabbies","rabie","rabis","rab","rabi","ra","rabies vac","rabies vaccine","광견병","광견","광견병백신","광견병접종","예방접종"]},
@@ -62,10 +64,10 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "medicine_ear", "group": "medicine", "aliases": ["ear drop","otic","otitis","otomax","surolan","posatex","easotic","귀약","이염","외이염"]},
     {"code": "medicine_skin", "group": "medicine", "aliases": ["dermatitis","chlorhexidine","ketoconazole","miconazole","피부약","피부염"]},
     {"code": "medicine_allergy", "group": "medicine", "aliases": ["apoquel","cytopoint","cetirizine","zyrtec","benadryl","알러지","알레르기","가려움"]},
-    {"code": "medicine_oral", "group": "medicine", "aliases": ["내복약","경구약","먹는약","oral","oral med","oral medication","po","per os","처방약","약값"]},
+    {"code": "medicine_oral", "group": "medicine", "aliases": ["내복약","경구약","먹는약","oral","oral med","oral medication","po","per os","처방약","약값","처방료","조제료","약제비","약제","약값","투약","투약료","복약"]},
     # === 처치/수액/응급/수혈 ===
-    {"code": "care_injection", "group": "checkup", "aliases": ["inj","injection","shot","sc","im","iv","주사","주사제","피하주사","근육주사","정맥주사","주사료"]},
-    {"code": "care_fluid", "group": "checkup", "aliases": ["수액","링거","iv fluid","fluid therapy","수액처치","수액치료","피하수액","정맥수액","lactated ringer","생리식염수","normal saline","수액세트","링거액","hartmann"]},
+    {"code": "care_injection", "group": "checkup", "aliases": ["inj","injection","shot","sc","im","iv","주사","주사제","피하주사","근육주사","정맥주사","주사료","주사비","주사처치"]},
+    {"code": "care_fluid", "group": "checkup", "aliases": ["수액","링거","iv fluid","fluid therapy","수액처치","수액치료","피하수액","정맥수액","lactated ringer","생리식염수","normal saline","수액세트","링거액","hartmann","수액비","수액료"]},
     {"code": "care_transfusion", "group": "checkup", "aliases": ["수혈","transfusion","blood transfusion","전혈","packed rbc","혈장","plasma","수혈비","혈액제제","fresh frozen plasma","ffp"]},
     {"code": "care_oxygen", "group": "checkup", "aliases": ["산소","산소치료","산소방","산소텐트","oxygen","oxygen therapy","o2","산소공급","산소케이지"]},
     {"code": "care_emergency", "group": "checkup", "aliases": ["응급","응급처치","응급진료","emergency","ER","응급비","응급진료비","야간진료","야간응급","심폐소생","CPR","cpr"]},
@@ -75,9 +77,9 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "care_anal_gland", "group": "checkup", "aliases": ["항문낭","항문낭짜기","항문낭세척","anal gland","anal sac","항문선","항문낭 압출"]},
     {"code": "care_ear_flush", "group": "checkup", "aliases": ["귀세척","이도세척","ear flush","ear cleaning","ear irrigation","귀청소"]},
     # === 입원 ===
-    {"code": "hospitalization", "group": "checkup", "aliases": ["입원","입원비","입원료","hospitalization","hospital stay","icu","중환자","중환자실","집중치료","입원관리","입원케어","케이지","cage"]},
+    {"code": "hospitalization", "group": "checkup", "aliases": ["입원","입원비","입원료","hospitalization","hospital stay","icu","중환자","중환자실","집중치료","입원관리","입원케어","케이지","cage","입원실","입원1일","입원관찰"]},
     # === 수술 세분화 ===
-    {"code": "surgery_general", "group": "surgery", "aliases": ["surgery","operation","수술","봉합","마취","마취료","마취-호흡","흡입마취","전신마취","국소마취"]},
+    {"code": "surgery_general", "group": "surgery", "aliases": ["surgery","operation","수술","봉합","마취","마취료","마취-호흡","흡입마취","전신마취","국소마취","수술비","수술료","수술재료","수술재료비","봉합사"]},
     {"code": "surgery_spay_neuter", "group": "surgery", "aliases": ["중성화","spay","neuter","castration","ovariohysterectomy","ohe","수컷 중성화","암컷 중성화","자궁적출","난소적출","고환적출","중성화수술"]},
     {"code": "surgery_tumor", "group": "surgery", "aliases": ["종양","종양제거","종양수술","tumor","tumor removal","mass removal","mass","lump","혹제거","혹","종괴","종괴제거"]},
     {"code": "surgery_foreign_body", "group": "surgery", "aliases": ["이물","이물제거","이물수술","foreign body","foreign body removal","이물질","위절개","장절개","gastrotomy","enterotomy"]},
@@ -85,9 +87,9 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "surgery_hernia", "group": "surgery", "aliases": ["탈장","탈장수술","hernia","hernia repair","회음부탈장","서혜부탈장","perineal hernia","inguinal hernia","배꼽탈장","umbilical hernia"]},
     {"code": "surgery_eye", "group": "surgery", "aliases": ["안과수술","eye surgery","체리아이","cherry eye","백내장","백내장수술","cataract","안구적출","enucleation","안구","눈수술","각막수술"]},
     # === 치과 ===
-    {"code": "dental_scaling", "group": "dental", "aliases": ["scaling","dental cleaning","tartar","스케일링","치석"]},
-    {"code": "dental_extraction", "group": "dental", "aliases": ["extraction","dental extraction","발치"]},
-    {"code": "dental_treatment", "group": "dental", "aliases": ["잇몸","잇몸치료","치주","치주치료","periodontal","gingival","불소","불소도포","fluoride","치아치료","root canal","신경치료"]},
+    {"code": "dental_scaling", "group": "dental", "aliases": ["scaling","dental cleaning","tartar","스케일링","치석","치석제거","스켈링","dental prophylaxis"]},
+    {"code": "dental_extraction", "group": "dental", "aliases": ["extraction","dental extraction","발치","발치술","치아발치","tooth extraction"]},
+    {"code": "dental_treatment", "group": "dental", "aliases": ["잇몸","잇몸치료","치주","치주치료","periodontal","gingival","불소","불소도포","fluoride","치아치료","root canal","신경치료","치과","치과치료","구강","구강검진"]},
     # === 관절/정형 ===
     {"code": "ortho_patella", "group": "orthopedic", "aliases": ["mpl","lpl","patella","patellar luxation","슬개골탈구","슬탈","파행"]},
     {"code": "ortho_arthritis", "group": "orthopedic", "aliases": ["arthritis","oa","osteoarthritis","관절염","퇴행성관절"]},
@@ -101,8 +103,9 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     # === 기타 ===
     {"code": "care_e_collar", "group": "etc", "aliases": ["e-collar","ecollar","cone","elizabethan collar","넥카라","엘리자베스카라","보호카라"]},
     {"code": "care_prescription_diet", "group": "etc", "aliases": ["prescription diet","rx diet","therapeutic diet","처방식","처방사료","병원사료","hill's","hills","royal canin","k/d","c/d","i/d","z/d"]},
-    {"code": "checkup_general", "group": "checkup", "aliases": ["checkup","consult","opd","진료","상담","초진","재진","진찰","진료비"]},
+    {"code": "checkup_general", "group": "checkup", "aliases": ["checkup","consult","opd","진료","상담","초진","재진","진찰","진료비","초진료","재진료","진찰료","상담료","진료비용","진찰비","consultation","진료료","외래"]},
     {"code": "grooming_basic", "group": "grooming", "aliases": ["grooming","bath","trim","미용","목욕","클리핑"]},
+    {"code": "etc_fee", "group": "etc", "aliases": ["재료비","재료대","소모품","소모품비","위생비","위생용품","일회용품","material fee","supply fee","수납","수납비"]},
     {"code": "etc_other", "group": "etc", "aliases": ["기타","etc","other"]},
 ]
 
@@ -163,7 +166,9 @@ def _match_score(tag: Dict[str, Any], query: str) -> Tuple[int, Dict[str, Any]]:
             s = 120 + min(60, len(a_norm) * 2)
             best = max(best, s); hit += 1; strong = True; why.append(f"inQuery:{a}")
         elif a_norm.find(q_norm) >= 0:
-            s = 90 + min(40, len(q_norm) * 2)
+            # 한국어 짧은 항목명(2~4자)이 alias에 정확히 포함되면 가산
+            kr_bonus = 10 if len(q_norm) <= 4 and any("가" <= c <= "힣" for c in q_norm) else 0
+            s = 90 + min(40, len(q_norm) * 2) + kr_bonus
             best = max(best, s); hit += 1; why.append(f"queryInAlias:{a}")
     if hit >= 2: best += min(35, hit * (8 if strong else 5)); why.append(f"bonus:{hit}")
     return best, {"why": why[:10]}
@@ -185,7 +190,7 @@ def _build_record_query(items, hospital_name, ocr_text=None):
         if ocr_lines: parts.append(" | ".join(ocr_lines)[:2000])
     return " | ".join(parts)[:4000]
 
-def resolve_record_tags(*, items, hospital_name=None, ocr_text=None, record_thresh=125, item_thresh=120, max_tags=8, return_item_tags=True, **kw):
+def resolve_record_tags(*, items, hospital_name=None, ocr_text=None, record_thresh=120, item_thresh=100, max_tags=8, return_item_tags=True, **kw):
     query = _build_record_query(items or [], hospital_name, ocr_text=ocr_text)
     if not query.strip(): return {"tags": [], "itemCategoryTags": [], "evidence": {"policy": "catalog", "reason": "empty_query"}}
     scored = []
