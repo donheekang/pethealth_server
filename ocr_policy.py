@@ -698,11 +698,17 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
 }
 
 RULES:
-1. items = EVERY medical line item on the receipt: treatments, vaccines, medicines, tests, procedures, fees.
+1. items = EVERY line item on the receipt. Include ALL: treatments, vaccines, medicines, tests, procedures, fees, injections, fluids, supplements, disposables.
 2. itemName = copy the EXACT text from the receipt. Do NOT translate, rename, or standardize.
-3. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
-4. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
-5. Be precise with prices — copy exact amounts from the receipt.
+   - 예: "진료비" → "진료비" (NOT "진찰료"), "*병리검사(혈액-CRP)" → "*병리검사(혈액-CRP)"
+   - Keep asterisks (*), brackets [], parentheses () exactly as they appear.
+3. NEVER include as items: addresses, phone numbers, dates, totals/subtotals/합계 lines, tax lines, hospital info, patient info.
+4. totalAmount = the final payment amount (합계/총액/청구금액/결제요청금액), NOT sum of items.
+5. PRICE ACCURACY (매우 중요!!):
+   - Copy the EXACT price number from the receipt. Do NOT guess or approximate.
+   - 예: 77,000 → 77000 (NOT 71000), 9,900 → 9900 (NOT 5500)
+   - If a line shows "수량 x 단가 = 금액", use the 금액 (total for that line).
+   - If quantity > 1, report the TOTAL price (수량 × 단가), not the unit price.
 6. DISCOUNT HANDLING (중요!!):
    - price = actual charged amount (할인 적용 후 금액).
    - originalPrice = original amount before discount. null if no discount.
@@ -714,9 +720,13 @@ RULES:
    - CRITICAL: ANY item whose name contains "할인", "절사", "감면", "환급", "쿠폰", "discount"
      MUST have a NEGATIVE price value (e.g. -88000, NOT 88000).
    - The price field for discount lines represents the amount SUBTRACTED from the total.
-7. Extract ALL items — do not skip any line item, even if you are unsure what it is.
-   Include discount lines (절사할인, 할인, 쿠폰할인 etc.) as items with NEGATIVE price.
-8. If an item has quantity (수량) > 1, still report it as a single item with the total price.
+7. COMPLETENESS CHECK (항목 누락 방지 — 매우 중요!!):
+   - Extract EVERY SINGLE line item. Do NOT skip any item, even if unclear.
+   - After extracting, VERIFY: sum of all item prices should approximately equal totalAmount.
+   - If the sum is significantly different from totalAmount, you are MISSING items. Go back and re-read the receipt.
+   - Common missed items: 진료비/재진료, 주사료, 수액, 약값, 처치료, 검사비 등.
+   - Items with * or special markers are still valid items — do NOT skip them.
+8. If an item has quantity (수량) > 1, report the TOTAL price for that line (수량 × 단가).
 """
 
 
