@@ -687,12 +687,14 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
   "visitDate": "YYYY-MM-DD" or null,
   "totalAmount": integer or null,
   "discountAmount": integer or null,
+  "petNames": ["동물이름1", "동물이름2"] or [],
   "items": [
     {
       "itemName": "진료항목명 (영수증에 적힌 그대로)",
       "price": integer_or_null,
       "originalPrice": integer_or_null,
-      "discount": integer_or_null
+      "discount": integer_or_null,
+      "petName": "해당 동물이름" or null
     }
   ]
 }
@@ -713,6 +715,12 @@ RULES:
 7. Extract ALL items — do not skip any line item, even if you are unsure what it is.
    Include discount lines (절사할인, 할인, 쿠폰할인 etc.) as items with negative price.
 8. If an item has quantity (수량) > 1, still report it as a single item with the total price.
+9. PET NAME DETECTION (다두 영수증 처리):
+   - petNames = list of all pet/animal names found on the receipt (e.g. ["뚱이", "빡이"]).
+   - If the receipt has sections grouped by pet name, set each item's "petName" to the pet it belongs to.
+   - If only ONE pet on the receipt or names are unclear, set petNames to [] and each item's petName to null.
+   - Discount lines (할인, 절사할인) that apply to the whole receipt: set petName to null.
+   - Common patterns: "뚱이", "빡이" as section headers, or "환자명: XXX" labels.
 """
 
 
@@ -859,6 +867,7 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
         "hospitalName": None,
         "visitDate": None,
         "totalAmount": None,
+        "petNames": [],
         "items": [],
         "ocrText": "",
     }
@@ -874,6 +883,11 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
 
     ta = _coerce_int_amount(j.get("totalAmount"))
     parsed["totalAmount"] = ta if ta and ta > 0 else None
+
+    # petNames 추출 (다두 영수증)
+    raw_pet_names = j.get("petNames")
+    if isinstance(raw_pet_names, list):
+        parsed["petNames"] = [str(pn).strip() for pn in raw_pet_names if isinstance(pn, str) and pn.strip()]
 
     items = j.get("items")
     tags_set: set = set()
@@ -903,12 +917,17 @@ def _normalize_gemini_full_result(j: Dict[str, Any]) -> Tuple[Dict[str, Any], Li
             if ct:
                 tags_set.add(ct)
 
+            # petName 추출 (다두 영수증)
+            pet_name_raw = (it.get("petName") or "").strip() or None
+
             item_entry = {
                 "itemName": nm,
                 "price": pr,
                 "categoryTag": ct,
                 "standardName": sn,
             }
+            if pet_name_raw:
+                item_entry["petName"] = pet_name_raw
             if orig_pr is not None:
                 item_entry["originalPrice"] = orig_pr
             if disc is not None and disc > 0:
@@ -1134,17 +1153,21 @@ def process_receipt_image(
 
     items_for_main = []
     for it in (parsed.get("items") or []):
-        items_for_main.append({
+        entry = {
             "name": it.get("itemName") or "",
             "price": it.get("price"),
             "categoryTag": it.get("categoryTag"),
             "standardName": it.get("standardName"),
-        })
+        }
+        if it.get("petName"):
+            entry["petName"] = it["petName"]
+        items_for_main.append(entry)
 
     meta = {
         "hospital_name": parsed.get("hospitalName"),
         "visit_date": parsed.get("visitDate"),
         "total_amount": parsed.get("totalAmount"),
+        "petNames": parsed.get("petNames") or [],
         "address_hint": (hints or {}).get("addressHint"),
         "ocr_engine": (hints or {}).get("ocrEngine"),
         "gemini_used": (hints or {}).get("geminiUsed", False),
