@@ -2076,7 +2076,20 @@ def process_receipt(
     draft_id = str(uuid.uuid4())
 
     # 할인 항목(음수 가격)도 합산하여 실제 결제 금액 계산
-    total_amount = sum(fi.get("price") or 0 for fi in final_items if fi.get("price") is not None)
+    items_sum = sum(fi.get("price") or 0 for fi in final_items if fi.get("price") is not None)
+
+    # Gemini가 반환한 totalAmount와 항목 합계 비교 검증
+    gemini_total = meta.get("total_amount")
+    if gemini_total and gemini_total > 0:
+        total_amount = gemini_total  # Gemini totalAmount 우선 사용 (영수증의 합계/청구금액)
+        diff = abs(gemini_total - items_sum)
+        diff_pct = (diff / gemini_total * 100) if gemini_total else 0
+        if diff_pct > 5:
+            _dlog.warning(f"[VALIDATION] 항목 합계({items_sum})와 totalAmount({gemini_total}) 차이: {diff}원 ({diff_pct:.1f}%) — 항목 누락 가능성")
+        else:
+            _dlog.info(f"[VALIDATION] 항목 합계({items_sum}) ≈ totalAmount({gemini_total}) OK (차이 {diff_pct:.1f}%)")
+    else:
+        total_amount = items_sum if items_sum > 0 else 0
 
     pet_weight = None
     try:
