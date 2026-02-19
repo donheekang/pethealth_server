@@ -975,6 +975,68 @@ async def debug_ocr_status():
     }
 
 
+@app.get("/api/debug/gemini-test")
+async def debug_gemini_test():
+    """
+    실제로 Gemini API를 호출해서 응답이 오는지 테스트.
+    브라우저에서 /api/debug/gemini-test 접속
+    """
+    import time, traceback, httpx
+    api_key = str(settings.GEMINI_API_KEY or "")
+    model = str(settings.GEMINI_MODEL_NAME or "gemini-3-flash-preview")
+
+    if not api_key:
+        return {"success": False, "error": "GEMINI_API_KEY가 비어있음"}
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": "Say 'hello' in Korean. Reply only one word."}]}],
+        "generationConfig": {"maxOutputTokens": 20},
+    }
+
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(url, json=payload)
+        elapsed = round(time.time() - t0, 2)
+        body = resp.json()
+
+        if resp.status_code == 200:
+            text = ""
+            try:
+                text = body["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception:
+                text = "(파싱 실패)"
+            return {
+                "success": True,
+                "model": model,
+                "status_code": resp.status_code,
+                "gemini_reply": text.strip(),
+                "elapsed_sec": elapsed,
+                "verdict": f"✅ Gemini 응답 정상 ({elapsed}초)",
+            }
+        else:
+            err_msg = body.get("error", {}).get("message", str(body)[:300])
+            return {
+                "success": False,
+                "model": model,
+                "status_code": resp.status_code,
+                "error": err_msg,
+                "elapsed_sec": elapsed,
+                "verdict": f"❌ Gemini 오류 {resp.status_code}: {err_msg[:200]}",
+            }
+    except Exception as e:
+        elapsed = round(time.time() - t0, 2)
+        return {
+            "success": False,
+            "model": model,
+            "error": str(e)[:300],
+            "traceback": traceback.format_exc()[-500:],
+            "elapsed_sec": elapsed,
+            "verdict": f"❌ 호출 실패: {str(e)[:200]}",
+        }
+
+
 @app.on_event("startup")
 def _startup():
     init_db_pool()
