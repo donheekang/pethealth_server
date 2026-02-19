@@ -689,155 +689,27 @@ Extract ALL information and return ONLY valid JSON (no markdown, no backticks):
   "discountAmount": integer or null,
   "items": [
     {
-      "itemName": "진료항목명",
+      "itemName": "진료항목명 (영수증에 적힌 그대로)",
       "price": integer_or_null,
       "originalPrice": integer_or_null,
-      "discount": integer_or_null,
-      "categoryTag": "standard_tag_code_or_null",
-      "standardName": "한글 표준명 or null"
+      "discount": integer_or_null
     }
-  ],
-  "tags": ["tag_code1", "tag_code2"]
+  ]
 }
 
 RULES:
-1. items = ONLY real medical treatments, vaccines, medicines, tests, procedures.
-2. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
-3. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
-4. Be precise with prices — copy exact amounts from the receipt.
-5. DISCOUNT HANDLING:
-   - If an item has a discount (할인, DC, 감면, 면제), set "price" = actual charged amount (할인 적용 후).
-   - Set "originalPrice" = original amount before discount.
-   - Set "discount" = discount amount (양수로 기입).
-   - If the receipt shows a separate discount line (할인, DC), include it as a discount item with negative price.
-   - "discountAmount" at top level = total discount across all items (할인합계).
-   - If no discount exists, set discount fields to null.
-
-STANDARD TAG CODES (use these exact codes for categoryTag):
-
-검사 — 영상:
-  exam_xray = 엑스레이 (X-ray, radiograph, 방사선, 치아 방사선)
-  exam_ct = CT (CT촬영, CT조영, computed tomography)
-  exam_mri = MRI (MRI촬영, magnetic resonance)
-  exam_endoscope = 내시경 (endoscopy, 위내시경, 장내시경, 관절경)
-  exam_biopsy = 조직검사/생검 (biopsy, FNA, 병리검사)
-
-검사 — 초음파:
-  exam_echo = 심장초음파 (echocardiogram, cardiac ultrasound, echo)
-  exam_us_abdomen = 복부초음파 (abdominal ultrasound, abd US)
-  exam_us_general = 초음파 (ultrasound, sono, sonography) — 부위 불명시
-
-검사 — 혈액:
-  exam_blood_cbc = CBC/혈구검사 (complete blood count, CBC, 혈액검사+CBC)
-  exam_blood_chem = 생화학검사 (chemistry, biochem, 간수치, 신장수치)
-  exam_blood_general = 혈액검사 (blood test, 혈검, 피검사) — 세부 불명시
-  exam_blood_type = 혈액형검사 (blood type, crossmatch)
-  exam_coagulation = 응고검사 (PT, aPTT, coagulation)
-  exam_electrolyte = 전해질검사 (electrolyte, 나트륨, 칼륨)
-  exam_crp = CRP/염증 (C-reactive protein, 염증수치)
-
-검사 — 심장:
-  exam_ecg = 심전도 (ECG, EKG, electrocardiogram)
-  exam_heart_general = 심장검사 (cardiac exam, heart check)
-
-검사 — 호르몬:
-  exam_hormone = 호르몬검사 (T4, T3, TSH, 갑상선, cortisol, ACTH)
-
-검사 — 기타:
-  exam_lab_panel = 종합검사 (종합검진, lab panel, screening)
-  exam_urine = 소변검사 (urinalysis, UA)
-  exam_fecal = 대변검사 (fecal, stool test)
-  exam_fecal_pcr = 대변 PCR (fecal PCR, GI PCR)
-  exam_sdma = SDMA (신장마커)
-  exam_probnp = proBNP (심장마커, NT-proBNP)
-  exam_fructosamine = 당화알부민 (fructosamine)
-  exam_glucose_curve = 혈당곡선 (glucose curve)
-  exam_blood_gas = 혈액가스 (blood gas, BGA, i-stat)
-  exam_allergy = 알러지 검사 (allergy test, IgE)
-  exam_eye = 안과검사 (schirmer, fluorescein, IOP, 안압)
-  exam_skin = 피부검사 (skin scraping, cytology, 진균)
-  exam_general = 기본검사/검진 (초진, 재진, 진찰, consult)
-
-예방접종:
-  vaccine_rabies = 광견병 백신 (rabies, RA, R/A, 광견)
-  vaccine_comprehensive = 종합백신 (DHPP, DHPPI, FVRCP, 5종백신, 6종백신)
-  vaccine_corona = 코로나 백신 (corona, coronavirus)
-  vaccine_kennel = 켄넬코프 (kennel cough, bordetella)
-  vaccine_fip = FIP (전염성복막염)
-  vaccine_parainfluenza = 파라인플루엔자 (parainfluenza)
-  vaccine_lepto = 렙토 (lepto, leptospirosis)
-
-예방약/구충:
-  prevent_heartworm = 심장사상충 (heartworm, heartgard)
-  prevent_external = 외부기생충 (flea, tick, bravecto, nexgard)
-  prevent_deworming = 구충 (deworm, drontal, milbemax)
-
-처방약 (medicine_ prefix):
-  medicine_antibiotic = 항생제 (antibiotic, amoxicillin, cephalexin, convenia)
-  medicine_anti_inflammatory = 소염제 (NSAID, meloxicam, carprofen)
-  medicine_painkiller = 진통제 (tramadol, gabapentin)
-  medicine_steroid = 스테로이드 (steroid, prednisone, prednisolone)
-  medicine_gi = 위장약 (famotidine, omeprazole, cerenia)
-  medicine_allergy = 알러지약 (apoquel, cytopoint)
-  medicine_eye = 안약 (eye drop, tobramycin)
-  medicine_ear = 귀약 (otic, otomax, surolan)
-  medicine_skin = 피부약 (chlorhexidine, ketoconazole)
-  medicine_oral = 내복약/경구약 (oral med, 먹는약, 내복약, 경구, 약값)
-
-처치/진료:
-  care_injection = 주사 (injection, SC, IM, IV)
-  care_fluid = 수액/링거 (IV fluid, 링거, 피하수액)
-  care_transfusion = 수혈 (transfusion, packed RBC)
-  care_oxygen = 산소치료 (oxygen, O2, 산소텐트)
-  care_emergency = 응급처치 (emergency, ER, CPR)
-  care_catheter = 카테터/도뇨 (catheter, 유치도뇨관)
-  care_procedure_fee = 처치료 (procedure fee, 시술료)
-  care_dressing = 드레싱 (bandage, gauze, 소독)
-  care_anal_gland = 항문낭 (anal gland)
-  care_ear_flush = 귀세척 (ear flush)
-
-수술:
-  surgery_general = 수술/마취 (surgery, 마취, 봉합)
-  surgery_spay_neuter = 중성화 (spay, neuter, 자궁적출)
-  surgery_tumor = 종양수술 (tumor removal, 혹제거)
-  surgery_foreign_body = 이물제거 (foreign body, gastrotomy)
-  surgery_cesarean = 제왕절개 (cesarean, c-section)
-  surgery_hernia = 탈장수술 (hernia)
-  surgery_eye = 안과수술 (cherry eye, 백내장, enucleation)
-
-치과:
-  dental_scaling = 스케일링 (scaling, dental cleaning)
-  dental_extraction = 발치 (extraction)
-  dental_treatment = 잇몸/치주치료 (periodontal, 불소도포)
-
-입원:
-  hospitalization = 입원 (hospitalization, ICU, 입원비)
-
-재활:
-  rehab_therapy = 재활/물리치료 (rehabilitation, 수중런닝머신, 레이저치료, 침치료)
-
-기타:
-  care_e_collar = 넥카라 (e-collar, cone)
-  care_prescription_diet = 처방식 (prescription diet, Hill's, Royal Canin)
-  microchip = 마이크로칩 (microchip, 동물등록)
-  euthanasia = 안락사 (euthanasia)
-  funeral = 장례/화장 (cremation, funeral)
-  grooming_basic = 미용 (grooming, bath, trim)
-  checkup_general = 기본진료 (checkup, consult, 초진, 재진)
-  ortho_patella = 슬개골 (patella, MPL, LPL)
-  ortho_arthritis = 관절염 (arthritis, OA)
-  etc_other = 기타
-
-CRITICAL MAPPING RULES:
-- Use the EXACT tag code from above for categoryTag.
-- standardName = the Korean standard name shown after "=" in the tag list.
-- For blood tests with CBC: use "exam_blood_cbc"
-- For general blood tests without specifics: use "exam_blood_general"
-- For 내복약/경구약/먹는약: use "medicine_oral"
-- For 호르몬/T4/갑상선: use "exam_hormone"
-- For 마취: use "surgery_general"
-- tags = list of unique categoryTag codes found across all items.
-- If you cannot determine the tag, set categoryTag: null, standardName: null.
+1. items = EVERY medical line item on the receipt: treatments, vaccines, medicines, tests, procedures, fees.
+2. itemName = copy the EXACT text from the receipt. Do NOT translate, rename, or standardize.
+3. NEVER include as items: addresses, phone numbers, dates, totals, tax lines, hospital info, patient info.
+4. totalAmount = the final payment amount (합계/총액/청구금액), NOT sum of items.
+5. Be precise with prices — copy exact amounts from the receipt.
+6. DISCOUNT HANDLING:
+   - price = actual charged amount (할인 적용 후 금액).
+   - originalPrice = original amount before discount. null if no discount.
+   - discount = discount amount as positive integer. null if no discount.
+   - discountAmount at top level = total discount across all items.
+7. Extract ALL items — do not skip any line item, even if you are unsure what it is.
+8. If an item has quantity (수량) > 1, still report it as a single item with the total price.
 """
 
 
@@ -902,6 +774,8 @@ _VALID_TAG_CODES: set = {
     "exam_blood_type", "exam_coagulation", "exam_electrolyte", "exam_crp",
     # 검사 — 심장 (세분화)
     "exam_ecg", "exam_heart_general",
+    # 검사 — 활력징후
+    "exam_vitals",
     # 검사 — 호르몬
     "exam_hormone",
     # 검사 — 기타
