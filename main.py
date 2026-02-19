@@ -99,8 +99,8 @@ class Settings(BaseSettings):
 
     GEMINI_ENABLED: bool = True           # ✅ False→True: Gemini OCR 기본 활성화
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL_NAME: str = "gemini-2.5-flash"
-    GEMINI_TIMEOUT_SECONDS: int = 15      # ✅ 10→15: 고해상도 이미지 처리 시간 확보
+    GEMINI_MODEL_NAME: str = "gemini-3-flash-preview"  # ✅ 2.5-flash→3-flash: OCR 정확도 대폭 향상
+    GEMINI_TIMEOUT_SECONDS: int = 20      # ✅ 10→20: Gemini 3 thinking 시간 확보
 
     TAG_RECORD_THRESHOLD: int = 125
     TAG_ITEM_THRESHOLD: int = 140
