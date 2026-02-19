@@ -220,6 +220,41 @@ def _to_webp_bytes(img, quality: int = 85) -> bytes:
 
 
 # -----------------------------
+# ✅ v2.6.0: 영수증 이미지 전처리 (OCR 인식률 향상)
+# -----------------------------
+def _preprocess_for_ocr(img):
+    """
+    감열지 영수증 대비 강화 + 선명도 + 노이즈 제거.
+    Pillow의 ImageEnhance/ImageFilter만 사용 (추가 의존성 없음).
+    """
+    try:
+        from PIL import ImageEnhance, ImageFilter
+
+        # 1) 그레이스케일 변환 → 색상 노이즈 제거
+        gray = img.convert("L")
+
+        # 2) 대비 강화 (감열지는 대비가 낮음)
+        enhancer = ImageEnhance.Contrast(gray)
+        gray = enhancer.enhance(1.8)  # 1.8배 대비 강화
+
+        # 3) 밝기 살짝 올림 (어두운 영수증 보정)
+        enhancer = ImageEnhance.Brightness(gray)
+        gray = enhancer.enhance(1.1)
+
+        # 4) 선명도 강화 (흐릿한 글씨 대응)
+        enhancer = ImageEnhance.Sharpness(gray)
+        gray = enhancer.enhance(2.0)
+
+        # 5) 가벼운 노이즈 제거
+        gray = gray.filter(ImageFilter.MedianFilter(size=3))
+
+        # 다시 RGB로 (OCR API 호환)
+        return gray.convert("RGB")
+    except Exception:
+        return img
+
+
+# -----------------------------
 # Google Vision OCR (optional)
 # -----------------------------
 def _build_vision_client(google_credentials: str):
@@ -986,7 +1021,7 @@ def process_receipt(
     ocr_timeout_seconds: int = 12,
     ocr_max_concurrency: int = 4,
     ocr_sema_acquire_timeout_seconds: float = 1.0,
-    receipt_max_width: int = 1024,
+    receipt_max_width: int = 2048,       # ✅ 1024→2048: OCR 해상도 대폭 향상
     receipt_webp_quality: int = 85,
     image_max_pixels: int = 20_000_000,
     gemini_enabled: Optional[bool] = None,
@@ -1010,10 +1045,17 @@ def process_receipt(
         img = bg
 
     img = _ensure_max_pixels(img, int(image_max_pixels or 0))
-    img = _resize_to_width(img, int(receipt_max_width or 0))
+
+    # ✅ 원본 해상도 보존 (저장/표시용)
+    img_display = _resize_to_width(img.copy(), int(receipt_max_width or 0))
+
+    # ✅ OCR용 이미지: 더 높은 해상도 유지 + 전처리 적용
+    ocr_max_w = max(int(receipt_max_width or 0), 2048)  # OCR엔 최소 2048px 보장
+    img_ocr = _resize_to_width(img.copy(), ocr_max_w)
+    img_ocr = _preprocess_for_ocr(img_ocr)
 
     ocr_buf = io.BytesIO()
-    img.save(ocr_buf, format="PNG")
+    img_ocr.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
 
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
@@ -1084,8 +1126,9 @@ def process_receipt(
             except Exception:
                 pass
 
-    original_webp = _to_webp_bytes(img, quality=int(receipt_webp_quality or 85))
-    redacted = _redact_image_with_vision_tokens(img.copy(), vision_resp)
+    # ✅ 저장/표시용은 display 이미지 사용 (용량 절약)
+    original_webp = _to_webp_bytes(img_display, quality=int(receipt_webp_quality or 85))
+    redacted = _redact_image_with_vision_tokens(img_display.copy(), vision_resp)
     redacted_webp = _to_webp_bytes(redacted, quality=int(receipt_webp_quality or 85))
     webp_bytes = redacted_webp
 
@@ -1131,12 +1174,12 @@ def process_receipt_image(
     max_concurrency: int = 4,
     sema_timeout: float = 1.0,
     max_pixels: int = 20_000_000,
-    receipt_max_width: int = 1024,
+    receipt_max_width: int = 2048,       # ✅ 1024→2048
     receipt_webp_quality: int = 85,
     gemini_enabled: bool = False,
     gemini_api_key: str = "",
     gemini_model_name: str = "gemini-2.5-flash",
-    gemini_timeout: int = 10,
+    gemini_timeout: int = 15,            # ✅ 10→15: 고해상도 처리 시간 확보
     **kwargs,
 ) -> dict:
     if not raw_bytes:
