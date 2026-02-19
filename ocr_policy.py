@@ -689,6 +689,10 @@ You are a precision OCR data extractor for Korean veterinary hospital receipts.
 Your ONLY job: read the receipt image and output a JSON object with EXACT data from the receipt.
 Do NOT interpret, rename, translate, standardize, or infer anything. Just copy what you see.
 
+CRITICAL: Your item prices MUST add up to the totalAmount on the receipt (within 100원).
+If they don't match, you MUST re-read the receipt and find missing items or fix wrong prices.
+This is the #1 quality requirement. DO NOT skip this check.
+
 Return ONLY valid JSON (no markdown, no code fences, no explanation):
 
 {
@@ -793,27 +797,31 @@ RULE 5: totalAmount = FINAL PAYMENT AMOUNT
 - discountAmount = total discount amount (할인/할증 합계). null if none.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE 6: SELF-VERIFICATION (필수 검증)
+RULE 6: MANDATORY SELF-VERIFICATION (반드시 수행)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Before returning your JSON, perform these checks:
+You MUST perform ALL checks below. If any check fails, go back and re-read the receipt.
+DO NOT return your JSON until all checks pass.
 
-CHECK 1 — Item count:
-  Count the number of line items visible on the receipt.
-  Your items array must have the SAME count (± discount lines).
-  If you have fewer items than visible lines → you MISSED items. Re-read the receipt.
-  IMPORTANT: Count EACH row separately, even if names look similar.
-  A receipt with 16 visible rows must produce ~16 items in your output.
+STEP 1 — Count visible line items:
+  Scan the receipt image from top to bottom.
+  Count EVERY row that has a name + price. Write this count down.
+  Your items array must have the SAME count (± 1 for discount lines).
+  If your array is shorter → you MISSED items. Go back and find them.
+  COMMON MISTAKE: Similar-looking items (혈액 검사 types, 고가약물-XXX) are SEPARATE rows.
 
-CHECK 2 — Price sum (CRITICAL):
-  Calculate: sum of all your item prices (including negative discount prices).
-  Compare to totalAmount.
-  If |sum - totalAmount| > 500 → you have WRONG prices or MISSING items.
-  Go back and fix before returning.
-  This is the MOST IMPORTANT check. If the sum is off by thousands, you definitely missed items.
+STEP 2 — Calculate your sum vs totalAmount (THIS IS THE MOST IMPORTANT CHECK):
+  Add up ALL your item prices: item1 + item2 + item3 + ...
+  Compare this sum to the totalAmount on the receipt.
+  If the difference is more than 100원 → you have ERRORS.
+  Possible causes:
+    - You MISSED an item (most common!) → re-scan the receipt
+    - You read a PRICE wrong → re-check each price
+    - You read the TOTAL wrong → re-check the 청구금액/합계
+  DO NOT RETURN until |your_sum - totalAmount| < 100.
 
-CHECK 3 — Name accuracy:
-  For each item, verify the itemName matches the receipt text exactly.
-  If you wrote a generic name like "진료비" but the receipt says "진찰료-초진" → fix it.
+STEP 3 — Name accuracy:
+  For each item, verify the itemName matches the receipt text CHARACTER BY CHARACTER.
+  If you wrote a generic name → fix it to match the receipt exactly.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 7: DO NOT INCLUDE THESE AS ITEMS
@@ -937,8 +945,12 @@ def _claude_parse_receipt(
         },
     ]
 
-    # ✅ Claude는 이미지만 직접 봄 — OCR 텍스트 전달 안 함
-    # (Vision OCR 텍스트가 깨진 이름을 포함해서 오히려 방해됨)
+    # ✅ OCR 힌트 전달 (항목 수 + 총액만 — 깨진 이름은 보내지 않음)
+    if (ocr_text or "").strip():
+        user_content.append({
+            "type": "text",
+            "text": ocr_text.strip(),
+        })
 
     import urllib.request
 
@@ -1413,19 +1425,48 @@ def process_receipt(
             except Exception:
                 pass
 
+    # ✅ Step 1.5: Vision OCR에서 항목 수 + 총액 힌트 추출
+    ocr_item_count = 0
+    ocr_total_amount = None
+    if ocr_text:
+        try:
+            ocr_extracted = _extract_items_from_text(ocr_text)
+            ocr_item_count = len(ocr_extracted)
+            ocr_total_amount = _extract_total_amount(ocr_text)
+            _log.info(f"[OCR-hint] item_count={ocr_item_count}, total={ocr_total_amount}")
+        except Exception:
+            pass
+
     # ✅ Step 2: AI 영수증 분석 (Claude 우선 → Gemini 폴백)
     ai_result_json = None
 
-    # --- 2a: Claude API 시도 (원본 컬러 이미지 사용) ---
+    # --- 2a: Claude API 시도 (원본 컬러 이미지 + OCR 힌트) ---
     if c_enabled:
         try:
-            _log.info(f"[Claude] calling model={c_model}, timeout={c_timeout}")
+            # OCR에서 추출한 숫자 힌트 (이름은 깨지니 숫자만)
+            ocr_hint = ""
+            if ocr_item_count > 0 or ocr_total_amount:
+                hint_parts = []
+                if ocr_item_count > 0:
+                    hint_parts.append(f"- Line item count from OCR: approximately {ocr_item_count} items")
+                if ocr_total_amount:
+                    hint_parts.append(f"- Total amount from OCR: {ocr_total_amount:,}원")
+                ocr_hint = (
+                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "VERIFICATION TARGETS (from machine OCR — numbers are accurate):\n"
+                    + "\n".join(hint_parts) + "\n"
+                    "Your extracted items MUST match these targets.\n"
+                    "If your item count or price sum differs significantly, re-read the receipt.\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                )
+
+            _log.info(f"[Claude] calling model={c_model}, timeout={c_timeout}, ocr_hint_len={len(ocr_hint)}")
             cj = _claude_parse_receipt(
                 image_bytes=claude_image_bytes,  # ✅ 원본 컬러 이미지 (전처리 없음)
                 api_key=c_key,
                 model=c_model,
                 timeout_seconds=c_timeout,
-                ocr_text="",  # ✅ OCR 텍스트 안 보냄 — Claude가 이미지만 직접 읽음
+                ocr_text=ocr_hint,  # ✅ 숫자 힌트만 전달 (깨진 이름 없음)
             )
             if isinstance(cj, dict):
                 ai_result_json = cj
