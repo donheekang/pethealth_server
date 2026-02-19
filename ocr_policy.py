@@ -822,6 +822,7 @@ def _gemini_parse_receipt_full(
     api_key: str,
     model: str,
     timeout_seconds: int = 15,
+    ocr_text: str = "",
 ) -> Optional[Dict[str, Any]]:
     api_key = (api_key or "").strip()
     model = (model or "gemini-3-flash-preview").strip()
@@ -842,6 +843,15 @@ def _gemini_parse_receipt_full(
         {"text": _GEMINI_RECEIPT_PROMPT},
         {"inline_data": {"mime_type": mime, "data": b64}},
     ]
+
+    # ✅ Google Vision OCR 텍스트가 있으면 Gemini에 참고자료로 전달
+    if (ocr_text or "").strip():
+        parts.append({"text": (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "REFERENCE: Google Vision OCR text (use this to verify item names and prices):\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + (ocr_text or "").strip()[:6000]
+        )})
 
     try:
         out = _call_gemini_generate_content(
@@ -1094,6 +1104,37 @@ def process_receipt(
     _log = logging.getLogger("ocr_policy")
     _log.info(f"[Gemini] enabled={g_enabled}, key_present={bool(g_key.strip())}, model={g_model}")
 
+    # ✅ Step 1: Google Vision OCR 먼저 실행 (텍스트 추출)
+    ocr_text = ""
+    vision_resp = None
+
+    sema = _get_sema(int(ocr_max_concurrency or 4))
+    acquired = sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
+    if not acquired:
+        _log.warning("[Vision] semaphore busy, will try Gemini without OCR text")
+        hints["visionSkipped"] = "semaphore_busy"
+    else:
+        try:
+            try:
+                ocr_text, vision_resp = _vision_ocr(
+                    ocr_image_bytes,
+                    google_credentials=google_credentials,
+                    timeout_seconds=int(ocr_timeout_seconds or 12),
+                )
+                if hints["ocrEngine"] == "none":
+                    hints["ocrEngine"] = "google_vision"
+                _log.info(f"[Vision] ocr_text_len={len(ocr_text)}")
+            except Exception as e:
+                hints["visionError"] = str(e)[:200]
+                ocr_text = ""
+                vision_resp = None
+        finally:
+            try:
+                sema.release()
+            except Exception:
+                pass
+
+    # ✅ Step 2: Gemini 실행 (이미지 + Vision OCR 텍스트 동시 전달)
     if g_enabled and g_key.strip():
         try:
             gj = _gemini_parse_receipt_full(
@@ -1101,6 +1142,7 @@ def process_receipt(
                 api_key=g_key,
                 model=g_model,
                 timeout_seconds=g_timeout,
+                ocr_text=ocr_text,
             )
             _log.info(f"[Gemini] raw result type={type(gj).__name__}, keys={list(gj.keys()) if isinstance(gj, dict) else 'N/A'}")
             if isinstance(gj, dict):
@@ -1113,36 +1155,6 @@ def process_receipt(
             hints["geminiError"] = str(e)[:200]
     else:
         _log.warning(f"[Gemini] SKIPPED: enabled={g_enabled}, key_present={bool(g_key.strip())}")
-
-    ocr_text = ""
-    vision_resp = None
-
-    sema = _get_sema(int(ocr_max_concurrency or 4))
-    acquired = sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
-    if not acquired:
-        if gemini_parsed:
-            hints["ocrSkipped"] = "semaphore_busy_but_gemini_ok"
-        else:
-            raise OCRConcurrencyError("OCR is busy (semaphore acquire timeout)")
-    else:
-        try:
-            try:
-                ocr_text, vision_resp = _vision_ocr(
-                    ocr_image_bytes,
-                    google_credentials=google_credentials,
-                    timeout_seconds=int(ocr_timeout_seconds or 12),
-                )
-                if hints["ocrEngine"] == "none":
-                    hints["ocrEngine"] = "google_vision"
-            except Exception as e:
-                hints["visionError"] = str(e)[:200]
-                ocr_text = ""
-                vision_resp = None
-        finally:
-            try:
-                sema.release()
-            except Exception:
-                pass
 
     # ✅ 저장/표시용은 display 이미지 사용 (용량 절약)
     original_webp = _to_webp_bytes(img_display, quality=int(receipt_webp_quality or 85))
