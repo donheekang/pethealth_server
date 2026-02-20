@@ -884,6 +884,31 @@ def _gemini_parse_receipt_full(
 
     # ✅ Google Vision OCR 텍스트: 가격(숫자) 검증용으로만 사용
     if (ocr_text or "").strip():
+        # OCR 텍스트에서 금액 목록 추출하여 Gemini에게 힌트로 제공
+        ocr_prices_hint = ""
+        try:
+            ocr_nums_for_hint: list = []
+            for ln in (ocr_text or "").splitlines():
+                for m in re.findall(r"[\d,]+\d", ln):
+                    try:
+                        n = int(m.replace(",", ""))
+                        if 1000 <= n <= 50_000_000:
+                            ocr_nums_for_hint.append(n)
+                    except ValueError:
+                        pass
+            if ocr_nums_for_hint:
+                # 중복 제거하고 정렬
+                unique_prices = sorted(set(ocr_nums_for_hint))
+                price_list = ", ".join(f"{p:,}" for p in unique_prices)
+                ocr_prices_hint = (
+                    f"\n⭐ PRICE REFERENCE LIST (from OCR — these numbers are RELIABLE):\n"
+                    f"[{price_list}]\n"
+                    f"Your item prices should come from THIS list. "
+                    f"If you read a price that is NOT in this list, you probably misread a digit.\n"
+                )
+        except Exception:
+            pass
+
         parts.append({"text": (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "SUPPLEMENTARY: OCR text (for PRICE/NUMBER verification ONLY)\n"
@@ -900,7 +925,8 @@ def _gemini_parse_receipt_full(
             "DO NOT USE THIS TEXT FOR:\n"
             "- Item names (read names from the IMAGE only)\n"
             "- Replacing or modifying names you read from the image\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + ocr_prices_hint
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             + (ocr_text or "").strip()[:6000]
         )})
 
@@ -1072,13 +1098,14 @@ def _cross_validate_prices(
         _xlog.warning(f"[XVAL] price not in OCR: '{nm}' = {pr}")
         mismatch_count += 1
 
-        # 유사 가격 후보 찾기 (차이가 10% 이내이고, 자릿수 같은 것)
+        # 유사 가격 후보 찾기 (차이가 15% 이내이고, 자릿수 같은 것)
         best_candidate = None
         best_diff = float("inf")
         for ocr_n in all_ocr_nums:
             diff = abs(ocr_n - abs_pr)
-            # 차이가 10% 이내이고 자릿수가 같아야 함
-            if diff > 0 and diff < abs_pr * 0.10 and len(str(ocr_n)) == len(str(abs_pr)):
+            # 차이가 15% 이내이고 자릿수가 같아야 함
+            # (53,790 vs 49,500 = 8.6% 차이 같은 케이스 대응)
+            if diff > 0 and diff < abs_pr * 0.15 and len(str(ocr_n)) == len(str(abs_pr)):
                 if diff < best_diff:
                     best_diff = diff
                     best_candidate = ocr_n
@@ -1109,14 +1136,19 @@ def _cross_validate_prices(
 # =========================================================
 # ✅ 총액 기반 OCR 숫자 혼동 역보정
 # =========================================================
-# 감열지에서 흔한 숫자 혼동 패턴: 6↔8, 5↔6, 3↔8, 0↔8, 1↔7
+# 감열지에서 흔한 숫자 혼동 패턴
 _DIGIT_SWAPS = [
-    ("6", "8"), ("8", "6"),
+    ("6", "8"), ("8", "6"),   # 가장 흔함
     ("5", "6"), ("6", "5"),
     ("3", "8"), ("8", "3"),
     ("0", "8"), ("8", "0"),
     ("1", "7"), ("7", "1"),
     ("5", "8"), ("8", "5"),
+    ("2", "0"), ("0", "2"),   # 1,320,000→1,300,000 케이스
+    ("3", "5"), ("5", "3"),   # 53→35 등
+    ("9", "0"), ("0", "9"),   # 9↔0
+    ("9", "4"), ("4", "9"),   # 49↔94 등
+    ("7", "2"), ("2", "7"),   # 7↔2
 ]
 
 
