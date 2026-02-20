@@ -1045,7 +1045,95 @@ def _migrate_tag(code: str) -> Optional[str]:
 
 
 # =========================================================
-# ✅ AI ↔ Vision OCR 교차검증 (로깅 전용 — 교정 안 함)
+# ✅ OCR 항목 이름 매칭 보정 (총액 불필요 — 직접 비교)
+# =========================================================
+def _fix_prices_by_ocr_name_match(
+    ai_items: List[Dict[str, Any]],
+    ocr_text: str,
+) -> None:
+    """
+    OCR 텍스트에서 항목(이름+가격)을 추출하고,
+    Gemini 항목과 이름을 매칭하여 가격이 다르면 OCR 가격으로 교체.
+    총액에 의존하지 않고 개별 항목 단위로 보정.
+    """
+    if not ocr_text or not ai_items:
+        return
+
+    import logging
+    _mlog = logging.getLogger("ocr_policy.name_match")
+
+    ocr_items = _extract_items_from_text(ocr_text)
+    if not ocr_items:
+        return
+
+    def _norm_name(s: str) -> str:
+        return re.sub(r"[^가-힣a-zA-Z0-9]", "", s.lower())
+
+    def _name_similarity(a: str, b: str) -> float:
+        na, nb = _norm_name(a), _norm_name(b)
+        if not na or not nb:
+            return 0.0
+        short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
+        if short in long:
+            return 0.9
+        common = sum(1 for c in short if c in long)
+        return common / max(len(short), 1)
+
+    # Gemini 항목의 가격을 set으로
+    ai_prices = set()
+    for it in ai_items:
+        if it.get("price"):
+            ai_prices.add(abs(it["price"]))
+
+    corrected = 0
+    for ai_item in ai_items:
+        ai_pr = ai_item.get("price")
+        if ai_pr is None or ai_pr == 0:
+            continue
+        ai_name = ai_item.get("itemName") or ""
+        abs_ai_pr = abs(ai_pr)
+
+        # 이 Gemini 항목과 가장 잘 매칭되는 OCR 항목 찾기
+        best_ocr = None
+        best_sim = 0.0
+        for ocr_item in ocr_items:
+            ocr_name = ocr_item.get("itemName") or ""
+            ocr_pr = ocr_item.get("price")
+            if ocr_pr is None:
+                continue
+
+            sim = _name_similarity(ai_name, ocr_name)
+            if sim > best_sim:
+                best_sim = sim
+                best_ocr = ocr_item
+
+        if best_ocr and best_sim >= 0.5:
+            ocr_pr = best_ocr["price"]
+            ocr_name = best_ocr.get("itemName", "")
+
+            # 가격이 다르고, OCR 가격이 다른 Gemini 항목의 가격과 동일하지 않을 때
+            # (= OCR 가격이 영수증에서 고유한 값일 때 더 신뢰)
+            if ocr_pr != abs_ai_pr:
+                # OCR 가격이 다른 Gemini 항목에는 없는 고유 가격이면 → 강하게 보정
+                ocr_is_unique = ocr_pr not in ai_prices
+                # 또는 이름 유사도가 매우 높으면 → 보정
+                if ocr_is_unique or best_sim >= 0.8:
+                    sign = -1 if ai_pr < 0 else 1
+                    old_pr = ai_pr
+                    ai_item["price"] = sign * ocr_pr
+                    corrected += 1
+                    _mlog.warning(
+                        f"[NAME_MATCH] '{ai_name}' {old_pr} → {sign * ocr_pr} "
+                        f"(OCR item '{ocr_name}', sim={best_sim:.2f}, "
+                        f"unique={ocr_is_unique})"
+                    )
+
+    if corrected:
+        _mlog.warning(f"[NAME_MATCH] {corrected} items corrected by OCR name matching")
+
+
+# =========================================================
+# ✅ AI ↔ Vision OCR 교차검증
 # =========================================================
 def _cross_validate_prices(
     ai_items: List[Dict[str, Any]],
@@ -1704,21 +1792,27 @@ def process_receipt(
 
         # OCR 교차검증 + 총액 기반 보정 + 누락 복구 적용
         if ocr_text and ai_parsed.get("items"):
+            # 🔍 보정 전 상태 로깅
+            _pre_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
+            _log.warning(f"[DEBUG-PRE] Gemini prices: {_pre_prices}")
+
+            # OCR에서 추출한 항목 로깅
+            _ocr_extracted = _extract_items_from_text(ocr_text)
+            _ocr_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in _ocr_extracted}
+            _log.warning(f"[DEBUG-OCR] extracted items: {_ocr_prices}")
+
+            # Step 0: ✅ OCR 항목 이름 매칭 보정 (총액 불필요 — 가장 직접적인 보정)
+            _fix_prices_by_ocr_name_match(ai_parsed["items"], ocr_text)
+
             # Step A: OCR 텍스트 숫자 교차검증
             _cross_validate_prices(ai_parsed["items"], ocr_text)
 
             gemini_total = ai_parsed.get("totalAmount")
-
-            # ✅ 총액 결정: 3가지 소스에서 가장 신뢰할 수 있는 값 사용
-            # 1) Vision OCR 총액 (숫자 정확도 높음)
-            # 2) Gemini 총액
-            # 3) 둘 다 사용하여 교차 검증
             total_amt = gemini_total
             gemini_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
 
             if ocr_total_amount and ocr_total_amount > 0:
-                # OCR 총액이 있으면 무조건 우선 사용 (숫자는 OCR이 더 정확)
-                _log.info(
+                _log.warning(
                     f"[TOTAL] OCR total={ocr_total_amount}, Gemini total={gemini_total}, "
                     f"Gemini sum={gemini_sum}"
                 )
@@ -1739,6 +1833,12 @@ def process_receipt(
             if recovered_count > 0:
                 _log.warning(f"[RECOVER] {recovered_count} items recovered from Vision OCR")
                 hints["recovered_items"] = recovered_count
+
+            # 🔍 보정 후 상태 로깅
+            _post_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
+            _final_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
+            _log.warning(f"[DEBUG-POST] final prices: {_post_prices}")
+            _log.warning(f"[DEBUG-POST] final_sum={_final_sum}, totalAmount={ai_parsed.get('totalAmount')}")
 
     # ✅ 저장/표시용은 display 이미지 사용 (용량 절약)
     original_webp = _to_webp_bytes(img_display, quality=int(receipt_webp_quality or 85))
