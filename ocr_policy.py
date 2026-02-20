@@ -1479,14 +1479,21 @@ def process_receipt(
     # ✅ 원본 해상도 보존 (저장/표시용)
     img_display = _resize_to_width(img.copy(), int(receipt_max_width or 0))
 
-    # ✅ OCR용 이미지: 더 높은 해상도 유지 + 전처리 적용 (Vision OCR 전용)
-    ocr_max_w = max(int(receipt_max_width or 0), 2048)  # OCR엔 최소 2048px 보장
+    # ✅ Vision OCR용 이미지: 전처리 적용 (흑백 + 대비 + 선명도)
+    ocr_max_w = max(int(receipt_max_width or 0), 2048)
     img_ocr = _resize_to_width(img.copy(), ocr_max_w)
     img_ocr = _preprocess_for_ocr(img_ocr)
 
     ocr_buf = io.BytesIO()
     img_ocr.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
+
+    # ✅ Gemini용 이미지: 원본 컬러 고해상도 (전처리 NO — 미디안 필터가 숫자 디테일 뭉갬)
+    gemini_max_w = max(int(receipt_max_width or 0), 3072)  # Gemini엔 3072px
+    img_gemini = _resize_to_width(img.copy(), gemini_max_w)
+    gemini_buf = io.BytesIO()
+    img_gemini.save(gemini_buf, format="PNG")
+    gemini_image_bytes = gemini_buf.getvalue()
 
     g_enabled = bool(gemini_enabled) if gemini_enabled is not None else _env_bool("GEMINI_ENABLED")
     g_key = (gemini_api_key if gemini_api_key is not None else os.getenv("GEMINI_API_KEY", "")) or ""
@@ -1555,7 +1562,7 @@ def process_receipt(
         try:
             _log.info(f"[Gemini] calling model={g_model}, timeout={g_timeout}")
             gj = _gemini_parse_receipt_full(
-                image_bytes=ocr_image_bytes,
+                image_bytes=gemini_image_bytes,  # ✅ 원본 컬러 고해상도 이미지 사용
                 api_key=g_key,
                 model=g_model,
                 timeout_seconds=g_timeout,
