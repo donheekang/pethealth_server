@@ -1166,7 +1166,7 @@ def _cross_validate_prices(
             if diff > 0 and diff < abs_pr * 0.20 and len(str(ocr_n)) == len(str(abs_pr)):
                 # 🔒 이미 다른 AI 항목이 이 가격을 사용 중이면 후보 제외
                 if ocr_n in ai_used_prices:
-                    _xlog.info(
+                    _xlog.warning(
                         f"[XVAL] SKIP candidate {ocr_n} for '{nm}' — "
                         f"already used by another AI item"
                     )
@@ -1860,7 +1860,7 @@ def process_receipt(
         if ocr_text and ai_parsed.get("items"):
             # 🔍 보정 전 상태 로깅
             _pre_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
-            _log.warning(f"[DEBUG-PRE] Gemini prices: {_pre_prices}")
+            _log.warning(f"[DEBUG-PRE] version=v7-xval-dedup | Gemini prices: {_pre_prices}")
             _ocr_extracted = _extract_items_from_text(ocr_text)
             _ocr_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in _ocr_extracted}
             _log.warning(f"[DEBUG-OCR] extracted items: {_ocr_prices}")
@@ -1947,7 +1947,7 @@ def process_receipt(
         parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = hints.get("pipeline", "ai_primary")
-        hints["_ocr_version"] = "v6-name-match-fix"
+        hints["_ocr_version"] = "v7-xval-dedup"
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
