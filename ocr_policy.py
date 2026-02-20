@@ -1157,13 +1157,21 @@ def _cross_validate_prices(
         nm = (item.get("itemName") or "")[:40]
         _xlog.warning(f"[XVAL] price not in OCR: '{nm}' = {pr}")
         mismatch_count += 1
-        # 유사 가격 후보 찾기 (차이가 20% 이내이고, 자릿수 같은 것)
+        # 유사 가격 후보 찾기 (차이가 10% 이내이고, 자릿수 같고, 100원 단위인 것)
         best_candidate = None
         best_diff = float("inf")
         for ocr_n in all_ocr_nums:
             diff = abs(ocr_n - abs_pr)
-            # 차이가 20% 이내이고 자릿수가 같아야 함
-            if diff > 0 and diff < abs_pr * 0.20 and len(str(ocr_n)) == len(str(abs_pr)):
+            # 차이가 10% 이내이고 자릿수가 같아야 함
+            if diff > 0 and diff < abs_pr * 0.10 and len(str(ocr_n)) == len(str(abs_pr)):
+                # 🔒 OCR 쓰레기 숫자 필터: 한국 영수증 가격은 100원 단위
+                # 52215, 60978 같은 건 OCR 오독 → 후보 제외
+                if ocr_n % 100 != 0:
+                    _xlog.warning(
+                        f"[XVAL] SKIP candidate {ocr_n} for '{nm}' — "
+                        f"not a round price (mod100={ocr_n % 100})"
+                    )
+                    continue
                 # 🔒 이미 다른 AI 항목이 이 가격을 사용 중이면 후보 제외
                 if ocr_n in ai_used_prices:
                     _xlog.warning(
@@ -1860,7 +1868,7 @@ def process_receipt(
         if ocr_text and ai_parsed.get("items"):
             # 🔍 보정 전 상태 로깅
             _pre_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
-            _log.warning(f"[DEBUG-PRE] version=v7-xval-dedup | Gemini prices: {_pre_prices}")
+            _log.warning(f"[DEBUG-PRE] version=v8-xval-round | Gemini prices: {_pre_prices}")
             _ocr_extracted = _extract_items_from_text(ocr_text)
             _ocr_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in _ocr_extracted}
             _log.warning(f"[DEBUG-OCR] extracted items: {_ocr_prices}")
@@ -1947,7 +1955,7 @@ def process_receipt(
         parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = hints.get("pipeline", "ai_primary")
-        hints["_ocr_version"] = "v7-xval-dedup"
+        hints["_ocr_version"] = "v8-xval-round"
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
