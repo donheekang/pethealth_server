@@ -763,12 +763,14 @@ RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
        receipt shows "9,900" → price: 9900 (NOT 5500, NOT 10000)
        receipt shows "2,600" → price: 2600 (NOT 2000)
 - QUANTITY HANDLING:
-  · If receipt shows "수량: 4 × 단가: 22,000 = 88,000" → price: 88000 (use the total)
-  · If receipt shows "내복약 1일 × 7 = 31,500" → price: 31500 (use the total)
-  · If only unit price visible with quantity → multiply: price = 수량 × 단가
-  · IMPORTANT: Some receipts show columns like "항목 | 수량 | 단가 | 금액"
-    → Always use the FINAL 금액 column, not 단가.
-    → If 수량 > 1 and only 단가 is shown → price = 수량 × 단가.
+  · ⚠️ DO NOT multiply quantity × unit price yourself. Just record the price number as printed.
+  · If receipt shows columns like "항목 | 수량 | 단가 | 금액" with a FINAL 금액 column
+    → Use the 금액 column value.
+  · If receipt shows "수량: 4 × 단가: 22,000 = 88,000" → price: 88000 (use the total shown)
+  · If receipt shows "내복약 1일 × 7 = 31,500" → price: 31500 (use the total shown)
+  · If receipt shows ONLY unit price with quantity but NO total → record the unit price AS IS.
+    → Example: "주사1회당 | 2 | 16,940" → price: 16940 (NOT 33880, do NOT multiply)
+  · NEVER do arithmetic yourself. Only use numbers that are PRINTED on the receipt.
 - price = null ONLY if truly no price is visible for that item.
 - CRITICAL: Read every digit carefully. Similar-looking digits:
   · 3 vs 8, 5 vs 6, 0 vs 8, 1 vs 7 — zoom in and verify.
