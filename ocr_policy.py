@@ -554,7 +554,7 @@ def _gemini_parse_receipt(
     prompt = (
         "You are a receipt parser for Korean veterinary receipts.\n"
         "Return ONLY valid JSON with keys:\n"
-        '  hospitalName (string|null), visitDate (YYYY-MM-DD|null), totalAmount (integer|null),\n'
+        '  hospitalName (string|null), visitDate (YYYY-MM-DD|null), visitTime (HH:MM 24h format|null), totalAmount (integer|null),\n'
         '  items (array of {itemName:string, price:integer|null}).\n'
         "Rules:\n"
         "- items must be REAL treatment/vaccine/medicine line-items only.\n"
@@ -598,7 +598,7 @@ def _is_items_suspicious(items: List[Dict[str, Any]]) -> bool:
             bad += 1
     return bad >= max(1, min(3, len(items)))
 def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"hospitalName": None, "visitDate": None, "totalAmount": None, "items": []}
+    out: Dict[str, Any] = {"hospitalName": None, "visitDate": None, "visitTime": None, "totalAmount": None, "items": []}
     hn = j.get("hospitalName")
     if isinstance(hn, str) and hn.strip():
         out["hospitalName"] = hn.strip()[:80]
@@ -606,6 +606,12 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(vd, str) and vd.strip():
         d = _parse_date_from_text(vd.strip())
         out["visitDate"] = d.isoformat() if d else vd.strip()[:20]
+    # ✅ visitTime 추출
+    vt = j.get("visitTime")
+    if isinstance(vt, str) and vt.strip():
+        vt_clean = vt.strip()[:5]  # "HH:MM"
+        if re.match(r"^\d{1,2}:\d{2}$", vt_clean):
+            out["visitTime"] = vt_clean
     ta = _coerce_int_amount(j.get("totalAmount"))
     out["totalAmount"] = ta if ta and ta > 0 else None
     items = j.get("items")
@@ -642,6 +648,7 @@ Return ONLY valid JSON (no markdown, no code fences, no explanation):
 {
   "hospitalName": "exact hospital name from receipt" or null,
   "visitDate": "YYYY-MM-DD" or null,
+  "visitTime": "HH:MM" (24h) or null,
   "totalAmount": integer or null,
   "discountAmount": integer or null,
   "items": [
@@ -1836,6 +1843,7 @@ def _normalize_gemini_full_result(
     parsed: Dict[str, Any] = {
         "hospitalName": None,
         "visitDate": None,
+        "visitTime": None,
         "totalAmount": None,
         "items": [],
         "ocrText": "",
@@ -1847,6 +1855,12 @@ def _normalize_gemini_full_result(
     if isinstance(vd, str) and vd.strip():
         d = _parse_date_from_text(vd.strip())
         parsed["visitDate"] = d.isoformat() if d else vd.strip()[:20]
+    # ✅ visitTime 추출
+    vt = j.get("visitTime")
+    if isinstance(vt, str) and vt.strip():
+        vt_clean = vt.strip()[:5]
+        if re.match(r"^\d{1,2}:\d{2}$", vt_clean):
+            parsed["visitTime"] = vt_clean
     ta = _coerce_int_amount(j.get("totalAmount"))
     parsed["totalAmount"] = ta if ta and ta > 0 else None
     items = j.get("items")
@@ -2225,6 +2239,7 @@ def process_receipt_image(
     meta = {
         "hospital_name": parsed.get("hospitalName"),
         "visit_date": parsed.get("visitDate"),
+        "visit_time": parsed.get("visitTime"),
         "total_amount": parsed.get("totalAmount"),
         "address_hint": (hints or {}).get("addressHint"),
         "ocr_engine": (hints or {}).get("ocrEngine"),
