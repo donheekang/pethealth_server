@@ -239,17 +239,17 @@ def _preprocess_for_ocr(img):
         # 1) 그레이스케일 변환 → 색상 노이즈 제거
         gray = img.convert("L")
 
-        # 2) 대비 강화 (감열지는 대비가 낮음)
+        # 2) 대비 강화 (감열지는 대비가 낮음 → 6과 8 구분에 중요)
         enhancer = ImageEnhance.Contrast(gray)
-        gray = enhancer.enhance(1.8)  # 1.8배 대비 강화
+        gray = enhancer.enhance(2.2)  # 2.2배 대비 강화 (6↔8 구분 개선)
 
         # 3) 밝기 살짝 올림 (어두운 영수증 보정)
         enhancer = ImageEnhance.Brightness(gray)
         gray = enhancer.enhance(1.1)
 
-        # 4) 선명도 강화 (흐릿한 글씨 대응)
+        # 4) 선명도 강화 (흐릿한 글씨 대응 → 숫자 윤곽 선명하게)
         enhancer = ImageEnhance.Sharpness(gray)
-        gray = enhancer.enhance(2.0)
+        gray = enhancer.enhance(2.5)  # 2.5배 선명도 (6의 열린 부분 강조)
 
         # 5) 가벼운 노이즈 제거
         gray = gray.filter(ImageFilter.MedianFilter(size=3))
@@ -772,9 +772,15 @@ RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
     → Example: "주사1회당 | 2 | 16,940" → price: 16940 (NOT 33880, do NOT multiply)
   · NEVER do arithmetic yourself. Only use numbers that are PRINTED on the receipt.
 - price = null ONLY if truly no price is visible for that item.
-- CRITICAL: Read every digit carefully. Similar-looking digits:
+- ⭐ #1 MOST COMMON ERROR: Confusing digit 6 and 8!
+  · On thermal receipts, "6" and "8" look VERY similar. This is the biggest source of errors.
+  · "6" has an OPEN top-right (like a hook). "8" is CLOSED on both top and bottom (two loops).
+  · ALWAYS double-check every 6 and 8 in prices: Is it 66,000 or 68,000? Is it 16,000 or 18,000?
+  · When uncertain between 6 and 8, CHECK THE OCR TEXT — it usually has the correct digit.
+  · Example errors to AVOID: 66,000→68,000, 16,940→18,940, 36,000→38,000
+- Other similar-looking digits to verify:
   · 3 vs 8, 5 vs 6, 0 vs 8, 1 vs 7 — zoom in and verify.
-  · If the total doesn't match your items sum, re-read the prices digit by digit.
+  · If the total doesn't match your items sum, the cause is usually a 6↔8 confusion.
 - ⚠️ ABSOLUTELY NEVER invent or adjust a price to make your sum equal the totalAmount.
   Every price must come directly from the receipt image. Accuracy per item > matching total.
 - ⚠️ OCR TEXT CROSS-CHECK (when SUPPLEMENTARY OCR text is provided):
