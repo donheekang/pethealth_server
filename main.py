@@ -1977,6 +1977,7 @@ def process_receipt(
 
     ocr_hospital_name_raw = meta.get("hospital_name") or ""
     ocr_visit_date_raw = meta.get("visit_date") or ""
+    ocr_visit_time_raw = meta.get("visit_time") or ""  # ✅ "HH:MM" or ""
 
     # Gemini may have already provided tags via ocr_policy
     gemini_tags: List[str] = meta.get("tags") or []
@@ -2179,6 +2180,7 @@ def process_receipt(
         "draftReceiptPath": file_path,
         "fileSizeBytes": file_size,
         "visitDate": vd.isoformat() if hasattr(vd, "isoformat") else str(vd),
+        "visitTime": ocr_visit_time_raw if ocr_visit_time_raw else None,
         "hospitalName": hosp_name,
         "hospitalMgmtNo": auto_hosp_mgmt,
         "totalAmount": int(total_amount),
