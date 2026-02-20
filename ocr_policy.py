@@ -1083,7 +1083,7 @@ _TAG_KEYWORD_RULES: List[tuple] = [
     (["귀약", "이어클리너", "ear drop", "이약"], "medicine_ear"),
     (["피부약", "아포퀠", "사이토포인트", "아토피카", "피부"], "medicine_skin"),
     (["알레르기약", "항히스타민", "세티리진"], "medicine_allergy"),
-    (["팔라디아", "palladia", "항암", "빈크리스틴", "독소루비신", "사이클로포스파마이드", "종양약"], "medicine_oral"),
+    (["팔라디아", "팔리디아", "palladia", "항암", "빈크리스틴", "독소루비신", "사이클로포스파마이드", "종양약"], "medicine_oral"),
     (["내복약", "경구약", "조제", "oral med"], "medicine_oral"),
     (["칼슘", "calcium"], "medicine_oral"),
     (["비타민", "vitamin", "vit k", "vit b"], "medicine_oral"),
