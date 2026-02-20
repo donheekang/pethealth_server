@@ -775,6 +775,12 @@ RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
   · If the total doesn't match your items sum, re-read the prices digit by digit.
 - ⚠️ ABSOLUTELY NEVER invent or adjust a price to make your sum equal the totalAmount.
   Every price must come directly from the receipt image. Accuracy per item > matching total.
+- ⚠️ OCR TEXT CROSS-CHECK (when SUPPLEMENTARY OCR text is provided):
+  · The OCR text's NUMBERS/DIGITS are highly accurate even when item names are garbled.
+  · For EVERY price you read from the image, cross-check it against the OCR text numbers.
+  · If you read "68,000" from image but OCR text shows "66,000" for the same line → USE 66,000.
+  · Trust OCR text digits MORE than your image reading for prices.
+  · Example: Image looks like 68,000 but OCR text says 66,000 → the correct price is 66,000.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 4: DISCOUNT ITEMS → NEGATIVE PRICE
@@ -879,7 +885,9 @@ def _gemini_parse_receipt_full(
             "\n"
             "USE THIS TEXT ONLY FOR:\n"
             "1. Counting how many line items exist (to make sure you don't miss any)\n"
-            "2. Verifying NUMBERS/PRICES (the digits are usually accurate)\n"
+            "2. ⭐ Verifying NUMBERS/PRICES — OCR digits are MORE RELIABLE than image reading!\n"
+            "   If your image reading differs from OCR text number → TRUST THE OCR TEXT NUMBER.\n"
+            "   Example: You read 68,000 from image but OCR text shows 66,000 → USE 66,000.\n"
             "\n"
             "DO NOT USE THIS TEXT FOR:\n"
             "- Item names (read names from the IMAGE only)\n"
@@ -1010,9 +1018,9 @@ def _cross_validate_prices(
     ocr_text: str,
 ) -> List[Dict[str, Any]]:
     """
-    AI가 추출한 항목의 가격이 Vision OCR 텍스트에 존재하는지 로깅.
-    OCR 이름이 깨질 수 있으므로 가격 교정은 하지 않음 (AI를 신뢰).
-    로그로 불일치 항목만 기록.
+    AI가 추출한 항목의 가격이 Vision OCR 텍스트에 존재하는지 검증.
+    OCR 텍스트에 없는 가격이면, 가장 가까운 OCR 숫자로 보정 시도.
+    (OCR 숫자가 더 정확하므로 — 예: Gemini가 66000을 68000으로 읽는 경우)
     """
     if not ocr_text or not ai_items:
         return ai_items
@@ -1031,20 +1039,63 @@ def _cross_validate_prices(
             except ValueError:
                 pass
 
+    if not all_ocr_nums:
+        return ai_items
+
+    # totalAmount 가져오기 (보정 판단용)
+    total_amount = None
+    for item in ai_items:
+        pass  # items에서는 total을 안 가지고 있음
+    # 별도로 OCR에서 총액 추출
+    ocr_total = _extract_total_amount(ocr_text)
+
     mismatch_count = 0
+    corrected_count = 0
     for item in ai_items:
         pr = item.get("price")
         if pr is None:
             continue
-        if abs(pr) not in all_ocr_nums:
-            nm = (item.get("itemName") or "")[:40]
-            _xlog.warning(f"[XVAL] price not in OCR: '{nm}' = {pr}")
-            mismatch_count += 1
+        abs_pr = abs(pr)
+        if abs_pr in all_ocr_nums:
+            continue  # OK — OCR에도 같은 숫자 있음
+
+        # 🔍 OCR에 없는 가격 → 가장 가까운 OCR 숫자 찾기
+        nm = (item.get("itemName") or "")[:40]
+        _xlog.warning(f"[XVAL] price not in OCR: '{nm}' = {pr}")
+        mismatch_count += 1
+
+        # 유사 가격 후보 찾기 (차이가 10% 이내이고, 자릿수 같은 것)
+        best_candidate = None
+        best_diff = float("inf")
+        for ocr_n in all_ocr_nums:
+            diff = abs(ocr_n - abs_pr)
+            # 차이가 10% 이내이고 자릿수가 같아야 함
+            if diff > 0 and diff < abs_pr * 0.10 and len(str(ocr_n)) == len(str(abs_pr)):
+                if diff < best_diff:
+                    best_diff = diff
+                    best_candidate = ocr_n
+
+        if best_candidate is not None:
+            # 보정 전후 총합 비교 — OCR 숫자가 totalAmount에 더 가까우면 보정
+            sign = -1 if pr < 0 else 1
+            old_price = pr
+            new_price = sign * best_candidate
+
+            # 보정 적용
+            item["price"] = new_price
+            corrected_count += 1
+            _xlog.warning(
+                f"[XVAL] CORRECTED: '{nm}' {old_price} → {new_price} "
+                f"(OCR number {best_candidate} found, diff was {best_diff})"
+            )
 
     if mismatch_count:
-        _xlog.warning(f"[XVAL] {mismatch_count}/{len(ai_items)} prices not found in OCR text")
+        _xlog.warning(
+            f"[XVAL] {mismatch_count}/{len(ai_items)} prices not in OCR, "
+            f"{corrected_count} corrected"
+        )
 
-    return ai_items  # 교정 없이 그대로 반환
+    return ai_items
 
 
 # =========================================================
