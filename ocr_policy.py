@@ -353,20 +353,33 @@ def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
             continue
         if _is_noise_line(ln):
             continue
-        # ✅ 카테고리 소계 라인 필터: "진료 (1,964,600)" 등 건너뛰기
-        # 괄호 안에 큰 숫자만 있는 라인 = 소계 헤더, 항목 아님
+        # ✅ 카테고리 소계/헤더 라인 필터 (3가지 패턴):
+        # 패턴1: "진료 (1,964,600)" — 괄호 안에 큰 숫자
         _paren_num_m = re.search(r'\(\s*([\d,]+)\s*\)', ln)
         if _paren_num_m:
             try:
                 _pn = int(_paren_num_m.group(1).replace(",", ""))
-                # 괄호 밖에 유효한 숫자가 없으면 → 소계 라인
                 _outside = re.sub(r'\([^)]*\)', '', ln)
                 _outside_nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(_outside)]
                 _outside_nums = [n for n in _outside_nums if n >= 100]
                 if _pn >= 100_000 and not _outside_nums:
-                    continue  # 소계 라인 → 건너뛰기
+                    continue
             except ValueError:
                 pass
+        # 패턴2: "진료 ( . )" "입원 ( . )" — OCR이 숫자를 잘못 읽어 점/공백만 남은 경우
+        # 이런 이름은 카테고리 헤더임 (실제 항목명에는 괄호 안에 점만 있지 않음)
+        _garbled_paren = re.search(r'\(\s*[.\s,]+\s*\)', ln)
+        if _garbled_paren:
+            continue
+        # 패턴3: 이름이 한글 1~3글자 + 괄호 → 카테고리 헤더 (예: "진료 (...)", "용품 (...)")
+        _short_header = re.match(r'^[가-힣]{1,3}\s*\(', ln.strip())
+        if _short_header:
+            _paren_content = re.search(r'\([^)]*\)', ln)
+            if _paren_content:
+                _inner = _paren_content.group(0)
+                # 괄호 안에 한글이 없으면 (= 숫자/기호만) → 카테고리 헤더
+                if not re.search(r'[가-힣]', _inner):
+                    continue
         nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(ln)]
         nums = [n for n in nums if n >= 100]
         if not nums:
@@ -1069,6 +1082,16 @@ def _fix_prices_by_ocr_name_match(
             # 가격이 다르고, OCR 가격이 다른 Gemini 항목의 가격과 동일하지 않을 때
             # (= OCR 가격이 영수증에서 고유한 값일 때 더 신뢰)
             if ocr_pr != abs_ai_pr:
+                # ✅ 안전장치: 가격 차이가 너무 크면 교체하지 않음
+                # OCR이 소계/카테고리 숫자를 항목으로 잘못 추출한 경우 방지
+                # 예: Gemini 11,000 → OCR 964,600 (87배 차이) = 명백한 오류
+                ratio = max(ocr_pr, abs_ai_pr) / max(min(ocr_pr, abs_ai_pr), 1)
+                if ratio > 10:
+                    _mlog.info(
+                        f"[NAME_MATCH] SKIP '{ai_name}' {abs_ai_pr} → {ocr_pr} "
+                        f"(ratio {ratio:.1f}x too large, likely subtotal contamination)"
+                    )
+                    continue
                 # OCR 가격이 다른 Gemini 항목에는 없는 고유 가격이면 → 강하게 보정
                 ocr_is_unique = ocr_pr not in ai_prices
                 # 또는 이름 유사도가 매우 높으면 → 보정
@@ -1833,17 +1856,52 @@ def process_receipt(
                     f"[TOTAL] OCR total={ocr_total_amount}, Gemini total={gemini_total}, "
                     f"Gemini sum={gemini_sum}"
                 )
-                total_amt = ocr_total_amount
-                ai_parsed["totalAmount"] = ocr_total_amount
+                # ✅ OCR total 신뢰성 검증:
+                # Gemini total과 sum이 일치하는데 OCR total이 크게 다르면 → Gemini 신뢰
+                _use_ocr_total = True
+                if gemini_total and gemini_sum and gemini_total > 0:
+                    _gem_match = abs(gemini_sum - gemini_total) < gemini_total * 0.1
+                    _ocr_far = abs(ocr_total_amount - gemini_total) > gemini_total * 0.3
+                    if _gem_match and _ocr_far:
+                        _log.warning(
+                            f"[TOTAL] OCR total={ocr_total_amount} is far from "
+                            f"Gemini total={gemini_total} (sum={gemini_sum}), "
+                            f"keeping Gemini total"
+                        )
+                        _use_ocr_total = False
+                if _use_ocr_total:
+                    total_amt = ocr_total_amount
+                    ai_parsed["totalAmount"] = ocr_total_amount
+            # 🔍 OCR 텍스트 원본 로깅 (디버깅용 — 500자)
+            _log.warning(f"[DEBUG-OCRTEXT] {repr((ocr_text or '')[:500])}")
+            # 🔍 OCR 텍스트의 모든 숫자 로깅
+            _all_nums_debug = sorted(set(
+                int(m.replace(",", ""))
+                for ln in (ocr_text or "").splitlines()
+                for m in re.findall(r"[\d,]+\d", ln)
+                if int(m.replace(",", "")) >= 1000
+            ))
+            _log.warning(f"[DEBUG-OCRNUMS] all numbers >= 1000: {_all_nums_debug}")
             # Step B-1: ✅ 카테고리 소계 오염 감지/교정 (★ 가장 먼저 실행!)
-            # Step 0보다 먼저 실행해야 Step 0이 소계 가격으로 덮어쓰는 걸 방지
+            _pre_b1 = {(it.get("itemName") or "")[:20]: it.get("price") for it in ai_parsed["items"]}
             ai_parsed["items"] = _fix_subtotal_contamination(
                 ai_parsed["items"], total_amt, ocr_text=ocr_text
             )
+            _post_b1 = {(it.get("itemName") or "")[:20]: it.get("price") for it in ai_parsed["items"]}
+            if _pre_b1 != _post_b1:
+                _log.warning(f"[DEBUG-B1] CHANGED: {_pre_b1} → {_post_b1}")
+            else:
+                _log.warning(f"[DEBUG-B1] no change: {_post_b1}")
             # Step 0: ✅ OCR 항목 이름 매칭 보정
             _fix_prices_by_ocr_name_match(ai_parsed["items"], ocr_text)
+            _post_s0 = {(it.get("itemName") or "")[:20]: it.get("price") for it in ai_parsed["items"]}
+            if _post_b1 != _post_s0:
+                _log.warning(f"[DEBUG-S0] CHANGED: {_post_b1} → {_post_s0}")
             # Step A: OCR 텍스트 숫자 교차검증
             _cross_validate_prices(ai_parsed["items"], ocr_text)
+            _post_sa = {(it.get("itemName") or "")[:20]: it.get("price") for it in ai_parsed["items"]}
+            if _post_s0 != _post_sa:
+                _log.warning(f"[DEBUG-SA] CHANGED: {_post_s0} → {_post_sa}")
 
             # Step B-2: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
             ai_parsed["items"] = _fix_prices_by_total(
@@ -1872,7 +1930,7 @@ def process_receipt(
         parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = hints.get("pipeline", "ai_primary")
-        hints["_ocr_version"] = "v4-subtotal-fix"
+        hints["_ocr_version"] = "v6-name-match-fix"
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
