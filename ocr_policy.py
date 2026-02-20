@@ -1634,6 +1634,20 @@ def _recover_missing_items(
         ocr_pr = ocr_it.get("price") or 0
         if not ocr_nm or ocr_pr == 0:
             continue
+        # 🔒 OCR 쓰레기 필터: 이름이 너무 짧거나 noise
+        raw_name = (ocr_it.get("itemName") or "").strip()
+        if len(ocr_nm) < 2 or _is_noise_line(raw_name):
+            _rlog.warning(f"[RECOVER] SKIP noise/short item: '{raw_name}' = {ocr_pr}")
+            continue
+        # 🔒 한글 없는 짧은 영문은 OCR 쓰레기 (BMOS, LAD 등)
+        _has_korean = any("\uac00" <= ch <= "\ud7a3" for ch in raw_name)
+        if not _has_korean and len(ocr_nm) <= 6:
+            _rlog.warning(f"[RECOVER] SKIP no-korean short name: '{raw_name}' = {ocr_pr}")
+            continue
+        # 🔒 100원 단위가 아닌 가격은 OCR 쓰레기일 가능성 높음
+        if ocr_pr > 0 and ocr_pr % 100 != 0:
+            _rlog.warning(f"[RECOVER] SKIP non-round price: '{raw_name}' = {ocr_pr}")
+            continue
         if (ocr_nm, ocr_pr) in gemini_keys:
             continue
         name_exists = False
@@ -1868,7 +1882,7 @@ def process_receipt(
         if ocr_text and ai_parsed.get("items"):
             # 🔍 보정 전 상태 로깅
             _pre_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
-            _log.warning(f"[DEBUG-PRE] version=v8-xval-round | Gemini prices: {_pre_prices}")
+            _log.warning(f"[DEBUG-PRE] version=v9-tax-filter | Gemini prices: {_pre_prices}")
             _ocr_extracted = _extract_items_from_text(ocr_text)
             _ocr_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in _ocr_extracted}
             _log.warning(f"[DEBUG-OCR] extracted items: {_ocr_prices}")
@@ -1941,6 +1955,21 @@ def process_receipt(
             if recovered_count > 0:
                 _log.warning(f"[RECOVER] {recovered_count} items recovered from Vision OCR")
                 hints["recovered_items"] = recovered_count
+            # 🔒 최종 세금/합계 항목 필터 (Gemini가 비과세/부가세를 항목으로 넣는 경우 제거)
+            _TAX_KEYWORDS = {"비과세", "부가세", "과세", "공급가액", "과세공급가액", "부가세액",
+                             "소계", "합계", "총액", "총금액", "청구금액", "결제요청", "결제금액"}
+            _before_tax_filter = len(ai_parsed["items"])
+            _filtered_items = []
+            for _it in ai_parsed["items"]:
+                _iname = (_it.get("itemName") or "").strip()
+                _iname_norm = re.sub(r"[^가-힣a-zA-Z]", "", _iname)
+                if _iname_norm in _TAX_KEYWORDS or _is_noise_line(_iname):
+                    _log.warning(f"[TAX-FILTER] removing: '{_iname}' = {_it.get('price')}")
+                    continue
+                _filtered_items.append(_it)
+            ai_parsed["items"] = _filtered_items
+            if len(_filtered_items) < _before_tax_filter:
+                _log.warning(f"[TAX-FILTER] removed {_before_tax_filter - len(_filtered_items)} tax/summary items")
             # 🔍 보정 후 상태 로깅
             _post_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
             _final_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
@@ -1955,7 +1984,7 @@ def process_receipt(
         parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = hints.get("pipeline", "ai_primary")
-        hints["_ocr_version"] = "v8-xval-round"
+        hints["_ocr_version"] = "v9-tax-filter"
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
