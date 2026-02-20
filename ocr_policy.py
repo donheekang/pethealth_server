@@ -1138,6 +1138,12 @@ def _cross_validate_prices(
         return ai_items
     # 별도로 OCR에서 총액 추출
     ocr_total = _extract_total_amount(ocr_text)
+    # 🔒 이미 AI 항목이 사용 중인 가격 집합 (다른 항목의 가격을 빼앗지 않도록)
+    ai_used_prices: set = set()
+    for item in ai_items:
+        _p = item.get("price")
+        if _p is not None:
+            ai_used_prices.add(abs(_p))
     mismatch_count = 0
     corrected_count = 0
     for item in ai_items:
@@ -1158,6 +1164,13 @@ def _cross_validate_prices(
             diff = abs(ocr_n - abs_pr)
             # 차이가 20% 이내이고 자릿수가 같아야 함
             if diff > 0 and diff < abs_pr * 0.20 and len(str(ocr_n)) == len(str(abs_pr)):
+                # 🔒 이미 다른 AI 항목이 이 가격을 사용 중이면 후보 제외
+                if ocr_n in ai_used_prices:
+                    _xlog.info(
+                        f"[XVAL] SKIP candidate {ocr_n} for '{nm}' — "
+                        f"already used by another AI item"
+                    )
+                    continue
                 if diff < best_diff:
                     best_diff = diff
                     best_candidate = ocr_n
@@ -1168,6 +1181,9 @@ def _cross_validate_prices(
             # 보정 적용
             item["price"] = new_price
             corrected_count += 1
+            # 사용 가격 집합 업데이트
+            ai_used_prices.discard(abs_pr)
+            ai_used_prices.add(best_candidate)
             _xlog.warning(
                 f"[XVAL] CORRECTED: '{nm}' {old_price} → {new_price} "
                 f"(OCR number {best_candidate} found, diff was {best_diff})"
