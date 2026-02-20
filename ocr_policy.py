@@ -1352,13 +1352,14 @@ def _fix_subtotal_contamination(
     ocr_text: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    Gemini가 카테고리 소계(예: "진료 (1,964,600)")를 개별 항목 가격으로
-    잘못 읽는 경우를 감지하고 교정.
+    Gemini가 카테고리 소계를 개별 항목 가격으로 잘못 읽는 경우를 감지/교정.
 
-    2단계 방어:
-      1단계: OCR 텍스트에서 괄호 안 소계 패턴 직접 감지 → 항목 가격이
-             소계 숫자와 일치(부분 포함)하면 OCR에서 올바른 가격 찾아 교정
-      2단계: 총액 기반 감지 → 합계가 totalAmount의 130% 초과 시 교정
+    3단계 방어 (괄호 없어도 작동):
+      1단계: 접미사 감지 — OCR의 큰 숫자(소계)의 뒷부분이 항목 가격과 일치
+             예: OCR에 1964600 있고 항목 가격이 964600 → 소계 오염
+      2단계: 비정상 고가 감지 — 항목 가격이 totalAmount의 40% 초과 시
+             진료비/진찰료/검진 등 일반 항목은 이렇게 비쌀 수 없음
+      3단계: 총액 기반 감지 — 합계가 totalAmount의 130% 초과 시 교정
     """
     if not ai_items:
         return ai_items
@@ -1366,8 +1367,9 @@ def _fix_subtotal_contamination(
     import logging
     _slog = logging.getLogger("ocr_policy.subtotal")
 
-    # ===== OCR 텍스트에서 소계 숫자 + 항목별 가격 매핑 추출 =====
-    subtotal_numbers: set = set()        # 괄호 안 소계 숫자들
+    # ===== OCR 텍스트에서 모든 숫자 + 라인별 이름→가격 매핑 추출 =====
+    all_ocr_nums: set = set()
+    large_ocr_nums: set = set()          # 100,000 이상 큰 숫자 (잠재적 소계)
     item_line_prices: dict = {}          # {정규화된_이름: [가격들]}
 
     if ocr_text:
@@ -1375,80 +1377,122 @@ def _fix_subtotal_contamination(
             stripped = ln.strip()
             if not stripped:
                 continue
-            # 1) 괄호 안 큰 숫자 → 소계 후보
-            for pm in re.findall(r'\(\s*([\d,]+)\s*\)', stripped):
+            # 이 라인의 모든 숫자 추출
+            line_nums = []
+            for m in re.findall(r'[\d,]+\d', stripped):
                 try:
-                    pn = int(pm.replace(",", ""))
-                    if pn >= 100_000:
-                        subtotal_numbers.add(pn)
+                    n = int(m.replace(",", ""))
+                    if n >= 100:
+                        all_ocr_nums.add(n)
+                        line_nums.append(n)
+                    if n >= 100_000:
+                        large_ocr_nums.add(n)
                 except ValueError:
                     pass
-            # 2) 항목 라인에서 이름 → 가격 매핑 (소계 아닌 일반 라인)
-            # 괄호 안 숫자만 있는 라인은 건너뜀
-            _outside = re.sub(r'\([^)]*\)', '', stripped)
-            _out_nums = [int(x.replace(",", "")) for x in re.findall(r'[\d,]+\d', _outside)]
-            _out_nums = [n for n in _out_nums if n >= 100]
-            if _out_nums:
-                # 이름 부분 추출
+            # 이름 → 가격 매핑 (숫자가 2개 이상 있는 라인 = 테이블 항목)
+            if len(line_nums) >= 2:
                 name_part = re.sub(r'[\d,]+', ' ', stripped)
                 name_part = re.sub(r'[^\w가-힣a-zA-Z]', ' ', name_part).strip()
                 name_part = re.sub(r'\s+', '', name_part)
                 if name_part and len(name_part) >= 2:
                     if name_part not in item_line_prices:
                         item_line_prices[name_part] = []
-                    item_line_prices[name_part].extend(_out_nums)
+                    item_line_prices[name_part].extend(line_nums)
 
-    # ===== 1단계: 패턴 기반 감지 (totalAmount 불필요) =====
-    if subtotal_numbers:
-        _slog.info(f"[SUBTOTAL] detected subtotal numbers in OCR: {subtotal_numbers}")
-        fixed_pattern = 0
+    _slog.info(
+        f"[SUBTOTAL] large_ocr_nums={large_ocr_nums}, "
+        f"item_lines={len(item_line_prices)}, total_amount={total_amount}"
+    )
+
+    # ===== 이름으로 OCR에서 올바른 가격 찾는 헬퍼 =====
+    def _find_correct_price_by_name(item_name: str, bad_price: int) -> Optional[int]:
+        nm_norm = re.sub(r'[^\w가-힣a-zA-Z]', '', item_name)
+        if len(nm_norm) < 2:
+            return None
+        best = None
+        for ocr_name, ocr_prices in item_line_prices.items():
+            if len(ocr_name) < 2:
+                continue
+            # 이름 매칭: 부분 포함 (양방향)
+            if nm_norm in ocr_name or ocr_name in nm_norm:
+                for op in ocr_prices:
+                    if 100 <= op < bad_price:
+                        if best is None or op > best:  # 가장 큰 합리적 가격
+                            best = op
+        return best
+
+    # ===== 1단계: 접미사 감지 (괄호 불필요, totalAmount 불필요) =====
+    # 예: 항목 가격 964600, OCR에 1964600 존재 → 964600은 1964600의 접미사
+    fixed_any = False
+    for idx, item in enumerate(ai_items):
+        price = item.get("price") or 0
+        if price < 100_000:  # 10만원 미만은 소계일 가능성 낮음
+            continue
+        price_str = str(price)
+        nm = item.get("itemName") or ""
+        is_suffix_of_larger = False
+        for big_n in large_ocr_nums:
+            if big_n <= price:
+                continue
+            big_str = str(big_n)
+            # 항목 가격이 큰 OCR 숫자의 접미사인지 확인
+            if big_str.endswith(price_str) and len(big_str) > len(price_str):
+                is_suffix_of_larger = True
+                _slog.warning(
+                    f"[SUBTOTAL-SUFFIX] '{nm}' price {price} is suffix of OCR number {big_n}"
+                )
+                break
+        if not is_suffix_of_larger:
+            continue
+        # 올바른 가격 찾기
+        correct = _find_correct_price_by_name(nm, price)
+        if correct:
+            old_pr = price
+            ai_items[idx]["price"] = correct
+            fixed_any = True
+            _slog.warning(f"[SUBTOTAL-SUFFIX] FIXED: '{nm}' {old_pr} → {correct}")
+
+    if fixed_any:
+        new_sum = sum(it.get("price") or 0 for it in ai_items)
+        _slog.warning(f"[SUBTOTAL-SUFFIX] after fix, new_sum={new_sum}")
+        return ai_items
+
+    # ===== 2단계: 비정상 고가 감지 (totalAmount 필요) =====
+    if total_amount and total_amount > 0:
         for idx, item in enumerate(ai_items):
             price = item.get("price") or 0
-            if price <= 0:
+            if price < 100_000:
                 continue
-            nm = (item.get("itemName") or "")
-            # 항목 가격이 소계 숫자와 매칭되는지 확인
-            # (964,600 == 일부 of 1,964,600, 또는 정확히 일치)
-            price_str = str(price)
-            is_contaminated = False
-            for sub_n in subtotal_numbers:
-                sub_str = str(sub_n)
-                if price == sub_n or sub_str.endswith(price_str) and len(price_str) >= 4:
-                    is_contaminated = True
-                    break
-            if not is_contaminated:
-                continue
-            _slog.warning(f"[SUBTOTAL-PATTERN] '{nm}' = {price} matches subtotal pattern!")
-            # OCR에서 이 항목의 올바른 가격 찾기
-            nm_norm = re.sub(r'[^\w가-힣a-zA-Z]', '', nm)
-            best_replacement = None
-            for ocr_name, ocr_prices in item_line_prices.items():
-                # 이름 매칭: 부분 포함
-                if len(nm_norm) >= 2 and len(ocr_name) >= 2:
-                    if nm_norm in ocr_name or ocr_name in nm_norm:
-                        for op in ocr_prices:
-                            if op < price and op >= 100:
-                                if best_replacement is None or op < best_replacement:
-                                    best_replacement = op
-            if best_replacement:
-                old_pr = price
-                ai_items[idx]["price"] = best_replacement
-                fixed_pattern += 1
+            nm = item.get("itemName") or ""
+            nm_lower = nm.lower()
+            # 진료/진찰/검진/내복약 등 일반 항목이 totalAmount의 40% 초과 → 비정상
+            is_common_item = any(k in nm_lower for k in [
+                "진료", "진찰", "검진", "내복약", "외용", "입원",
+                "기본", "재진", "초진",
+            ])
+            if is_common_item and price > total_amount * 0.4:
                 _slog.warning(
-                    f"[SUBTOTAL-PATTERN] FIXED: '{nm}' {old_pr} → {best_replacement}"
+                    f"[SUBTOTAL-HIGHPRICE] '{nm}' = {price} is >{total_amount * 0.4:.0f} "
+                    f"(40% of total {total_amount}) — suspicious for common item"
                 )
-        if fixed_pattern > 0:
-            new_sum = sum(it.get("price") or 0 for it in ai_items)
-            _slog.warning(f"[SUBTOTAL-PATTERN] {fixed_pattern} items fixed, new_sum={new_sum}")
-            return ai_items  # 패턴으로 고쳤으면 여기서 종료
+                correct = _find_correct_price_by_name(nm, price)
+                if correct:
+                    old_pr = price
+                    ai_items[idx]["price"] = correct
+                    fixed_any = True
+                    _slog.warning(f"[SUBTOTAL-HIGHPRICE] FIXED: '{nm}' {old_pr} → {correct}")
 
-    # ===== 2단계: 총액 기반 감지 (기존 로직, 안전장치) =====
+        if fixed_any:
+            new_sum = sum(it.get("price") or 0 for it in ai_items)
+            _slog.warning(f"[SUBTOTAL-HIGHPRICE] after fix, new_sum={new_sum}")
+            return ai_items
+
+    # ===== 3단계: 총액 기반 감지 (가장 넓은 안전망) =====
     if not total_amount:
         return ai_items
 
     current_sum = sum(it.get("price") or 0 for it in ai_items)
 
-    # 합계가 총액의 130% 이상일 때만 작동 (명확한 초과)
     if current_sum <= total_amount * 1.3:
         return ai_items
 
@@ -1458,43 +1502,28 @@ def _fix_subtotal_contamination(
         f"excess={excess}, checking for subtotal contamination"
     )
 
-    # OCR 텍스트에서 모든 숫자 추출
-    all_ocr_nums: set = set()
-    if ocr_text:
-        for ln in ocr_text.splitlines():
-            for m in re.findall(r"[\d,]+\d", ln):
-                try:
-                    n = int(m.replace(",", ""))
-                    if 1000 <= n <= 5_000_000:
-                        all_ocr_nums.add(n)
-                except ValueError:
-                    pass
-    # 소계 숫자 제외 (이미 소계로 식별된 숫자는 대체 후보에서 제거)
-    all_ocr_nums -= subtotal_numbers
-
+    # 소계 후보에서 교체 시도
     best_fix = None
     best_new_diff = abs(current_sum - total_amount)
+
+    # 대체용 OCR 숫자 (큰 숫자 제외 — 소계일 수 있으므로)
+    replacement_nums = {n for n in all_ocr_nums if n < 500_000}
 
     for idx, item in enumerate(ai_items):
         price = item.get("price") or 0
         if price <= 0:
             continue
-
-        # 이 항목 가격이 excess의 50% 이상이어야 소계 후보
         if price < excess * 0.5:
             continue
 
         nm = (item.get("itemName") or "")[:40]
         _slog.info(f"[SUBTOTAL] suspect item: '{nm}' = {price} (excess={excess})")
 
-        # OCR 숫자 중 이 항목의 가격보다 훨씬 작은 숫자로 대체 시도
-        for ocr_n in all_ocr_nums:
+        for ocr_n in replacement_nums:
             if ocr_n >= price:
                 continue
             new_sum = current_sum - price + ocr_n
             new_diff = abs(new_sum - total_amount)
-
-            # 총액에 훨씬 가까워져야 함 (총액의 5% 이내)
             if new_diff < best_new_diff and new_diff < total_amount * 0.05:
                 best_new_diff = new_diff
                 best_fix = (idx, ocr_n, price)
@@ -1506,7 +1535,7 @@ def _fix_subtotal_contamination(
         new_sum = sum(it.get("price") or 0 for it in ai_items)
         _slog.warning(
             f"[SUBTOTAL] FIXED: '{nm}' {old_price} → {new_price} "
-            f"(was subtotal contamination, new_sum={new_sum}, total={total_amount})"
+            f"(new_sum={new_sum}, total={total_amount})"
         )
     else:
         _slog.info("[SUBTOTAL] no subtotal contamination fix found")
@@ -1795,10 +1824,7 @@ def process_receipt(
             _ocr_extracted = _extract_items_from_text(ocr_text)
             _ocr_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in _ocr_extracted}
             _log.warning(f"[DEBUG-OCR] extracted items: {_ocr_prices}")
-            # Step 0: ✅ OCR 항목 이름 매칭 보정
-            _fix_prices_by_ocr_name_match(ai_parsed["items"], ocr_text)
-            # Step A: OCR 텍스트 숫자 교차검증
-            _cross_validate_prices(ai_parsed["items"], ocr_text)
+            # totalAmount 결정 (소계 감지에 필요)
             gemini_total = ai_parsed.get("totalAmount")
             total_amt = gemini_total
             gemini_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
@@ -1809,10 +1835,15 @@ def process_receipt(
                 )
                 total_amt = ocr_total_amount
                 ai_parsed["totalAmount"] = ocr_total_amount
-            # Step B-1: ✅ 카테고리 소계 오염 감지/교정 (안전장치)
+            # Step B-1: ✅ 카테고리 소계 오염 감지/교정 (★ 가장 먼저 실행!)
+            # Step 0보다 먼저 실행해야 Step 0이 소계 가격으로 덮어쓰는 걸 방지
             ai_parsed["items"] = _fix_subtotal_contamination(
                 ai_parsed["items"], total_amt, ocr_text=ocr_text
             )
+            # Step 0: ✅ OCR 항목 이름 매칭 보정
+            _fix_prices_by_ocr_name_match(ai_parsed["items"], ocr_text)
+            # Step A: OCR 텍스트 숫자 교차검증
+            _cross_validate_prices(ai_parsed["items"], ocr_text)
 
             # Step B-2: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
             ai_parsed["items"] = _fix_prices_by_total(
@@ -1841,6 +1872,7 @@ def process_receipt(
         parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = hints.get("pipeline", "ai_primary")
+        hints["_ocr_version"] = "v4-subtotal-fix"
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
