@@ -1155,12 +1155,12 @@ _DIGIT_SWAPS = [
 def _fix_prices_by_total(
     ai_items: List[Dict[str, Any]],
     total_amount: Optional[int],
+    ocr_text: str = "",
 ) -> List[Dict[str, Any]]:
     """
-    항목 합계가 totalAmount와 다를 때,
-    흔한 OCR 숫자 혼동(6↔8 등)을 시도해서 합계가 맞는 보정을 찾는다.
-    예: 68,000 → 66,000 (6↔8 혼동) → 합계 일치 시 적용.
-    최대 2개 항목까지 동시 보정.
+    항목 합계가 totalAmount와 다를 때:
+    1단계: 흔한 OCR 숫자 혼동(6↔8 등) 시도 (최대 2항목)
+    2단계: 1단계 실패 시 → OCR 텍스트에 있는 숫자로 대체해서 총액 맞추기
     **최소 변경량 우선**: 여러 보정 조합이 가능하면 가격 변동이 가장 작은 것을 선택.
     """
     if not total_amount or not ai_items:
@@ -1249,7 +1249,117 @@ def _fix_prices_by_total(
         )
         return ai_items
 
-    _flog.info(f"[FIX_TOTAL] no digit-swap correction found for diff={diff}")
+    # ═══════════════════════════════════════════════
+    # 2단계: OCR 항목 매칭 기반 보정
+    # OCR 텍스트에서 (이름, 가격) 쌍을 추출하고, Gemini 항목과
+    # 이름을 매칭하여 가격이 다른 항목을 찾아 보정한다.
+    # 예: OCR "내복약 1일 38,500" vs Gemini "내복약-1일 33,000" → 38,500으로 보정
+    # ═══════════════════════════════════════════════
+    if not ocr_text:
+        _flog.info(f"[FIX_TOTAL] no digit-swap correction found, no OCR text for phase 2")
+        return ai_items
+
+    # OCR 텍스트에서 항목(이름+가격) 추출
+    ocr_items = _extract_items_from_text(ocr_text)
+    if not ocr_items:
+        _flog.info(f"[FIX_TOTAL] no OCR items for phase 2")
+        return ai_items
+
+    def _name_sim(a: str, b: str) -> float:
+        """두 항목명의 유사도 (0~1). 공통 글자 비율."""
+        na = re.sub(r"[^가-힣a-zA-Z0-9]", "", a.lower())
+        nb = re.sub(r"[^가-힣a-zA-Z0-9]", "", b.lower())
+        if not na or not nb:
+            return 0.0
+        # 짧은 쪽이 긴 쪽에 포함되는지
+        short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
+        if short in long:
+            return 0.9
+        # 공통 글자 수
+        common = sum(1 for c in short if c in long)
+        return common / max(len(short), 1)
+
+    # Gemini 항목과 OCR 항목을 이름 매칭하여 가격 불일치 찾기
+    ocr_replacements = []
+    for idx, ai_item in enumerate(ai_items):
+        ai_pr = ai_item.get("price")
+        if ai_pr is None or ai_pr == 0:
+            continue
+        ai_name = ai_item.get("itemName") or ""
+
+        for ocr_item in ocr_items:
+            ocr_pr = ocr_item.get("price")
+            ocr_name = ocr_item.get("itemName") or ""
+            if ocr_pr is None or ocr_pr == abs(ai_pr):
+                continue  # 같은 가격이면 건너뜀
+
+            sim = _name_sim(ai_name, ocr_name)
+            if sim < 0.4:
+                continue  # 이름이 너무 다르면 건너뜀
+
+            sign = -1 if ai_pr < 0 else 1
+            new_pr = sign * ocr_pr
+            change = new_pr - ai_pr
+            new_diff = diff + change
+
+            if abs(new_diff) < 100:
+                # 총액 일치 + 이름도 매칭!
+                ocr_replacements.append((idx, new_pr, change, abs(change), sim, ocr_name))
+
+    if ocr_replacements:
+        # 이름 유사도 높은 것 우선, 그 다음 최소 변경량
+        ocr_replacements.sort(key=lambda x: (-x[4], x[3]))
+        idx, new_pr, change, _, sim, ocr_nm = ocr_replacements[0]
+        old_pr = ai_items[idx]["price"]
+        nm = (ai_items[idx].get("itemName") or "")[:40]
+        ai_items[idx]["price"] = new_pr
+        _flog.warning(
+            f"[FIX_TOTAL] OCR MATCH REPLACEMENT: '{nm}' {old_pr} → {new_pr} "
+            f"(matched OCR item '{ocr_nm}', sim={sim:.2f}, diff {diff} → {diff + change})"
+        )
+        return ai_items
+
+    # 3단계 폴백: 이름 매칭 없이 숫자만으로 대체 (최소 변경량)
+    all_ocr_nums: set = set()
+    for raw_ln in ocr_text.splitlines():
+        for m in re.findall(r"[\d,]+\d", raw_ln):
+            try:
+                n = int(m.replace(",", ""))
+                if 100 <= n <= 50_000_000:
+                    all_ocr_nums.add(n)
+            except ValueError:
+                pass
+
+    fallback_replacements = []
+    for idx, item in enumerate(ai_items):
+        pr = item.get("price")
+        if pr is None or pr == 0:
+            continue
+        abs_pr = abs(pr)
+        sign = -1 if pr < 0 else 1
+
+        for ocr_n in all_ocr_nums:
+            if ocr_n == abs_pr:
+                continue
+            new_pr = sign * ocr_n
+            change = new_pr - pr
+            new_diff = diff + change
+            if abs(new_diff) < 100:
+                fallback_replacements.append((idx, new_pr, change, abs(change)))
+
+    if fallback_replacements:
+        fallback_replacements.sort(key=lambda x: x[3])
+        idx, new_pr, change, _ = fallback_replacements[0]
+        old_pr = ai_items[idx]["price"]
+        nm = (ai_items[idx].get("itemName") or "")[:40]
+        ai_items[idx]["price"] = new_pr
+        _flog.warning(
+            f"[FIX_TOTAL] OCR FALLBACK REPLACEMENT: '{nm}' {old_pr} → {new_pr} "
+            f"(diff {diff} → {diff + change})"
+        )
+        return ai_items
+
+    _flog.info(f"[FIX_TOTAL] no correction found for diff={diff}")
     return ai_items
 
 
@@ -1602,7 +1712,7 @@ def process_receipt(
             # Step B: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
             # Vision OCR도 같은 오류를 내는 경우 대비
             ai_parsed["items"] = _fix_prices_by_total(
-                ai_parsed["items"], total_amt
+                ai_parsed["items"], total_amt, ocr_text=ocr_text
             )
 
             # Step C: 누락 항목 복구
