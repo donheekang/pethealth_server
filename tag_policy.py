@@ -299,7 +299,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "amoxicillin","cephalexin","enrofloxacin","doxycycline","clindamycin",
         "mycophenolate","마이코페놀레이트","tacrolimus","타크로리무스",
         "chlorambucil","클로람부실","vincristine","빈크리스틴",
-        "piroxicam","피록시캄","토세라닙","toceranib","palladia",
+        "piroxicam","피록시캄","토세라닙","toceranib","palladia","팔라디아",
         "실데나필","sildenafil","피모벤단","pimobendan","베트메딘","vetmedin",
         "암로디핀","amlodipine","베나제프릴","benazepril","포르테코르","fortekor",
         "에날라프릴","enalapril","텔미사르탄","telmisartan","세미트라","semintra",
