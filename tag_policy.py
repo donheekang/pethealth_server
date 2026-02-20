@@ -66,6 +66,8 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "exam_coagulation", "group": "exam", "aliases": [
         "응고검사","응고","coagulation","pt","aptt","pt/aptt","프로트롬빈",
         "피브리노겐","fibrinogen","응고시간","출혈시간",
+        "d-dimer","d dimer","ddimer","디다이머","혈전","thrombin","트롬빈",
+        "혈전검사","응고인자","혈액응고",
     ]},
     {"code": "exam_electrolyte", "group": "exam", "aliases": [
         "전해질","전해질검사","electrolyte","나트륨","칼륨","칼슘",
@@ -161,6 +163,9 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "항체검사","pcr","pcr검사","파보","디스템퍼","파보바이러스",
         "parvovirus","distemper","panleukopenia","범백","코로나검사","giardia","지아디아",
         "snap combo","combo test","키트검사","신속검사","rapid test",
+        "감염병검사","감염검사","전염병검사","바이러스검사","ehrlichia","에를리히아",
+        "anaplasma","아나플라즈마","lyme","라임","라임병","리케치아","rickettsia",
+        "cpl","spec cpl","cpli","감염병","감염","전염병",
     ]},
     # === 기본 신체검사 / 활력징후 ===
     {"code": "exam_vitals", "group": "exam", "aliases": [
@@ -214,11 +219,16 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "벼룩","진드기","외부기생충","넥스가드","브라벡토","프론트라인",
         "어드밴티지","advantage","advantix","세레스토","seresto","외부구충",
         "레볼루션","크레델리오","credelio","simparica","심파리카","벼룩약","진드기약",
+        "스팟온","spot-on","spot on","피프로닐","fipronil","퍼메트린","permethrin",
+        "이미드캐브","이미독스","imidox",
     ]},
     {"code": "prevent_deworming", "group": "preventive_med", "aliases": [
         "deworm","deworming","drontal","milbemax","fenbendazole","panacur",
         "구충","구충제","내부기생충","드론탈","밀베맥스","펜벤다졸",
         "내부구충","회충","촌충","편충","구충약","기생충약","프라지콴텔","praziquantel",
+        "말라론","malarone","아토바쿠온","atovaquone","바베시아","babesia",
+        "이미도카브","imidocarb","이미드캐브","항원충","항기생충",
+        "메트로니다졸","트리코모나스","콕시듐","coccidia","기아르디아","giardia",
     ]},
     # === 처방약 ===
     {"code": "medicine_antibiotic", "group": "medicine", "aliases": [
@@ -228,6 +238,10 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "enrofloxacin","marbofloxacin","마보플록사신","항생","클라바목스",
         "세파졸린","cefazolin","아지스로마이신","azithromycin","린코마이신","lincomycin",
         "클린다마이신","clindamycin",
+        "지스로맥스","zithromax","세프트리악손","ceftriaxone","세파클러","cefaclor",
+        "바이트릴","오비악스","obiaxe","리팜피신","rifampicin",
+        "세프포독심","cefpodoxime","세팔로스포린","cephalosporin",
+        "프라목스","pradofloxacin","프라도플록사신","오르비플록사신","orbax",
     ]},
     {"code": "medicine_anti_inflammatory", "group": "medicine", "aliases": [
         "nsaid","anti-inflammatory","meloxicam","metacam","carprofen","rimadyl",
@@ -249,6 +263,9 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "reglan","위장약","구토","설사","장염","위장관","소화제","지사제",
         "파모티딘","오메프라졸","세레니아","수크랄페이트","메토클로프라미드",
         "정장제","프로바이오틱스","probiotics","유산균","소화효소",
+        "란소프라졸","lansoprazole","판토프라졸","pantoprazole","라니티딘","ranitidine",
+        "마로필란트","maropitant","온단세트론","돔페리돈","domperidone",
+        "설파살라진","sulfasalazine","미소프로스톨","misoprostol",
     ]},
     {"code": "medicine_eye", "group": "medicine", "aliases": [
         "eye drop","ophthalmic","tobramycin","ofloxacin","cyclosporine",
@@ -280,6 +297,13 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "zonisamide","leflunomide","gabapentin","phenobarbital","prednisolone",
         "cyclosporine","oclacitinib","apoquel","atopica","metronidazole",
         "amoxicillin","cephalexin","enrofloxacin","doxycycline","clindamycin",
+        "mycophenolate","마이코페놀레이트","tacrolimus","타크로리무스",
+        "chlorambucil","클로람부실","vincristine","빈크리스틴",
+        "piroxicam","피록시캄","토세라닙","toceranib","palladia",
+        "실데나필","sildenafil","피모벤단","pimobendan","베트메딘","vetmedin",
+        "암로디핀","amlodipine","베나제프릴","benazepril","포르테코르","fortekor",
+        "에날라프릴","enalapril","텔미사르탄","telmisartan","세미트라","semintra",
+        "레보티록신","levothyroxine","솔록신","soloxine","갑상선약",
     ]},
     # === 처치/수액/응급/수혈 ===
     {"code": "care_injection", "group": "checkup", "aliases": [
@@ -297,6 +321,8 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "수혈","transfusion","blood transfusion","전혈","packed rbc","혈장",
         "plasma","수혈비","혈액제제","fresh frozen plasma","ffp",
         "적혈구농축액","prbc","혈소판","platelet","수혈료",
+        "농축적혈구","수혈모니터링","수혈반응","크로스매칭","crossmatching",
+        "혈액은행","blood bank","수혈전검사","수혈키트","수혈세트",
     ]},
     {"code": "care_oxygen", "group": "checkup", "aliases": [
         "산소","산소치료","산소방","산소텐트","oxygen","oxygen therapy","o2",
@@ -454,6 +480,10 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "오메가3","omega","유산균","프로바이오틱","프리바이오틱","관절영양제",
         "관절보조","피부영양제","면역보조","영양보조","건강보조식품","건강보조",
         "종합영양제","멀티비타민","눈영양제","간영양제","신장영양제",
+        "뉴트리플러스","nutri","뉴트리","헤파틱","hepatic support","데나마린","denamarin",
+        "사밀","samil","실리마린","silymarin","밀크시슬","간보호제",
+        "레날어드밴스","renal advance","아조딜","azodyl","이파키틴","ipakitine",
+        "코세퀸","cosequin","다스퀸","dasuquin","항산화제","antioxidant",
     ]},
     {"code": "supply_goods", "group": "etc", "aliases": [
         "용품","pet supply","pet supplies","펫용품","반려동물용품",
