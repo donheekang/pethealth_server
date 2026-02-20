@@ -773,6 +773,8 @@ RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
 - CRITICAL: Read every digit carefully. Similar-looking digits:
   · 3 vs 8, 5 vs 6, 0 vs 8, 1 vs 7 — zoom in and verify.
   · If the total doesn't match your items sum, re-read the prices digit by digit.
+- ⚠️ ABSOLUTELY NEVER invent or adjust a price to make your sum equal the totalAmount.
+  Every price must come directly from the receipt image. Accuracy per item > matching total.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 4: DISCOUNT ITEMS → NEGATIVE PRICE
@@ -809,15 +811,18 @@ STEP 1 — Count visible line items:
   If your array is shorter → you MISSED items. Go back and find them.
   COMMON MISTAKE: Similar-looking items (혈액 검사 types, 고가약물-XXX) are SEPARATE rows.
 
-STEP 2 — Calculate your sum vs totalAmount (THIS IS THE MOST IMPORTANT CHECK):
+STEP 2 — Calculate your sum vs totalAmount:
   Add up ALL your item prices: item1 + item2 + item3 + ...
   Compare this sum to the totalAmount on the receipt.
-  If the difference is more than 100원 → you have ERRORS.
-  Possible causes:
-    - You MISSED an item (most common!) → re-scan the receipt
-    - You read a PRICE wrong → re-check each price
-    - You read the TOTAL wrong → re-check the 청구금액/합계
-  DO NOT RETURN until |your_sum - totalAmount| < 100.
+  If the difference is more than 100원 → you may have missed an item or misread a price.
+  Try to re-read the receipt to find the cause.
+
+  ⚠️ CRITICAL WARNING: NEVER change an item's price just to make the sum match the total!
+  Each price MUST be exactly what is printed on the receipt.
+  If your sum doesn't match after careful re-reading, return the EXACT prices anyway.
+  An accurate price with a mismatched total is BETTER than a fake price that matches.
+  WRONG: Reading 96,000 on receipt but writing 56,000 to make sum work.
+  RIGHT: Always write 96,000 if that's what the receipt shows, even if total doesn't match.
 
 STEP 3 — Name accuracy:
   For each item, verify the itemName matches the receipt text CHARACTER BY CHARACTER.
