@@ -107,8 +107,8 @@ class Settings(BaseSettings):
 
     DB_ENABLED: bool = True
     DATABASE_URL: str = ""
-    DB_POOL_MIN: int = 1
-    DB_POOL_MAX: int = 5
+    DB_POOL_MIN: int = 2
+    DB_POOL_MAX: int = 15
     DB_AUTO_UPSERT_USER: bool = True
 
     USER_TOUCH_THROTTLE_SECONDS: int = 300
