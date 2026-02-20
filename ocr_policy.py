@@ -1707,10 +1707,31 @@ def process_receipt(
             # Step A: OCR 텍스트 숫자 교차검증
             _cross_validate_prices(ai_parsed["items"], ocr_text)
 
-            total_amt = ai_parsed.get("totalAmount")
+            gemini_total = ai_parsed.get("totalAmount")
+
+            # ✅ 총액은 Vision OCR 추출값을 우선 사용
+            # Gemini가 총액도 잘못 읽으면(항목 합계에 맞춰버리면) 보정이 안 되므로
+            # Vision OCR 총액이 있으면 그걸 기준으로 사용
+            total_amt = gemini_total
+            if ocr_total_amount and ocr_total_amount > 0:
+                gemini_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
+                # OCR 총액과 Gemini 총액이 다르면, OCR 총액 사용
+                if gemini_total and abs(gemini_sum - gemini_total) < 500:
+                    # Gemini 합계 == Gemini 총액 → Gemini가 총액을 합계에 맞췄을 수 있음
+                    # OCR 총액이 더 신뢰할 수 있음
+                    if abs(ocr_total_amount - gemini_total) > 500:
+                        _log.warning(
+                            f"[TOTAL] Using OCR total {ocr_total_amount} instead of "
+                            f"Gemini total {gemini_total} (Gemini sum={gemini_sum})"
+                        )
+                        total_amt = ocr_total_amount
+                        # ai_parsed의 totalAmount도 업데이트
+                        ai_parsed["totalAmount"] = ocr_total_amount
+                elif not gemini_total:
+                    total_amt = ocr_total_amount
+                    ai_parsed["totalAmount"] = ocr_total_amount
 
             # Step B: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
-            # Vision OCR도 같은 오류를 내는 경우 대비
             ai_parsed["items"] = _fix_prices_by_total(
                 ai_parsed["items"], total_amt, ocr_text=ocr_text
             )
