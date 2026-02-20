@@ -1181,6 +1181,7 @@ def _fix_prices_by_ocr_name_match(
         if it.get("price"):
             ai_prices.add(abs(it["price"]))
     corrected = 0
+    _used_ocr_indices: set = set()  # 🔒 이미 매칭된 OCR 항목 재사용 방지
     for ai_item in ai_items:
         ai_pr = ai_item.get("price")
         if ai_pr is None or ai_pr == 0:
@@ -1192,48 +1193,61 @@ def _fix_prices_by_ocr_name_match(
         best_ocr = None
         best_sim = 0.0
         best_name_len = 0
-        for ocr_item in ocr_items:
+        best_ocr_idx = -1
+        for idx, ocr_item in enumerate(ocr_items):
+            if idx in _used_ocr_indices:
+                continue  # 🔒 이미 다른 AI 항목에 매칭됨
             ocr_name = ocr_item.get("itemName") or ""
             ocr_pr = ocr_item.get("price")
             if ocr_pr is None:
                 continue
+            # 🔒 OCR 항목 이름이 너무 짧으면 신뢰 불가 ("can", "LAD" 등)
+            _ocr_nm_clean = _norm_name(ocr_name)
+            _has_kor = any("\uac00" <= ch <= "\ud7a3" for ch in ocr_name)
+            if not _has_kor and len(_ocr_nm_clean) < 5:
+                continue
+            if len(_ocr_nm_clean) < 2:
+                continue
             sim = _name_similarity(ai_name, ocr_name)
-            ocr_nlen = len(_norm_name(ocr_name))
+            ocr_nlen = len(_ocr_nm_clean)
             # 유사도가 더 높거나, 같으면 이름이 더 긴(구체적인) 쪽 우선
             if sim > best_sim or (sim == best_sim and sim > 0 and ocr_nlen > best_name_len):
                 best_sim = sim
                 best_ocr = ocr_item
                 best_name_len = ocr_nlen
+                best_ocr_idx = idx
         if best_ocr and best_sim >= 0.5:
             ocr_pr = best_ocr["price"]
             ocr_name = best_ocr.get("itemName", "")
-            # 가격이 다르고, OCR 가격이 다른 Gemini 항목의 가격과 동일하지 않을 때
-            # (= OCR 가격이 영수증에서 고유한 값일 때 더 신뢰)
-            if ocr_pr != abs_ai_pr:
-                # ✅ 안전장치: 가격 차이가 너무 크면 교체하지 않음
-                # 정상적 OCR 보정은 2배 이내 (예: 66000↔68000=1.03배, 80000↔88000=1.1배)
-                # 3배 이상 차이 = OCR이 엉뚱한 숫자를 읽은 것
-                # 예: Gemini 9,300 → OCR 1,315 (7배) = OCR 오류
-                ratio = max(ocr_pr, abs_ai_pr) / max(min(ocr_pr, abs_ai_pr), 1)
-                if ratio > 3:
-                    _mlog.info(
-                        f"[NAME_MATCH] SKIP '{ai_name}' {abs_ai_pr} → {ocr_pr} "
-                        f"(ratio {ratio:.1f}x too large, likely subtotal contamination)"
-                    )
-                    continue
-                # OCR 가격이 다른 Gemini 항목에는 없는 고유 가격이면 → 강하게 보정
-                ocr_is_unique = ocr_pr not in ai_prices
-                # 또는 이름 유사도가 매우 높으면 → 보정
-                if ocr_is_unique or best_sim >= 0.8:
-                    sign = -1 if ai_pr < 0 else 1
-                    old_pr = ai_pr
-                    ai_item["price"] = sign * ocr_pr
-                    corrected += 1
-                    _mlog.warning(
-                        f"[NAME_MATCH] '{ai_name}' {old_pr} → {sign * ocr_pr} "
-                        f"(OCR item '{ocr_name}', sim={best_sim:.2f}, "
-                        f"unique={ocr_is_unique})"
-                    )
+            if ocr_pr == abs_ai_pr:
+                # 가격 동일 → 매칭은 하되 교정 불필요, OCR 항목 사용 표시
+                _used_ocr_indices.add(best_ocr_idx)
+                continue
+            # 가격이 다를 때
+            # ✅ 안전장치: 가격 차이가 너무 크면 교체하지 않음
+            # 정상적 OCR 보정은 2배 이내 (예: 66000↔68000=1.03배, 80000↔88000=1.1배)
+            # 3배 이상 차이 = OCR이 엉뚱한 숫자를 읽은 것
+            ratio = max(ocr_pr, abs_ai_pr) / max(min(ocr_pr, abs_ai_pr), 1)
+            if ratio >= 3:
+                _mlog.warning(
+                    f"[NAME_MATCH] SKIP '{ai_name}' {abs_ai_pr} → {ocr_pr} "
+                    f"(ratio {ratio:.1f}x too large)"
+                )
+                continue
+            # OCR 가격이 다른 Gemini 항목에는 없는 고유 가격이면 → 강하게 보정
+            ocr_is_unique = ocr_pr not in ai_prices
+            # 또는 이름 유사도가 매우 높으면 → 보정
+            if ocr_is_unique or best_sim >= 0.8:
+                sign = -1 if ai_pr < 0 else 1
+                old_pr = ai_pr
+                ai_item["price"] = sign * ocr_pr
+                corrected += 1
+                _used_ocr_indices.add(best_ocr_idx)
+                _mlog.warning(
+                    f"[NAME_MATCH] '{ai_name}' {old_pr} → {sign * ocr_pr} "
+                    f"(OCR item '{ocr_name}', sim={best_sim:.2f}, "
+                    f"unique={ocr_is_unique})"
+                )
     if corrected:
         _mlog.warning(f"[NAME_MATCH] {corrected} items corrected by OCR name matching")
 # =========================================================
