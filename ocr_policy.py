@@ -2027,12 +2027,23 @@ def process_receipt(
                     f"Gemini sum={gemini_sum}"
                 )
                 # ✅ OCR total 신뢰성 검증:
-                # Gemini total과 sum이 일치하는데 OCR total이 크게 다르면 → Gemini 신뢰
+                # Gemini total과 sum이 일치하면 → Gemini가 거의 확실히 맞음
                 _use_ocr_total = True
                 if gemini_total and gemini_sum and gemini_total > 0:
-                    _gem_match = abs(gemini_sum - gemini_total) < gemini_total * 0.1
-                    _ocr_far = abs(ocr_total_amount - gemini_total) > gemini_total * 0.3
-                    if _gem_match and _ocr_far:
+                    _gem_exact = abs(gemini_sum - gemini_total) < max(500, gemini_total * 0.01)
+                    _gem_close = abs(gemini_sum - gemini_total) < gemini_total * 0.1
+                    _ocr_diff = abs(ocr_total_amount - gemini_total)
+                    if _gem_exact and _ocr_diff > 0:
+                        # Gemini sum ≈ Gemini total (거의 정확히 일치)
+                        # → OCR total이 조금이라도 다르면 Gemini 신뢰
+                        _log.warning(
+                            f"[TOTAL] Gemini sum==total ({gemini_sum}=={gemini_total}), "
+                            f"OCR total={ocr_total_amount} differs by {_ocr_diff}, "
+                            f"trusting Gemini"
+                        )
+                        _use_ocr_total = False
+                    elif _gem_close and _ocr_diff > gemini_total * 0.05:
+                        # Gemini sum ≈ total (10% 이내) + OCR total이 5% 이상 벗어남
                         _log.warning(
                             f"[TOTAL] OCR total={ocr_total_amount} is far from "
                             f"Gemini total={gemini_total} (sum={gemini_sum}), "
