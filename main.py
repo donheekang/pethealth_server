@@ -1850,7 +1850,7 @@ _TAG_KEYWORDS: Dict[str, List[str]] = {
     "medicine": ["약", "처방", "prescription", "drug", "medicine", "항생제", "소염제",
                  "진통제", "위장약", "심장사상충", "구충제", "외구충", "내구충",
                  "넥스가드", "브라벡토", "레볼루션", "하트가드", "프론트라인",
-                 "팔라디아", "palladia", "항암", "빈크리스틴", "독소루비신"],
+                 "팔라디아", "팔리디아", "palladia", "항암", "빈크리스틴", "독소루비신"],
     "hospitalization": ["입원", "hospitalization", "icu", "중환자"],
     "emergency": ["응급", "emergency", "야간진료"],
 }
