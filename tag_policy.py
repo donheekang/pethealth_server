@@ -304,6 +304,14 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "암로디핀","amlodipine","베나제프릴","benazepril","포르테코르","fortekor",
         "에날라프릴","enalapril","텔미사르탄","telmisartan","세미트라","semintra",
         "레보티록신","levothyroxine","솔록신","soloxine","갑상선약",
+        "레나메진","renamezin","크레메진","kremezin","ast-120","ast120",
+        "신장약","신부전약","ckd약","인산결합제","세벨라머","sevelamer",
+        "에포에틴","epoetin","다르베포에틴","darbepoetin","epo",
+        "칼시트리올","calcitriol","수산화알루미늄","인흡착제",
+        "라프로스","rapros","베라프로스트","beraprost",
+        "우르소","ursodiol","우르소데옥시콜산","ursodeoxycholic","간장약",
+        "메틸프레드니솔론","methylprednisolone","덱사메타손","dexamethasone",
+        "트리암시놀론","triamcinolone","부데소니드","budesonide",
     ]},
     # === 처치/수액/응급/수혈 ===
     {"code": "care_injection", "group": "checkup", "aliases": [
@@ -483,7 +491,11 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "뉴트리플러스","nutri","뉴트리","헤파틱","hepatic support","데나마린","denamarin",
         "사밀","samil","실리마린","silymarin","밀크시슬","간보호제",
         "레날어드밴스","renal advance","아조딜","azodyl","이파키틴","ipakitine",
+        "프로네프라","pronefra","키드니쉴드","kidney shield","레날케어","renal care",
         "코세퀸","cosequin","다스퀸","dasuquin","항산화제","antioxidant",
+        "글루코사민","glucosamine","콘드로이틴","chondroitin","msm",
+        "엘카르니틴","l-carnitine","카르니틴","carnitine",
+        "쏜리서치","thorne","뉴트리베스트","프로네프라","프로바이오틱스","probiotics",
     ]},
     {"code": "supply_goods", "group": "etc", "aliases": [
         "용품","pet supply","pet supplies","펫용품","반려동물용품",
