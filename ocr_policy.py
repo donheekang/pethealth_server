@@ -1098,14 +1098,14 @@ def _cross_validate_prices(
         _xlog.warning(f"[XVAL] price not in OCR: '{nm}' = {pr}")
         mismatch_count += 1
 
-        # 유사 가격 후보 찾기 (차이가 15% 이내이고, 자릿수 같은 것)
+        # 유사 가격 후보 찾기 (차이가 20% 이내이고, 자릿수 같은 것)
         best_candidate = None
         best_diff = float("inf")
         for ocr_n in all_ocr_nums:
             diff = abs(ocr_n - abs_pr)
-            # 차이가 15% 이내이고 자릿수가 같아야 함
-            # (53,790 vs 49,500 = 8.6% 차이 같은 케이스 대응)
-            if diff > 0 and diff < abs_pr * 0.15 and len(str(ocr_n)) == len(str(abs_pr)):
+            # 차이가 20% 이내이고 자릿수가 같아야 함
+            # (33,000 vs 38,500 = 16.7% 차이 같은 케이스 대응)
+            if diff > 0 and diff < abs_pr * 0.20 and len(str(ocr_n)) == len(str(abs_pr)):
                 if diff < best_diff:
                     best_diff = diff
                     best_candidate = ocr_n
