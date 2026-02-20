@@ -1099,6 +1099,121 @@ def _cross_validate_prices(
 
 
 # =========================================================
+# ✅ 총액 기반 OCR 숫자 혼동 역보정
+# =========================================================
+# 감열지에서 흔한 숫자 혼동 패턴: 6↔8, 5↔6, 3↔8, 0↔8, 1↔7
+_DIGIT_SWAPS = [
+    ("6", "8"), ("8", "6"),
+    ("5", "6"), ("6", "5"),
+    ("3", "8"), ("8", "3"),
+    ("0", "8"), ("8", "0"),
+    ("1", "7"), ("7", "1"),
+    ("5", "8"), ("8", "5"),
+]
+
+
+def _fix_prices_by_total(
+    ai_items: List[Dict[str, Any]],
+    total_amount: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    항목 합계가 totalAmount와 다를 때,
+    흔한 OCR 숫자 혼동(6↔8 등)을 시도해서 합계가 맞는 보정을 찾는다.
+    예: 68,000 → 66,000 (6↔8 혼동) → 합계 일치 시 적용.
+    최대 2개 항목까지 동시 보정.
+    **최소 변경량 우선**: 여러 보정 조합이 가능하면 가격 변동이 가장 작은 것을 선택.
+    """
+    if not total_amount or not ai_items:
+        return ai_items
+
+    import logging
+    _flog = logging.getLogger("ocr_policy.fix_total")
+
+    current_sum = sum(it.get("price") or 0 for it in ai_items)
+    diff = current_sum - total_amount
+
+    if abs(diff) < 100:
+        return ai_items  # 이미 맞음
+
+    _flog.info(f"[FIX_TOTAL] sum={current_sum}, total={total_amount}, diff={diff}")
+
+    # 각 항목별 가능한 보정 후보 생성
+    # (item_index, new_price, price_change)
+    candidates: List[tuple] = []
+    for idx, item in enumerate(ai_items):
+        pr = item.get("price")
+        if pr is None or pr == 0:
+            continue
+        pr_str = str(abs(pr))
+        sign = -1 if pr < 0 else 1
+
+        for old_d, new_d in _DIGIT_SWAPS:
+            if old_d not in pr_str:
+                continue
+            # 각 자릿수 위치마다 시도
+            for pos in range(len(pr_str)):
+                if pr_str[pos] == old_d:
+                    new_pr_str = pr_str[:pos] + new_d + pr_str[pos+1:]
+                    new_pr = sign * int(new_pr_str)
+                    change = new_pr - pr
+                    if change != 0:
+                        candidates.append((idx, new_pr, change))
+
+    if not candidates:
+        return ai_items
+
+    # 1개 항목 보정: 최소 변경량 우선
+    single_fixes = []
+    for idx, new_pr, change in candidates:
+        if abs(diff + change) < 100:
+            single_fixes.append((idx, new_pr, change, abs(change)))
+
+    if single_fixes:
+        # 변경량이 가장 작은 것 선택
+        single_fixes.sort(key=lambda x: x[3])
+        idx, new_pr, change, _ = single_fixes[0]
+        old_pr = ai_items[idx]["price"]
+        nm = (ai_items[idx].get("itemName") or "")[:40]
+        ai_items[idx]["price"] = new_pr
+        _flog.warning(
+            f"[FIX_TOTAL] SINGLE CORRECTION: '{nm}' {old_pr} → {new_pr} "
+            f"(diff {diff} → {diff + change})"
+        )
+        return ai_items
+
+    # 2개 항목 조합 보정: 최소 총 변경량 우선
+    double_fixes = []
+    for i, (idx1, new_pr1, change1) in enumerate(candidates):
+        for idx2, new_pr2, change2 in candidates[i+1:]:
+            if idx1 == idx2:
+                continue
+            if abs(diff + change1 + change2) < 100:
+                total_change = abs(change1) + abs(change2)
+                double_fixes.append((idx1, new_pr1, change1, idx2, new_pr2, change2, total_change))
+
+    if double_fixes:
+        # 총 변경량이 가장 작은 것 선택
+        double_fixes.sort(key=lambda x: x[6])
+        idx1, new_pr1, change1, idx2, new_pr2, change2, _ = double_fixes[0]
+        nm1 = (ai_items[idx1].get("itemName") or "")[:40]
+        nm2 = (ai_items[idx2].get("itemName") or "")[:40]
+        old_pr1 = ai_items[idx1]["price"]
+        old_pr2 = ai_items[idx2]["price"]
+        ai_items[idx1]["price"] = new_pr1
+        ai_items[idx2]["price"] = new_pr2
+        _flog.warning(
+            f"[FIX_TOTAL] DOUBLE CORRECTION: "
+            f"'{nm1}' {old_pr1}→{new_pr1}, "
+            f"'{nm2}' {old_pr2}→{new_pr2} "
+            f"(diff {diff} → {diff + change1 + change2})"
+        )
+        return ai_items
+
+    _flog.info(f"[FIX_TOTAL] no digit-swap correction found for diff={diff}")
+    return ai_items
+
+
+# =========================================================
 # ✅ 누락 항목 복구: Vision OCR → Gemini 보충
 # =========================================================
 def _recover_missing_items(
@@ -1430,12 +1545,20 @@ def process_receipt(
         )
         _log.info(f"[AI] normalized: items={len(ai_parsed.get('items', []))}, tags={ai_tags}")
 
-        # OCR 교차검증 + 누락 복구 적용
+        # OCR 교차검증 + 총액 기반 보정 + 누락 복구 적용
         if ocr_text and ai_parsed.get("items"):
-            # Gemini 폴백인 경우만 OCR 기반 로깅
+            # Step A: OCR 텍스트 숫자 교차검증
             _cross_validate_prices(ai_parsed["items"], ocr_text)
 
             total_amt = ai_parsed.get("totalAmount")
+
+            # Step B: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
+            # Vision OCR도 같은 오류를 내는 경우 대비
+            ai_parsed["items"] = _fix_prices_by_total(
+                ai_parsed["items"], total_amt
+            )
+
+            # Step C: 누락 항목 복구
             before_recover = len(ai_parsed["items"])
             ai_parsed["items"] = _recover_missing_items(
                 ai_parsed["items"], ocr_text, total_amt
