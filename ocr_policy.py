@@ -755,6 +755,66 @@ RULE 7: DO NOT INCLUDE THESE AS ITEMS
 - 날짜, 시간
 - 병원명, 수의사명, 환자명/보호자명
 - 카드 결제 정보, 승인번호
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 8: ⚠️ CATEGORY HEADERS vs ITEMS — DO NOT CONFUSE (매우 중요!)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Korean vet receipts often have CATEGORY HEADERS with subtotals:
+  진료 (350,000)             ← THIS IS A CATEGORY HEADER, NOT AN ITEM!
+    진찰료-재진    15,000    ← This is the actual item
+    *검사-혈액     50,000    ← This is the actual item
+    처치-수액세트  85,000    ← This is the actual item
+  용품 (25,000)              ← CATEGORY HEADER
+    처방사료 캔    25,000    ← Actual item
+  입원 (120,000)             ← CATEGORY HEADER
+    내복약-1일     45,000    ← Actual item
+    입원비         75,000    ← Actual item
+
+- The parenthesized number after a category name (e.g. "진료 (350,000)") is a SUBTOTAL.
+- NEVER use category subtotals as item prices! They are the SUM of items below them.
+- ONLY extract the INDENTED line items underneath each category header.
+- If you see a huge price for a simple consultation item → WRONG! That's likely a subtotal.
+  The actual consultation fee (진찰료/진료비) is usually 10,000~30,000원.
+- Category header keywords to watch: 진료, 검사, 처치, 수술, 약, 용품, 입원, 미용, 기타
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 9: QUANTITY COLUMN — DO NOT CONFUSE WITH PRICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Receipts with table format often have: 항목명 | 수량 | 단가 | 금액
+- 수량(quantity) is usually a small number: 1, 2, 3, 5, 7, 10, etc.
+- NEVER read quantity as price. Example:
+  · "내복약-1일 | 7 | 5,500 | 38,500" → price is 38,500 (rightmost 금액 column)
+  · NOT 7, NOT 5,500
+- Always use the RIGHTMOST large number as the price (the 금액/total column).
+- If a row shows: "항목 | 수량 | 단가 | 금액" columns → price = 금액 column value.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 10: RECEIPT BOTTOM — READ CAREFULLY (영수증 하단 주의)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Thermal receipt paper often FADES at the bottom. Text becomes lighter and harder to read.
+- Items near the bottom (입원비, 용품, 내복약, etc.) are FREQUENTLY misread or skipped.
+- PAY EXTRA ATTENTION to the last 3-5 items on the receipt.
+- If a bottom item's price looks unusually low (e.g. 500 instead of 55,000), re-read carefully.
+- Cross-check bottom item prices against the OCR text — OCR is more reliable for faded text.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 11: PRICE RANGE SANITY CHECK (가격 범위 검증)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Korean veterinary prices have typical ranges:
+- 진료비/진찰료: 5,000 ~ 30,000원
+- 혈액검사: 10,000 ~ 100,000원
+- X-ray/초음파: 30,000 ~ 150,000원
+- CT/MRI: 200,000 ~ 1,000,000원
+- 수술: 50,000 ~ 2,000,000원
+- 내복약: 3,000 ~ 50,000원
+- 입원비: 20,000 ~ 200,000원/일
+- 용품/사료: 3,000 ~ 50,000원
+
+⚠️ RED FLAGS — if you see these prices, RE-READ the receipt:
+- Any item under 1,000원 (e.g. 500원 for 입원비 → almost certainly wrong)
+- Any single non-CT/MRI/surgery item over 500,000원 → likely a category subtotal, not an item
+- 진료비/진찰료 over 100,000원 → likely reading category subtotal instead of item price
+- If a price seems wildly out of range, check if you accidentally read a category subtotal.
 """
 def _gemini_parse_receipt_full(
     *,
