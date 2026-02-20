@@ -623,7 +623,9 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
             pr = _coerce_int_amount(it.get("price"))
             if pr is not None and pr < 0:
                 pr = None
-            cleaned.append({"itemName": nm, "price": pr, "categoryTag": None})
+            ct_raw = (it.get("categoryTag") or "").strip() or None
+            ct_val = _migrate_tag(ct_raw) if ct_raw else None
+            cleaned.append({"itemName": nm, "price": pr, "categoryTag": ct_val})
         out["items"] = cleaned
     return out
 # =========================================================
@@ -1017,6 +1019,132 @@ def _migrate_tag(code: str) -> Optional[str]:
     if migrated and migrated in _VALID_TAG_CODES:
         return migrated
     return None
+
+# =========================================================
+# ✅ 키워드 기반 자동 태그 추론 (Gemini가 태그를 누락한 경우 폴백)
+# =========================================================
+_TAG_KEYWORD_RULES: List[tuple] = [
+    # (키워드 리스트, 태그코드) — 먼저 매치되는 규칙 우선
+    # ── 검사: 영상 ──
+    (["x-ray", "xray", "x ray", "방사선", "엑스레이"], "exam_xray"),
+    (["ct ", "ct-", "ct촬영", "컴퓨터단층"], "exam_ct"),
+    (["mri", "자기공명"], "exam_mri"),
+    (["내시경", "endoscop"], "exam_endoscope"),
+    (["조직검사", "생검", "biopsy", "cytology", "fna"], "exam_biopsy"),
+    # ── 검사: 초음파 ──
+    (["심장초음파", "심초음파", "echo", "심장 초음파"], "exam_echo"),
+    (["초음파(복부", "초음파-복부", "복부초음파", "복부 초음파", "us abdomen"], "exam_us_abdomen"),
+    (["초음파"], "exam_us_general"),
+    # ── 검사: 혈액 ──
+    (["cbc", "혈구", "혈액(혈구)", "hemogram", "procyte"], "exam_blood_cbc"),
+    (["chem", "chemistry", "혈청", "생화학"], "exam_blood_chem"),
+    (["crp", "c-reactive", "c반응"], "exam_crp"),
+    (["saa"], "exam_crp"),
+    (["전해질", "electrolyte", "카탈리스트", "catalyst"], "exam_electrolyte"),
+    (["혈액가스", "가스분석", "blood gas", "정맥 가스"], "exam_blood_gas"),
+    (["혈액형", "blood type"], "exam_blood_type"),
+    (["응고", "coagul", "pt/aptt"], "exam_coagulation"),
+    (["sdma"], "exam_sdma"),
+    (["probnp", "bnp"], "exam_probnp"),
+    (["프럭토사민", "fructosamine"], "exam_fructosamine"),
+    (["혈당곡선", "glucose curve"], "exam_glucose_curve"),
+    (["혈액"], "exam_blood_general"),
+    # ── 검사: 심장 ──
+    (["심전도", "ecg", "ekg"], "exam_ecg"),
+    # ── 검사: 소변/분변 ──
+    (["소변", "뇨검사", "urinalysis", "urine"], "exam_urine"),
+    (["분변", "대변", "fecal", "변검사"], "exam_fecal"),
+    (["pcr"], "exam_fecal_pcr"),
+    # ── 검사: 알레르기/안과/피부/귀 ──
+    (["알레르기검사", "allergy test"], "exam_allergy"),
+    (["안압", "안과검사", "eye exam", "슬릿램프", "안검사"], "exam_eye"),
+    (["피부검사", "skin test", "피부과"], "exam_skin"),
+    (["이경", "귀검사", "ear exam", "otoscop"], "exam_ear"),
+    (["현미경", "microscop"], "exam_microscope"),
+    # ── 검사: 호르몬 ──
+    (["호르몬", "갑상선", "t4", "cortisol", "acth"], "exam_hormone"),
+    # ── 예방접종 ──
+    (["광견병", "rabies"], "vaccine_rabies"),
+    (["종합백신", "dhppl", "종합접종", "5종", "7종", "혼합예방"], "vaccine_comprehensive"),
+    (["코로나", "corona"], "vaccine_corona"),
+    (["켄넬", "kennel", "기관지염"], "vaccine_kennel"),
+    (["fip", "복막염"], "vaccine_fip"),
+    # ── 예방약/구충 ──
+    (["심장사상충", "heartworm", "하트가드", "넥스가드스펙트라"], "prevent_heartworm"),
+    (["외부기생충", "프론트라인", "넥스가드", "브라벡토", "외부구충"], "prevent_external"),
+    (["구충", "내부기생충", "deworming", "드론탈", "펜벤다졸"], "prevent_deworming"),
+    # ── 처방약 ──
+    (["항생제", "antibiotic", "아목시실린", "세팔렉신", "바이트릴", "엔로플록사신", "클라목실"], "medicine_antibiotic"),
+    (["소염", "항염", "anti-inflammatory", "멜록시캄", "메타캄", "카프로펜", "리마딜", "온시올", "갈라프란트"], "medicine_anti_inflammatory"),
+    (["진통", "painkiller", "트라마돌", "가바펜틴"], "medicine_painkiller"),
+    (["스테로이드", "steroid", "프레드니솔론", "덱사메타손"], "medicine_steroid"),
+    (["위장약", "위장관", "세레니아", "메토클로프라미드", "란소프라졸", "오메프라졸", "수크랄페이트", "장약"], "medicine_gi"),
+    (["안약", "eye drop", "점안"], "medicine_eye"),
+    (["귀약", "이어클리너", "ear drop", "이약"], "medicine_ear"),
+    (["피부약", "아포퀠", "사이토포인트", "아토피카", "피부"], "medicine_skin"),
+    (["알레르기약", "항히스타민", "세티리진"], "medicine_allergy"),
+    (["팔라디아", "palladia", "항암", "빈크리스틴", "독소루비신", "사이클로포스파마이드", "종양약"], "medicine_oral"),
+    (["내복약", "경구약", "조제", "oral med"], "medicine_oral"),
+    (["칼슘", "calcium"], "medicine_oral"),
+    (["비타민", "vitamin", "vit k", "vit b"], "medicine_oral"),
+    # ── 마취 (처치보다 먼저 — "마취-모니터링"이 "산소"보다 우선) ──
+    (["마취", "anesthes", "호흡마취", "모니터링"], "surgery_general"),
+    # ── 처치/진료 ──
+    (["주사", "injection", "inj", "피하주사", "근육주사", "정맥주사", "앰플"], "care_injection"),
+    (["수액", "fluid", "링거", "수액세트", "카테타", "catheter"], "care_fluid"),
+    (["수혈", "transfusion"], "care_transfusion"),
+    (["산소", "oxygen", "산소방"], "care_oxygen"),
+    (["응급", "emergency"], "care_emergency"),
+    (["드레싱", "dressing", "붕대", "bandage"], "care_dressing"),
+    (["항문낭", "anal gland"], "care_anal_gland"),
+    (["이세정", "ear flush", "귀세정"], "care_ear_flush"),
+    (["진료비", "재진", "초진", "진찰", "상담"], "care_procedure_fee"),
+    (["복수천자", "천자", "흉수"], "care_procedure_fee"),
+    # ── 입원 ──
+    (["입원", "hospitalization", "격리"], "hospitalization"),
+    # ── 수술 ──
+    (["중성화", "spay", "neuter", "거세", "난소", "자궁"], "surgery_spay_neuter"),
+    (["종양제거", "종양절제", "tumor"], "surgery_tumor"),
+    (["이물", "foreign body"], "surgery_foreign_body"),
+    (["제왕절개", "cesarean"], "surgery_cesarean"),
+    (["헤르니아", "hernia", "탈장"], "surgery_hernia"),
+    (["안과수술", "eye surgery", "안구"], "surgery_eye"),
+    (["수술"], "surgery_general"),
+    # ── 치과 ──
+    (["스케일링", "scaling", "치석"], "dental_scaling"),
+    (["발치", "extraction", "치아발거"], "dental_extraction"),
+    (["치과", "dental", "치아"], "dental_treatment"),
+    # ── 관절 ──
+    (["슬개골", "patella"], "ortho_patella"),
+    (["관절염", "arthritis", "관절"], "ortho_arthritis"),
+    # ── 재활 ──
+    (["재활", "물리치료", "rehab", "수중", "레이저치료"], "rehab_therapy"),
+    # ── 건강검진 ──
+    (["건강검진", "종합검진", "checkup", "기본검진"], "checkup_general"),
+    # ── 기타 ──
+    (["마이크로칩", "microchip", "칩삽입"], "microchip"),
+    (["안락사", "euthanasia"], "euthanasia"),
+    (["장례", "화장", "funeral"], "funeral"),
+    (["넥카라", "e-collar", "엘리자베스"], "care_e_collar"),
+    (["처방식", "처방사료"], "care_prescription_diet"),
+    (["사료", "캔", "파우치", "간식", "로얄캔", "로얄-", "힐스", "처방전용", "리커버리"], "supply_food"),
+    (["영양제", "supplement", "유산균", "오메가"], "supply_supplement"),
+    (["용품", "패드", "장난감"], "supply_goods"),
+    (["그루밍", "미용", "목욕"], "grooming_basic"),
+    (["할인", "감면", "discount"], "etc_discount"),
+]
+
+def _infer_tag_by_keyword(item_name: str) -> Optional[str]:
+    """항목 이름에서 키워드 매칭으로 태그 추론. 매치 없으면 None."""
+    if not item_name:
+        return None
+    low = item_name.lower()
+    for keywords, tag_code in _TAG_KEYWORD_RULES:
+        for kw in keywords:
+            if kw.lower() in low:
+                return tag_code
+    return None
+
 # =========================================================
 # ✅ OCR 항목 이름 매칭 보정 (총액 불필요 — 직접 비교)
 # =========================================================
@@ -1729,6 +1857,9 @@ def _normalize_gemini_full_result(
             sn = (it.get("standardName") or "").strip() or None
             if ct:
                 ct = _migrate_tag(ct)
+            # 🔒 Gemini 태그가 없거나 유효하지 않으면 키워드 기반 폴백
+            if not ct:
+                ct = _infer_tag_by_keyword(nm)
             if ct:
                 tags_set.add(ct)
             item_entry = {
@@ -1882,7 +2013,7 @@ def process_receipt(
         if ocr_text and ai_parsed.get("items"):
             # 🔍 보정 전 상태 로깅
             _pre_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in ai_parsed["items"]}
-            _log.warning(f"[DEBUG-PRE] version=v9-tax-filter | Gemini prices: {_pre_prices}")
+            _log.warning(f"[DEBUG-PRE] version=v10-tag-boost | Gemini prices: {_pre_prices}")
             _ocr_extracted = _extract_items_from_text(ocr_text)
             _ocr_prices = {(it.get("itemName") or "")[:30]: it.get("price") for it in _ocr_extracted}
             _log.warning(f"[DEBUG-OCR] extracted items: {_ocr_prices}")
@@ -1963,7 +2094,7 @@ def process_receipt(
             for _it in ai_parsed["items"]:
                 _iname = (_it.get("itemName") or "").strip()
                 _iname_norm = re.sub(r"[^가-힣a-zA-Z]", "", _iname)
-                if _iname_norm in _TAX_KEYWORDS or _is_noise_line(_iname):
+                if _iname_norm in _TAX_KEYWORDS:
                     _log.warning(f"[TAX-FILTER] removing: '{_iname}' = {_it.get('price')}")
                     continue
                 _filtered_items.append(_it)
@@ -1984,7 +2115,7 @@ def process_receipt(
         parsed = ai_parsed
         parsed["ocrText"] = (ocr_text or "")[:8000]
         hints["pipeline"] = hints.get("pipeline", "ai_primary")
-        hints["_ocr_version"] = "v9-tax-filter"
+        hints["_ocr_version"] = "v10-tag-boost"
     else:
         parsed, regex_hints = _parse_receipt_from_text(ocr_text or "")
         hints.update(regex_hints)
