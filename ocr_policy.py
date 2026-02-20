@@ -1290,8 +1290,8 @@ def _cross_validate_prices(
         best_diff = float("inf")
         for ocr_n in all_ocr_nums:
             diff = abs(ocr_n - abs_pr)
-            # 차이가 10% 이내이고 자릿수가 같아야 함
-            if diff > 0 and diff < abs_pr * 0.10 and len(str(ocr_n)) == len(str(abs_pr)):
+            # 차이가 5% 이내이고 자릿수가 같아야 함
+            if diff > 0 and diff < abs_pr * 0.05 and len(str(ocr_n)) == len(str(abs_pr)):
                 # 🔒 OCR 쓰레기 숫자 필터: 한국 영수증 가격은 100원 단위
                 # 52215, 60978 같은 건 OCR 오독 → 후보 제외
                 if ocr_n % 100 != 0:
