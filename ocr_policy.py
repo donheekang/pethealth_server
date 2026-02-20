@@ -1323,6 +1323,98 @@ def _fix_prices_by_total(
     _flog.info(f"[FIX_TOTAL] no correction found for diff={diff}")
     return ai_items
 # =========================================================
+# ✅ 카테고리 소계 오염 감지 및 교정
+# =========================================================
+def _fix_subtotal_contamination(
+    ai_items: List[Dict[str, Any]],
+    total_amount: Optional[int],
+    ocr_text: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Gemini가 카테고리 소계(예: "진료 (1,964,600)")를 개별 항목 가격으로
+    잘못 읽는 경우를 감지하고 교정.
+
+    감지 조건: 항목 합계가 totalAmount보다 30% 이상 높을 때
+    교정 방법: 비정상적으로 큰 가격의 항목을 찾고,
+              OCR 텍스트에서 해당 항목의 올바른 가격을 찾아 대체.
+    """
+    if not total_amount or not ai_items:
+        return ai_items
+
+    import logging
+    _slog = logging.getLogger("ocr_policy.subtotal")
+
+    current_sum = sum(it.get("price") or 0 for it in ai_items)
+
+    # 합계가 총액의 130% 이상일 때만 작동 (명확한 초과)
+    if current_sum <= total_amount * 1.3:
+        return ai_items
+
+    excess = current_sum - total_amount
+    _slog.warning(
+        f"[SUBTOTAL] sum={current_sum} >> total={total_amount}, "
+        f"excess={excess}, checking for subtotal contamination"
+    )
+
+    # OCR 텍스트에서 모든 숫자 추출
+    all_ocr_nums: set = set()
+    if ocr_text:
+        for ln in ocr_text.splitlines():
+            for m in re.findall(r"[\d,]+\d", ln):
+                try:
+                    n = int(m.replace(",", ""))
+                    if 1000 <= n <= 5_000_000:
+                        all_ocr_nums.add(n)
+                except ValueError:
+                    pass
+
+    # 각 항목에 대해: 이 항목의 가격을 다른 OCR 숫자로 바꿨을 때
+    # 합계가 totalAmount에 가까워지면 → 소계 오염 가능성
+    best_fix = None
+    best_new_diff = abs(current_sum - total_amount)
+
+    for idx, item in enumerate(ai_items):
+        price = item.get("price") or 0
+        if price <= 0:
+            continue
+
+        # 이 항목 가격이 excess의 50% 이상이어야 소계 후보
+        # (소계가 합계를 크게 부풀리는 원인이어야 함)
+        if price < excess * 0.5:
+            continue
+
+        nm = (item.get("itemName") or "")[:40]
+        _slog.info(f"[SUBTOTAL] suspect item: '{nm}' = {price} (excess={excess})")
+
+        # OCR 숫자 중 이 항목의 가격보다 훨씬 작은 숫자로 대체 시도
+        for ocr_n in all_ocr_nums:
+            if ocr_n >= price:
+                continue
+            # 대체했을 때 새 합계
+            new_sum = current_sum - price + ocr_n
+            new_diff = abs(new_sum - total_amount)
+
+            # 총액에 훨씬 가까워져야 함 (기존 차이의 20% 이내)
+            if new_diff < best_new_diff and new_diff < total_amount * 0.05:
+                best_new_diff = new_diff
+                best_fix = (idx, ocr_n, price)
+
+    if best_fix:
+        idx, new_price, old_price = best_fix
+        nm = (ai_items[idx].get("itemName") or "")[:40]
+        ai_items[idx]["price"] = new_price
+        new_sum = sum(it.get("price") or 0 for it in ai_items)
+        _slog.warning(
+            f"[SUBTOTAL] FIXED: '{nm}' {old_price} → {new_price} "
+            f"(was subtotal contamination, new_sum={new_sum}, total={total_amount})"
+        )
+    else:
+        _slog.info("[SUBTOTAL] no subtotal contamination fix found")
+
+    return ai_items
+
+
+# =========================================================
 # ✅ 누락 항목 복구: Vision OCR → Gemini 보충
 # =========================================================
 def _recover_missing_items(
@@ -1617,7 +1709,13 @@ def process_receipt(
                 )
                 total_amt = ocr_total_amount
                 ai_parsed["totalAmount"] = ocr_total_amount
-            # Step B: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
+            # Step B-1: ✅ 카테고리 소계 오염 감지/교정
+            # (Gemini가 "진료 (1,964,600)" 같은 소계를 항목 가격으로 읽는 경우)
+            ai_parsed["items"] = _fix_subtotal_contamination(
+                ai_parsed["items"], total_amt, ocr_text=ocr_text
+            )
+
+            # Step B-2: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
             ai_parsed["items"] = _fix_prices_by_total(
                 ai_parsed["items"], total_amt, ocr_text=ocr_text
             )
