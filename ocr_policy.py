@@ -1083,10 +1083,11 @@ def _fix_prices_by_ocr_name_match(
             # (= OCR 가격이 영수증에서 고유한 값일 때 더 신뢰)
             if ocr_pr != abs_ai_pr:
                 # ✅ 안전장치: 가격 차이가 너무 크면 교체하지 않음
-                # OCR이 소계/카테고리 숫자를 항목으로 잘못 추출한 경우 방지
-                # 예: Gemini 11,000 → OCR 964,600 (87배 차이) = 명백한 오류
+                # 정상적 OCR 보정은 2배 이내 (예: 66000↔68000=1.03배, 80000↔88000=1.1배)
+                # 3배 이상 차이 = OCR이 엉뚱한 숫자를 읽은 것
+                # 예: Gemini 9,300 → OCR 1,315 (7배) = OCR 오류
                 ratio = max(ocr_pr, abs_ai_pr) / max(min(ocr_pr, abs_ai_pr), 1)
-                if ratio > 10:
+                if ratio > 3:
                     _mlog.info(
                         f"[NAME_MATCH] SKIP '{ai_name}' {abs_ai_pr} → {ocr_pr} "
                         f"(ratio {ratio:.1f}x too large, likely subtotal contamination)"
