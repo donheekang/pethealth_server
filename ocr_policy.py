@@ -1709,27 +1709,21 @@ def process_receipt(
 
             gemini_total = ai_parsed.get("totalAmount")
 
-            # ✅ 총액은 Vision OCR 추출값을 우선 사용
-            # Gemini가 총액도 잘못 읽으면(항목 합계에 맞춰버리면) 보정이 안 되므로
-            # Vision OCR 총액이 있으면 그걸 기준으로 사용
+            # ✅ 총액 결정: 3가지 소스에서 가장 신뢰할 수 있는 값 사용
+            # 1) Vision OCR 총액 (숫자 정확도 높음)
+            # 2) Gemini 총액
+            # 3) 둘 다 사용하여 교차 검증
             total_amt = gemini_total
+            gemini_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
+
             if ocr_total_amount and ocr_total_amount > 0:
-                gemini_sum = sum(it.get("price") or 0 for it in ai_parsed["items"])
-                # OCR 총액과 Gemini 총액이 다르면, OCR 총액 사용
-                if gemini_total and abs(gemini_sum - gemini_total) < 500:
-                    # Gemini 합계 == Gemini 총액 → Gemini가 총액을 합계에 맞췄을 수 있음
-                    # OCR 총액이 더 신뢰할 수 있음
-                    if abs(ocr_total_amount - gemini_total) > 500:
-                        _log.warning(
-                            f"[TOTAL] Using OCR total {ocr_total_amount} instead of "
-                            f"Gemini total {gemini_total} (Gemini sum={gemini_sum})"
-                        )
-                        total_amt = ocr_total_amount
-                        # ai_parsed의 totalAmount도 업데이트
-                        ai_parsed["totalAmount"] = ocr_total_amount
-                elif not gemini_total:
-                    total_amt = ocr_total_amount
-                    ai_parsed["totalAmount"] = ocr_total_amount
+                # OCR 총액이 있으면 무조건 우선 사용 (숫자는 OCR이 더 정확)
+                _log.info(
+                    f"[TOTAL] OCR total={ocr_total_amount}, Gemini total={gemini_total}, "
+                    f"Gemini sum={gemini_sum}"
+                )
+                total_amt = ocr_total_amount
+                ai_parsed["totalAmount"] = ocr_total_amount
 
             # Step B: ✅ 총액 기반 숫자 혼동 역보정 (6↔8 등)
             ai_parsed["items"] = _fix_prices_by_total(
