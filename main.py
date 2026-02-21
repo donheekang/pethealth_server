@@ -805,7 +805,7 @@ class HealthRecordUpsertRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: Optional[str] = None
     pet_id: str = Field(alias="petId")
-    visit_date: date = Field(alias="visitDate")
+    visit_date: str = Field(alias="visitDate")  # ✅ "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM"
     hospital_name: Optional[str] = Field(default=None, alias="hospitalName")
     hospital_mgmt_no: Optional[str] = Field(default=None, alias="hospitalMgmtNo")
     total_amount: Optional[int] = Field(default=None, alias="totalAmount")
@@ -1583,7 +1583,16 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
     db_touch_user(uid, desired_tier=desired)
     record_uuid = _uuid_or_new(req.id, "id")
     pet_uuid = _uuid_or_400(req.pet_id, "petId")
-    visit_date = req.visit_date
+    # ✅ visit_date: "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" → datetime
+    from datetime import datetime as _dt
+    _vd_raw = (req.visit_date or "").strip()
+    try:
+        if "T" in _vd_raw and len(_vd_raw) >= 16:
+            visit_date = _dt.fromisoformat(_vd_raw)
+        else:
+            visit_date = _dt.combine(date.fromisoformat(_vd_raw[:10]), _dt.min.time())
+    except Exception:
+        visit_date = _dt.now()
     hospital_name = req.hospital_name.strip() if isinstance(req.hospital_name, str) and req.hospital_name.strip() else None
     hospital_mgmt_no = req.hospital_mgmt_no.strip() if isinstance(req.hospital_mgmt_no, str) and req.hospital_mgmt_no.strip() else None
     total_amount_in: Optional[int] = None
@@ -2052,20 +2061,30 @@ def process_receipt(
     if not record_tags:
         record_tags = _fallback_classify_record(final_items, ocr_text)
 
-    # --- parse visit date ---
-    vd: Optional[date] = None
+    # --- parse visit date + time ---
+    from datetime import datetime as _dt
+    vd: Optional[_dt] = None
     if visitDate:
         try:
-            vd = date.fromisoformat(visitDate)
+            vd = _dt.combine(date.fromisoformat(visitDate), _dt.min.time())
         except Exception:
             pass
     if vd is None and ocr_visit_date_raw:
         try:
-            vd = date.fromisoformat(ocr_visit_date_raw)
+            vd = _dt.combine(date.fromisoformat(ocr_visit_date_raw), _dt.min.time())
         except Exception:
             pass
     if vd is None:
-        vd = date.today()
+        vd = _dt.combine(date.today(), _dt.min.time())
+    # ✅ visitTime이 있으면 합치기
+    if ocr_visit_time_raw:
+        try:
+            _parts = ocr_visit_time_raw.split(":")
+            _h, _m = int(_parts[0]), int(_parts[1])
+            if 0 <= _h <= 23 and 0 <= _m <= 59:
+                vd = vd.replace(hour=_h, minute=_m)
+        except Exception:
+            pass
 
     # --- hospital matching ---
     hosp_name = hospitalName.strip() if isinstance(hospitalName, str) and hospitalName.strip() else None
