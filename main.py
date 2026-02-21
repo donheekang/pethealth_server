@@ -1922,6 +1922,7 @@ def _fallback_classify_record(items: List[Dict[str, Any]], ocr_text: str) -> Lis
 def process_receipt(
     petId: str = Form(...),
     file: UploadFile = File(...),
+    original_file: Optional[UploadFile] = File(None),  # ✅ v2.8.0: iOS에서 보내는 원본 컬러 이미지
     visitDate: Optional[str] = Form(None),
     hospitalName: Optional[str] = Form(None),
     hospitalMgmtNo: Optional[str] = Form(None),
@@ -1946,6 +1947,19 @@ def process_receipt(
     raw = _read_upload_limited(file, int(settings.MAX_RECEIPT_IMAGE_BYTES))
     if not raw:
         raise HTTPException(status_code=400, detail="empty image")
+
+    # ✅ v2.8.0: iOS가 보낸 원본 컬러 이미지 (보험청구용)
+    raw_original: Optional[bytes] = None
+    if original_file is not None:
+        try:
+            raw_original = _read_upload_limited(original_file, int(settings.MAX_RECEIPT_IMAGE_BYTES))
+            if raw_original:
+                logger.info("[receipt-draft] original_file received from iOS: %d bytes", len(raw_original))
+            else:
+                raw_original = None
+        except Exception as _orig_err:
+            logger.warning("[receipt-draft] original_file read failed (ignored): %s", _orig_err)
+            raw_original = None
 
     # --- OCR pipeline ---
     _require_module(ocr_policy, "ocr_policy")
@@ -2123,20 +2137,51 @@ def process_receipt(
     file_path = _receipt_draft_path(uid, str(pet_uuid), draft_id)
     file_size = int(len(webp_bytes))
 
-    logger.info("[receipt-draft] original_webp present=%s, size=%s, webp_bytes size=%s",
-                original_webp is not None,
-                len(original_webp) if original_webp else 0,
-                len(webp_bytes))
+    # ✅ v2.8.0: iOS가 원본 컬러를 별도로 보냈으면 그것을 _original로 저장
+    #   → iOS original_file(컬러) > OCR 파이프라인 original_webp(전처리된 것일 수 있음)
+    effective_original = None
+    effective_original_ct = content_type
+    if raw_original:
+        # iOS가 보낸 원본 컬러 → WebP로 변환하여 저장
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            _orig_img = _PILImage.open(_io.BytesIO(raw_original))
+            _orig_img = _orig_img.convert("RGB")
+            _orig_buf = _io.BytesIO()
+            _rw = int(settings.RECEIPT_MAX_WIDTH) if hasattr(settings, "RECEIPT_MAX_WIDTH") else 2048
+            if max(_orig_img.size) > _rw:
+                ratio = _rw / max(_orig_img.size)
+                new_size = (int(_orig_img.width * ratio), int(_orig_img.height * ratio))
+                _orig_img = _orig_img.resize(new_size, _PILImage.LANCZOS)
+            _rq = int(settings.RECEIPT_WEBP_QUALITY) if hasattr(settings, "RECEIPT_WEBP_QUALITY") else 85
+            _orig_img.save(_orig_buf, format="WEBP", quality=_rq)
+            effective_original = _orig_buf.getvalue()
+            effective_original_ct = "image/webp"
+            logger.info("[receipt-draft] iOS original_file → WebP: %d bytes (color preserved)", len(effective_original))
+        except Exception as _conv_err:
+            logger.warning("[receipt-draft] iOS original_file WebP conversion failed, using raw: %s", _conv_err)
+            effective_original = raw_original
+            effective_original_ct = "image/jpeg"
+    elif original_webp:
+        effective_original = original_webp
+        effective_original_ct = content_type
+
+    logger.info("[receipt-draft] effective_original present=%s, size=%s, webp_bytes size=%s, from_ios=%s",
+                effective_original is not None,
+                len(effective_original) if effective_original else 0,
+                len(webp_bytes),
+                raw_original is not None)
 
     try:
         # 마스킹본 (앱 표시용)
         upload_bytes_to_storage(file_path, webp_bytes, content_type)
-        # 원본 (보험 청구 PDF용)
-        if original_webp:
+        # 원본 컬러 (보험 청구 PDF용)
+        if effective_original:
             orig_path = _receipt_draft_original_path(uid, str(pet_uuid), draft_id)
-            logger.info("[receipt-draft] uploading original to %s (%d bytes)", orig_path, len(original_webp))
+            logger.info("[receipt-draft] uploading original to %s (%d bytes, from_ios=%s)", orig_path, len(effective_original), raw_original is not None)
             try:
-                upload_bytes_to_storage(orig_path, original_webp, content_type)
+                upload_bytes_to_storage(orig_path, effective_original, effective_original_ct)
             except Exception as orig_err:
                 logger.error("[receipt-draft] original upload FAILED: %s", orig_err)
     except Exception as e:
