@@ -3454,11 +3454,15 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         "    - 각 키워드는 한국어 3~7자. 진료 패턴, 건강 상태, 관리 특성 요약 라벨.",
         "    - 예: ['정기검진형', '피부관리필요', '예방접종완료']",
         "    - 진료 이력이 없으면: ['건강관리시작']",
-        "12. next_action: 보호자가 다음에 해야 할 가장 중요한 행동 1개. 한국어 1문장(15~30자). ~해요 체.",
-        "    - 예: '다음 달 광견병 예방접종을 잊지 마세요'",
+        "12. next_action: (삭제됨 — care_actions로 대체)",
+        "13. care_actions: 보호자가 실천할 수 있는 구체적인 조언 2~3개 배열.",
+        "    - 각 항목은 한국어 1문장(15~30자). ~해요 체. 따뜻하고 실천 가능한 문장.",
+        "    - 진료 이력 기반으로 가장 중요한 순서대로.",
+        "    - 예: ['알레르기 유발 원료를 피해 급여해 주세요', '다음 달 광견병 접종을 확인해 주세요', '수술 부위 실밥 제거 일정을 잡아 주세요']",
+        "    - 진료 이력이 없으면: ['가까운 동물병원에서 기본 건강검진을 받아 보세요']",
         "",
         "## 응답 JSON 형식 (이 형식을 정확히 따를 것)",
-        '{"summary":"보리 보호자님, 전반적으로...","summary_lines":["전반적으로 건강하지만 피부 관리가 필요해요","최근 3개월간 피부염 치료를 2회 받았어요","다음 달 광견병 접종 일정을 확인해 주세요"],"health_keywords":["정기검진형","피부관리필요"],"next_action":"다음 달 광견병 예방접종을 잊지 마세요","tags":[{"tag":"exam_blood_general","label":"혈액검사","count":2,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"exam_blood_general":0},"3m":{"exam_blood_general":2},"1y":{"exam_blood_general":2}},"group_summary":{"exam":"혈액검사와 초음파를 정기적으로 받고 있어요","vaccine":"기본 예방접종이 완료됐어요"},"care_guide":{}}',
+        '{"summary":"보리 보호자님, 전반적으로...","summary_lines":["전반적으로 건강하지만 피부 관리가 필요해요","최근 3개월간 피부염 치료를 2회 받았어요","다음 달 광견병 접종 일정을 확인해 주세요"],"health_keywords":["정기검진형","피부관리필요"],"care_actions":["알레르기 유발 원료를 피해 급여해 주세요","다음 달 광견병 예방접종을 확인해 주세요"],"tags":[{"tag":"exam_blood_general","label":"혈액검사","count":2,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"exam_blood_general":0},"3m":{"exam_blood_general":2},"1y":{"exam_blood_general":2}},"group_summary":{"exam":"혈액검사와 초음파를 정기적으로 받고 있어요","vaccine":"기본 예방접종이 완료됐어요"},"care_guide":{}}',
     ])
 
     prompt = "\n".join(prompt_lines)
@@ -3608,11 +3612,22 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     if not next_action and summary_lines and len(summary_lines) >= 3:
         next_action = summary_lines[2]
 
+    care_actions = result.get("care_actions", [])
+    if not isinstance(care_actions, list):
+        care_actions = []
+    # care_actions가 비었으면 next_action이나 summary_lines에서 생성
+    if not care_actions:
+        if next_action:
+            care_actions = [next_action]
+        elif summary_lines and len(summary_lines) >= 3:
+            care_actions = [summary_lines[2]]
+
     response = {
         "summary": summary_val,
         "summary_lines": summary_lines,
         "health_keywords": health_keywords,
         "next_action": next_action,
+        "care_actions": care_actions,
         "tags": raw_tags,
         "period_stats": result.get("period_stats", {}),
         "group_summary": group_summary,
