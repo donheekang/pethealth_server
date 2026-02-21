@@ -81,6 +81,14 @@ def _looks_like_date_line(t: str) -> bool:
     if re.fullmatch(r"20\d{2}(0?\d|1[0-2])(0?\d|[12]\d|3[01])\d{0,6}", k) and len(k) <= 12:
         return True
     return False
+# ✅ 체중 구간 패턴: "5kg 이하", "10kg 미만", "20kg 이상", "5~10kg" 등
+_WEIGHT_CLASS_RE = re.compile(
+    r"^\s*\d+(\.\d+)?\s*kg\s*(이하|이상|미만|초과|미만|~|―|-)\s*$"
+    r"|^\s*\d+(\.\d+)?\s*(~|―|-)\s*\d+(\.\d+)?\s*kg\s*$"
+    r"|^\s*(이하|이상|미만|초과)\s*\d+(\.\d+)?\s*kg\s*$",
+    re.IGNORECASE,
+)
+
 def _is_noise_line(s: str) -> bool:
     t = (s or "").strip()
     if not t:
@@ -92,6 +100,9 @@ def _is_noise_line(s: str) -> bool:
     if _looks_like_date_line(t):
         return True
     if _ADDRESS_RE.search(t):
+        return True
+    # ✅ 체중 구간 표시 필터 (예: "5kg 이하", "10~20kg")
+    if _WEIGHT_CLASS_RE.match(t):
         return True
     has_letter = any(("a" <= ch.lower() <= "z") or ("가" <= ch <= "힣") for ch in t)
     has_digit = any(ch.isdigit() for ch in t)
@@ -1891,6 +1902,9 @@ def _normalize_gemini_full_result(
             if not nm:
                 continue
             if not skip_noise_filter and _is_noise_line(nm):
+                continue
+            # ✅ 체중 구간 패턴은 skip_noise_filter=True(AI 경로)에서도 항상 제외
+            if _WEIGHT_CLASS_RE.match(nm):
                 continue
             pr = _coerce_int_amount(it.get("price"))
             orig_pr = _coerce_int_amount(it.get("originalPrice"))
