@@ -628,7 +628,14 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             pr = _coerce_int_amount(it.get("price"))
             if pr is not None and pr < 0:
-                pr = None
+                continue  # ✅ 할인 라인(음수 가격) 제외
+            disc = _coerce_int_amount(it.get("discount"))
+            # ✅ 항목별 할인 적용
+            if disc is not None and disc > 0 and pr is not None:
+                net_price = pr - disc
+                if net_price <= 0:
+                    continue  # 100% 할인 → 무료 항목 제외
+                pr = net_price
             ct_raw = (it.get("categoryTag") or "").strip() or None
             ct_val = _migrate_tag(ct_raw) if ct_raw else None
             cleaned.append({"itemName": nm, "price": pr, "categoryTag": ct_val})
@@ -1907,6 +1914,13 @@ def _normalize_gemini_full_result(
             if any(kw in nm_lower for kw in _DISC_KW) and (pr is None or pr <= 0):
                 continue  # 할인 키워드 + 가격 0 이하 항목 제외
 
+            # ✅ 항목별 할인 적용: discount가 있으면 실결제 가격으로 조정
+            if disc is not None and disc > 0 and pr is not None:
+                net_price = pr - disc
+                if net_price <= 0:
+                    continue  # 100% 할인 항목 → 무료이므로 제외
+                pr = net_price  # 할인 적용된 실결제 가격으로 교체
+
             if ct:
                 ct = _migrate_tag(ct)
             # 🔒 Gemini 태그가 없거나 유효하지 않으면 키워드 기반 폴백
@@ -2100,6 +2114,19 @@ def process_receipt(
                             f"[TOTAL] OCR total={ocr_total_amount} is far from "
                             f"Gemini total={gemini_total} (sum={gemini_sum}), "
                             f"keeping Gemini total"
+                        )
+                        _use_ocr_total = False
+                    # ✅ 할인 시나리오 감지:
+                    # Gemini sum ≈ OCR total AND Gemini total < Gemini sum
+                    # → 할인 전 합계 = item sum, 결제요청 = Gemini total
+                    elif (gemini_total < gemini_sum
+                          and abs(ocr_total_amount - gemini_sum) < max(500, gemini_sum * 0.02)):
+                        _disc_diff = gemini_sum - gemini_total
+                        _log.warning(
+                            f"[TOTAL] DISCOUNT detected: "
+                            f"Gemini sum({gemini_sum}) ≈ OCR total({ocr_total_amount}), "
+                            f"Gemini total({gemini_total}) = 결제요청, "
+                            f"discount ≈ {_disc_diff}, trusting Gemini total"
                         )
                         _use_ocr_total = False
                 if _use_ocr_total:
