@@ -2261,15 +2261,25 @@ def commit_receipt(
     if not draft_path:
         raise HTTPException(status_code=400, detail="draftReceiptPath is required")
 
-    # visit date
-    vd: Optional[date] = None
+    # visit date + time
+    from datetime import datetime as _dt
+    import logging as _logging
+    _clog = _logging.getLogger("commit_receipt")
+    vd = None
+    _clog.warning(f"[COMMIT] req.visitDate raw = '{req.visitDate}'")
     if req.visitDate:
         try:
-            vd = date.fromisoformat(req.visitDate)
-        except Exception:
-            pass
+            if "T" in req.visitDate and len(req.visitDate) >= 16:
+                vd = _dt.fromisoformat(req.visitDate)
+                _clog.warning(f"[COMMIT] parsed datetime with T: {vd}")
+            else:
+                vd = _dt.combine(date.fromisoformat(req.visitDate[:10]), _dt.min.time())
+                _clog.warning(f"[COMMIT] parsed date only: {vd}")
+        except Exception as _e:
+            _clog.warning(f"[COMMIT] parse FAILED: {_e}")
     if vd is None:
-        vd = date.today()
+        vd = _dt.combine(date.today(), _dt.min.time())
+        _clog.warning(f"[COMMIT] FALLBACK to today: {vd}")
 
     hosp_name = req.hospitalName.strip() if isinstance(req.hospitalName, str) and req.hospitalName.strip() else None
     hosp_mgmt = req.hospitalMgmtNo.strip() if isinstance(req.hospitalMgmtNo, str) and req.hospitalMgmtNo.strip() else None
