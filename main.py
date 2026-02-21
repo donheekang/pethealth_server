@@ -3431,38 +3431,38 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         "## 사용 가능한 태그 코드 (tag 필드에 아래 코드만 사용할 것)",
         tag_codes_info,
         "",
-        "## 응답 규칙",
-        "1. 순수 JSON만 출력. ```json 같은 마크다운 절대 금지.",
-        "2. summary_lines 작성 규칙 (3줄 요약, 배열):",
-        "   - 정확히 3개의 문자열 배열. 각 줄은 한국어 1문장(15~30자).",
-        "   - 1줄: 현재 건강 상태 한줄 요약 (예: '전반적으로 건강하지만 피부 관리가 필요해요')",
-        "   - 2줄: 최근 주요 진료/예방 핵심 (예: '피부염 치료를 2회 받았어요')",
-        "   - 3줄: 앞으로의 핵심 조언 1개 (예: '다음 달 예방접종 일정을 확인해 주세요')",
-        "   - ~해요 체. 따뜻하지만 간결하게. 이모지 사용 금지.",
-        "3. summary: summary_lines 3줄을 합쳐서 자연스러운 문단으로도 제공 (기존 호환).",
-        "   - 반드시 '{이름} 보호자님,'으로 시작. 3~5문장. ~해요 체.",
-        "4. tags: 진료 이력의 tags를 분석해서 관련 태그를 반드시 포함. 태그는 최대 5개까지만. 진료 이력이 있으면 tags를 절대 빈 배열로 보내지 마.",
-        "5. 진료 이력이 완전히 없는 경우에만 tags=[]로 비워.",
-        "6. period_stats: 1m, 3m, 1y 기간별 각 태그 진료 횟수.",
-        "7. group_summary: 태그를 group별로 묶어서 각 group당 1줄 한국어 설명 제공. group명은 영어(exam, vaccine, preventive_med, medicine, checkup, surgery, dental, orthopedic, grooming, etc), 값은 한국어 1문장.",
-        "   - 예: {\"exam\": \"혈액검사와 초음파를 정기적으로 받고 있어요\", \"vaccine\": \"기본 예방접종이 완료됐어요\"}",
-        "   - 진료 이력에 해당 group이 없으면 해당 group은 생략.",
-        "8. tags의 tag는 위 태그 코드 중에서만 선택. label은 한글 이름.",
-        "9. care_guide는 빈 객체 {}로 보내. 서버가 자동으로 채워줌.",
-        "10. 전체 응답이 반드시 완전한 JSON이 되도록 할 것. 절대 중간에 끊기면 안 됨.",
-        "11. health_keywords: 반려동물 건강 프로필을 나타내는 키워드 2~3개 배열.",
-        "    - 각 키워드는 한국어 3~7자. 진료 패턴, 건강 상태, 관리 특성 요약 라벨.",
-        "    - 예: ['정기검진형', '피부관리필요', '예방접종완료']",
-        "    - 진료 이력이 없으면: ['건강관리시작']",
-        "12. next_action: (삭제됨 — care_actions로 대체)",
-        "13. care_actions: 보호자가 실천할 수 있는 구체적인 조언 2~3개 배열.",
-        "    - 각 항목은 한국어 1문장(15~30자). ~해요 체. 따뜻하고 실천 가능한 문장.",
-        "    - 진료 이력 기반으로 가장 중요한 순서대로.",
-        "    - 예: ['알레르기 유발 원료를 피해 급여해 주세요', '다음 달 광견병 접종을 확인해 주세요', '수술 부위 실밥 제거 일정을 잡아 주세요']",
-        "    - 진료 이력이 없으면: ['가까운 동물병원에서 기본 건강검진을 받아 보세요']",
+        "## 핵심 원칙",
+        "당신은 경험 많은 수의사입니다. 보호자에게 건강 편지를 쓰듯 따뜻하지만 전문적으로 조언합니다.",
+        "절대로 보호자가 '이미 아는 사실'을 반복하지 마세요. 대신 다음을 제공하세요:",
+        "- 진료 기록 간의 연관성 (예: '수술 후 면역력 저하 → 감염 주의 시기')",
+        "- 구체적인 시점/기한 (예: '수술 2주 후 경과 확인 필요', '3개월마다 혈액검사 추천')",
+        "- 보호자가 놓칠 수 있는 패턴 (예: '최근 3개월간 수술이 잦았어요 — 면역 관리가 중요해요')",
+        "- 약물 간 주의사항이나 관리 팁 (예: '스테로이드 장기 복용 시 간 수치 모니터링 필요')",
+        "- '수술 받았어요', '검사했어요' 같은 당연한 사실은 생략하세요.",
+        "",
+        "## 응답 필드 (순수 JSON만 출력. 마크다운 금지. 이모지 금지. ~해요 체.)",
+        "1. greeting: '{이름} 보호자님께' (고정 형식)",
+        "2. health_keywords: 건강 프로필 키워드 2~3개 배열. 각 3~7자 한국어.",
+        "   - 예: ['수술회복기', '식이알러지'], 진료 이력 없으면: ['건강관리시작']",
+        "3. key_message: 가장 중요한 메시지 1~2문장. 보호자가 모르는 인사이트.",
+        "   - 예: '수술 후 2주가 감염 위험이 가장 높은 시기예요. 상처 부위를 매일 확인해 주세요.'",
+        "4. insights: 분야별 인사이트 2~3개 객체 배열. 각 객체:",
+        "   - title: 짧은 제목 (3~6자). 예: '수술 회복', '식이 관리'",
+        "   - body: 보호자가 모르는 정보 1~2문장. 왜 중요한지 포함.",
+        "   - priority: 'high'(긴급/중요) 또는 'normal'",
+        "5. care_actions: 보호자 실천 항목 2~3개 객체 배열. 각 객체:",
+        "   - action: 구체적 행동 (15~25자). 예: '수술 경과 확인 예약하기'",
+        "   - reason: 왜 해야 하는지 (10~20자). 예: '감염 위험이 높은 시기예요'",
+        "6. closing: 마무리 1~2문장. 잘 하고 있다는 격려 + 응원.",
+        "7. summary: (하위호환) greeting + key_message + closing을 합친 자연스러운 문단.",
+        "8. tags: 진료 이력 기반 태그 (최대 5개). 진료 이력 있으면 빈 배열 금지.",
+        "9. period_stats: 1m, 3m, 1y 기간별 태그 횟수.",
+        "10. group_summary: group별 1줄 한국어 설명.",
+        "11. care_guide: 빈 객체 {}. 서버가 자동 채움.",
+        "12. 전체 응답이 반드시 완전한 JSON. 절대 중간에 끊기면 안 됨.",
         "",
         "## 응답 JSON 형식 (이 형식을 정확히 따를 것)",
-        '{"summary":"보리 보호자님, 전반적으로...","summary_lines":["전반적으로 건강하지만 피부 관리가 필요해요","최근 3개월간 피부염 치료를 2회 받았어요","다음 달 광견병 접종 일정을 확인해 주세요"],"health_keywords":["정기검진형","피부관리필요"],"care_actions":["알레르기 유발 원료를 피해 급여해 주세요","다음 달 광견병 예방접종을 확인해 주세요"],"tags":[{"tag":"exam_blood_general","label":"혈액검사","count":2,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"exam_blood_general":0},"3m":{"exam_blood_general":2},"1y":{"exam_blood_general":2}},"group_summary":{"exam":"혈액검사와 초음파를 정기적으로 받고 있어요","vaccine":"기본 예방접종이 완료됐어요"},"care_guide":{}}',
+        '{"greeting":"보리 보호자님께","health_keywords":["정기검진형","피부관리필요"],"key_message":"최근 피부염이 반복되고 있어요. 알러지 원인 검사를 받으면 근본적인 관리가 가능해요.","insights":[{"title":"피부 관리","body":"3개월간 피부염 치료 2회는 재발 패턴이에요. 환경성 알러지 검사로 원인을 특정하면 치료 효과가 높아져요.","priority":"high"},{"title":"예방접종","body":"기본 접종은 완료됐지만, 4세부터는 항체가 검사 후 선택 접종을 추천드려요.","priority":"normal"}],"care_actions":[{"action":"알러지 원인 검사 예약하기","reason":"재발 방지의 첫 단계예요"},{"action":"다음 달 광견병 접종 확인","reason":"접종 시기가 다가오고 있어요"}],"closing":"정기 검진을 꾸준히 받고 있어서 건강 관리가 잘 되고 있어요. 보리의 건강을 응원합니다.","summary":"보리 보호자님, ...","tags":[{"tag":"exam_blood_general","label":"혈액검사","count":2,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"exam_blood_general":0},"3m":{"exam_blood_general":2},"1y":{"exam_blood_general":2}},"group_summary":{"exam":"혈액검사와 초음파를 정기적으로 받고 있어요"},"care_guide":{}}',
     ])
 
     prompt = "\n".join(prompt_lines)
@@ -3606,28 +3606,62 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
     if not health_keywords:
         health_keywords = ["건강관리시작"]
 
-    next_action = result.get("next_action", "")
-    if not isinstance(next_action, str):
-        next_action = ""
-    if not next_action and summary_lines and len(summary_lines) >= 3:
-        next_action = summary_lines[2]
+    # ── 건강 편지 필드 추출 ──
+    greeting = result.get("greeting", "")
+    if not isinstance(greeting, str) or not greeting:
+        greeting = f"{pet_name} 보호자님께" if pet_name else "보호자님께"
+
+    key_message = result.get("key_message", "")
+    if not isinstance(key_message, str):
+        key_message = ""
+    if not key_message and summary_lines:
+        key_message = summary_lines[0] if summary_lines else summary_val
+
+    insights = result.get("insights", [])
+    if not isinstance(insights, list):
+        insights = []
+    # insights 각 항목 검증
+    validated_insights = []
+    for ins in insights:
+        if isinstance(ins, dict) and "title" in ins and "body" in ins:
+            validated_insights.append({
+                "title": str(ins.get("title", "")),
+                "body": str(ins.get("body", "")),
+                "priority": str(ins.get("priority", "normal")),
+            })
+    insights = validated_insights
 
     care_actions = result.get("care_actions", [])
     if not isinstance(care_actions, list):
         care_actions = []
-    # care_actions가 비었으면 next_action이나 summary_lines에서 생성
-    if not care_actions:
-        if next_action:
-            care_actions = [next_action]
-        elif summary_lines and len(summary_lines) >= 3:
-            care_actions = [summary_lines[2]]
+    # care_actions 각 항목 검증 (객체 또는 문자열 둘 다 수용)
+    validated_actions = []
+    for act in care_actions:
+        if isinstance(act, dict) and "action" in act:
+            validated_actions.append({
+                "action": str(act.get("action", "")),
+                "reason": str(act.get("reason", "")),
+            })
+        elif isinstance(act, str) and act:
+            validated_actions.append({"action": act, "reason": ""})
+    care_actions = validated_actions
+    # care_actions가 비었으면 summary_lines에서 생성
+    if not care_actions and summary_lines and len(summary_lines) >= 3:
+        care_actions = [{"action": summary_lines[2], "reason": ""}]
+
+    closing = result.get("closing", "")
+    if not isinstance(closing, str):
+        closing = ""
 
     response = {
         "summary": summary_val,
         "summary_lines": summary_lines,
         "health_keywords": health_keywords,
-        "next_action": next_action,
+        "greeting": greeting,
+        "key_message": key_message,
+        "insights": insights,
         "care_actions": care_actions,
+        "closing": closing,
         "tags": raw_tags,
         "period_stats": result.get("period_stats", {}),
         "group_summary": group_summary,
