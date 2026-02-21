@@ -3433,21 +3433,26 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         "",
         "## 응답 규칙",
         "1. 순수 JSON만 출력. ```json 같은 마크다운 절대 금지.",
-        "2. summary 작성 규칙:",
-        "   - 한국어 3~5문장. 친절한 말투(~해요 체).",
-        "   - 반드시 '{이름} 보호자님,'으로 시작.",
-        "   - 현재 건강 상태 → 최근 주요 진료/예방 언급 → 앞으로의 조언 순서.",
-        "   - 수의사가 보호자에게 직접 이야기하듯 따뜻하게.",
-        "   - 너무 길지 않게 핵심만 간결하게 전달.",
-        "3. tags: 진료 이력의 tags를 분석해서 관련 태그를 반드시 포함. 태그는 최대 5개까지만. 진료 이력이 있으면 tags를 절대 빈 배열로 보내지 마.",
-        "4. 진료 이력이 완전히 없는 경우에만 tags=[]로 비워.",
-        "5. period_stats: 1m, 3m, 1y 기간별 각 태그 진료 횟수.",
-        "6. tags의 tag는 위 태그 코드 중에서만 선택. label은 한글 이름.",
-        "7. care_guide는 빈 객체 {}로 보내. 서버가 자동으로 채워줌.",
-        "8. 전체 응답이 반드시 완전한 JSON이 되도록 할 것. 절대 중간에 끊기면 안 됨.",
+        "2. summary_lines 작성 규칙 (3줄 요약, 배열):",
+        "   - 정확히 3개의 문자열 배열. 각 줄은 한국어 1문장(15~30자).",
+        "   - 1줄: 현재 건강 상태 한줄 요약 (예: '전반적으로 건강하지만 피부 관리가 필요해요')",
+        "   - 2줄: 최근 주요 진료/예방 핵심 (예: '피부염 치료를 2회 받았어요')",
+        "   - 3줄: 앞으로의 핵심 조언 1개 (예: '다음 달 예방접종 일정을 확인해 주세요')",
+        "   - ~해요 체. 따뜻하지만 간결하게. 이모지 사용 금지.",
+        "3. summary: summary_lines 3줄을 합쳐서 자연스러운 문단으로도 제공 (기존 호환).",
+        "   - 반드시 '{이름} 보호자님,'으로 시작. 3~5문장. ~해요 체.",
+        "4. tags: 진료 이력의 tags를 분석해서 관련 태그를 반드시 포함. 태그는 최대 5개까지만. 진료 이력이 있으면 tags를 절대 빈 배열로 보내지 마.",
+        "5. 진료 이력이 완전히 없는 경우에만 tags=[]로 비워.",
+        "6. period_stats: 1m, 3m, 1y 기간별 각 태그 진료 횟수.",
+        "7. group_summary: 태그를 group별로 묶어서 각 group당 1줄 한국어 설명 제공. group명은 영어(exam, vaccine, preventive_med, medicine, checkup, surgery, dental, orthopedic, grooming, etc), 값은 한국어 1문장.",
+        "   - 예: {\"exam\": \"혈액검사와 초음파를 정기적으로 받고 있어요\", \"vaccine\": \"기본 예방접종이 완료됐어요\"}",
+        "   - 진료 이력에 해당 group이 없으면 해당 group은 생략.",
+        "8. tags의 tag는 위 태그 코드 중에서만 선택. label은 한글 이름.",
+        "9. care_guide는 빈 객체 {}로 보내. 서버가 자동으로 채워줌.",
+        "10. 전체 응답이 반드시 완전한 JSON이 되도록 할 것. 절대 중간에 끊기면 안 됨.",
         "",
         "## 응답 JSON 형식 (이 형식을 정확히 따를 것)",
-        '{"summary":"종합 분석 텍스트...","tags":[{"tag":"prevent_vaccine_rabies","label":"예방접종·광견병","count":1,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"prevent_vaccine_rabies":0},"3m":{"prevent_vaccine_rabies":1},"1y":{"prevent_vaccine_rabies":1}},"care_guide":{}}',
+        '{"summary":"보리 보호자님, 전반적으로...","summary_lines":["전반적으로 건강하지만 피부 관리가 필요해요","최근 3개월간 피부염 치료를 2회 받았어요","다음 달 광견병 접종 일정을 확인해 주세요"],"tags":[{"tag":"exam_blood_general","label":"혈액검사","count":2,"recent_dates":["2025-11-28"]}],"period_stats":{"1m":{"exam_blood_general":0},"3m":{"exam_blood_general":2},"1y":{"exam_blood_general":2}},"group_summary":{"exam":"혈액검사와 초음파를 정기적으로 받고 있어요","vaccine":"기본 예방접종이 완료됐어요"},"care_guide":{}}',
     ])
 
     prompt = "\n".join(prompt_lines)
@@ -3568,10 +3573,29 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         logger.warning("[AI Care] care_guide auto-fill failed: %s", e)
         care_guide = result.get("care_guide", {})
 
+    # ── summary_lines / group_summary 추출 ──
+    summary_lines = result.get("summary_lines", [])
+    if not isinstance(summary_lines, list):
+        summary_lines = []
+    # summary_lines가 비었으면 summary에서 자동 생성 (하위호환)
+    if not summary_lines and summary_val:
+        # 문장 분리 시도
+        sentences = [s.strip() for s in _re.split(r'[.!?]\s+|(?<=[요다죠세])\s+', summary_val) if s.strip()]
+        if len(sentences) >= 3:
+            summary_lines = sentences[:3]
+        elif summary_val:
+            summary_lines = [summary_val]
+
+    group_summary = result.get("group_summary", {})
+    if not isinstance(group_summary, dict):
+        group_summary = {}
+
     response = {
         "summary": summary_val,
+        "summary_lines": summary_lines,
         "tags": raw_tags,
         "period_stats": result.get("period_stats", {}),
+        "group_summary": group_summary,
         "care_guide": care_guide,
     }
 
