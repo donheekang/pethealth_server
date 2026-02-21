@@ -1383,14 +1383,28 @@ def _fix_prices_by_total(
         return ai_items
     import logging
     _flog = logging.getLogger("ocr_policy.fix_total")
-    current_sum = sum(it.get("price") or 0 for it in ai_items)
+
+    # ✅ 할인 항목(음수 가격)은 합계 계산에서 제외
+    #    totalAmount는 이미 할인 적용된 최종 결제액이므로,
+    #    양수 항목만 합산해서 비교해야 정확한 보정 가능
+    _DISCOUNT_KW = ("할인", "할증", "감면", "절사", "쿠폰", "discount")
+    def _is_discount_item(it: Dict[str, Any]) -> bool:
+        nm = (it.get("itemName") or "").lower()
+        pr = it.get("price") or 0
+        return pr < 0 or any(kw in nm for kw in _DISCOUNT_KW)
+
+    current_sum = sum(
+        it.get("price") or 0 for it in ai_items if not _is_discount_item(it)
+    )
     diff = current_sum - total_amount
     if abs(diff) < 100:
         return ai_items  # 이미 맞음
-    _flog.info(f"[FIX_TOTAL] sum={current_sum}, total={total_amount}, diff={diff}")
+    _flog.info(f"[FIX_TOTAL] sum={current_sum}, total={total_amount}, diff={diff} (discount items excluded)")
     # 각 항목별 가능한 보정 후보 생성
     candidates: List[tuple] = []
     for idx, item in enumerate(ai_items):
+        if _is_discount_item(item):
+            continue  # 할인 항목은 보정 대상에서 제외
         pr = item.get("price")
         if pr is None or pr == 0:
             continue
@@ -1883,6 +1897,16 @@ def _normalize_gemini_full_result(
             disc = _coerce_int_amount(it.get("discount"))
             ct = (it.get("categoryTag") or "").strip() or None
             sn = (it.get("standardName") or "").strip() or None
+
+            # ✅ 할인/할증 항목 필터링: 음수 가격이거나 할인 키워드 포함 시 제외
+            #    할인은 totalAmount에 이미 반영되어 있으므로 별도 아이템으로 불필요
+            _DISC_KW = ("할인", "할증", "감면", "절사", "쿠폰", "discount")
+            nm_lower = nm.lower()
+            if pr is not None and pr < 0:
+                continue  # 음수 가격 항목 제외
+            if any(kw in nm_lower for kw in _DISC_KW) and (pr is None or pr <= 0):
+                continue  # 할인 키워드 + 가격 0 이하 항목 제외
+
             if ct:
                 ct = _migrate_tag(ct)
             # 🔒 Gemini 태그가 없거나 유효하지 않으면 키워드 기반 폴백
