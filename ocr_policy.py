@@ -1448,6 +1448,32 @@ def _cross_validate_prices(
         return ai_items
     # 별도로 OCR에서 총액 추출
     ocr_total = _extract_total_amount(ocr_text)
+    # ✅ v2.9.1: 소계/합계/비과세 등 숫자를 XVAL 후보에서 제외
+    # 이런 숫자는 항목 가격이 아니라 소계/세금/할인 합계이므로 매칭하면 안 됨
+    _xval_exclude: set = set()
+    if total_amount and total_amount > 0:
+        _xval_exclude.add(total_amount)
+    # OCR에서 소계 키워드 줄의 숫자 제외
+    _subtotal_kws = {"비과세", "부가세", "과세", "소계", "합계", "총액", "청구", "결제", "부가세액", "공급가액"}
+    for ln in ocr_text.splitlines():
+        ln_clean = ln.strip()
+        if any(kw in ln_clean for kw in _subtotal_kws):
+            for m in re.findall(r"[\d,]+\d", ln_clean):
+                try:
+                    n = int(m.replace(",", ""))
+                    if n >= 10000:
+                        _xval_exclude.add(n)
+                except ValueError:
+                    pass
+    # AI 항목 가격과 정확히 일치하는 OCR 숫자는 제외 대상에서 복원
+    # (실제 항목 가격이 소계 줄에 우연히 있을 수 있으므로)
+    for item in ai_items:
+        _p = item.get("price")
+        if _p is not None and abs(_p) in _xval_exclude:
+            _xval_exclude.discard(abs(_p))
+    if _xval_exclude:
+        _xlog.info(f"[XVAL] excluding subtotal/tax numbers: {_xval_exclude}")
+        all_ocr_nums -= _xval_exclude
     # 🔒 이미 AI 항목이 사용 중인 가격 집합 (다른 항목의 가격을 빼앗지 않도록)
     ai_used_prices: set = set()
     for item in ai_items:
@@ -1472,8 +1498,8 @@ def _cross_validate_prices(
         best_diff = float("inf")
         for ocr_n in all_ocr_nums:
             diff = abs(ocr_n - abs_pr)
-            # 차이가 5% 이내이고 자릿수가 같아야 함
-            if diff > 0 and diff < abs_pr * 0.05 and len(str(ocr_n)) == len(str(abs_pr)):
+            # 차이가 3% 이내이고 자릿수가 같아야 함
+            if diff > 0 and diff < abs_pr * 0.03 and len(str(ocr_n)) == len(str(abs_pr)):
                 # 🔒 OCR 쓰레기 숫자 필터: 한국 영수증 가격은 100원 단위
                 # 52215, 60978 같은 건 OCR 오독 → 후보 제외
                 if ocr_n % 100 != 0:
@@ -1487,6 +1513,15 @@ def _cross_validate_prices(
                     _xlog.warning(
                         f"[XVAL] SKIP candidate {ocr_n} for '{nm}' — "
                         f"already used by another AI item"
+                    )
+                    continue
+                # 🔒 v2.9.1: 이 OCR 숫자가 OCR 텍스트에서 항목 줄에 나온 게 아니라면
+                # (= 어떤 AI 항목과도 정확 일치 안 함) → 소계/세금 숫자일 가능성
+                # 100,000 이상이면서 어떤 AI 항목과도 정확 일치 안 하면 후보 제외
+                if ocr_n >= 100_000 and ocr_n not in ai_used_prices:
+                    _xlog.warning(
+                        f"[XVAL] SKIP candidate {ocr_n} for '{nm}' — "
+                        f"large OCR number not matched to any AI item (likely subtotal/tax)"
                     )
                     continue
                 if diff < best_diff:
