@@ -710,6 +710,13 @@ RULE 2: itemName = EXACT COPY FROM RECEIPT
   · "로얄- cat) 마더앤 베이비캣 소프트 무스" → "로얄- cat) 마더앤 베이비캣 소프트 무스"
 - Keep ALL: parentheses (), brackets [], asterisks *, hyphens -, slashes /, dots.
 - Do NOT shorten, summarize, translate to English, or replace with a category name.
+- ⚠️ COMMON MISTAKE: Do NOT replace specific product/vaccine names with generic category names!
+  · "DHPPi" → "DHPPi" (NOT "진찰료", NOT "종합백신")
+  · "Nexgard Spectra" → "Nexgard Spectra" (NOT "Rabies", NOT "구충제")
+  · "Corona" → "Corona" (NOT "코로나백신")
+  · "노비박 Puppy DP" → "노비박 Puppy DP" (NOT "종합백신")
+  · "브라벡토" → "브라벡토" (NOT "외부기생충")
+  · "하트가드" → "하트가드" (NOT "심장사상충")
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1079,13 +1086,15 @@ _TAG_KEYWORD_RULES: List[tuple] = [
     (["호르몬", "갑상선", "t4", "cortisol", "acth"], "exam_hormone"),
     # ── 예방접종 ──
     (["광견병", "rabies"], "vaccine_rabies"),
-    (["종합백신", "dhppl", "종합접종", "5종", "7종", "혼합예방"], "vaccine_comprehensive"),
-    (["코로나", "corona"], "vaccine_corona"),
+    (["종합백신", "dhppl", "dhppi", "종합접종", "5종", "7종", "혼합예방", "노비박", "유리칸", "버박", "뱅가드", "인터벳", "듀라문", "puppy dp"], "vaccine_comprehensive"),
+    (["코로나", "corona", "코로나장염"], "vaccine_corona"),
     (["켄넬", "kennel", "기관지염"], "vaccine_kennel"),
     (["fip", "복막염"], "vaccine_fip"),
     # ── 예방약/구충 ──
-    (["심장사상충", "heartworm", "하트가드", "넥스가드스펙트라"], "prevent_heartworm"),
-    (["외부기생충", "프론트라인", "넥스가드", "브라벡토", "외부구충"], "prevent_external"),
+    (["심장사상충", "heartworm", "하트가드", "heartgard"], "prevent_heartworm"),
+    (["외부기생충", "프론트라인", "frontline", "브라벡토", "bravecto", "외부구충", "크레델리오", "simparica"], "prevent_external"),
+    (["넥스가드스펙트라", "nexgard spectra", "넥스가드 스펙트라"], "prevent_heartworm"),
+    (["넥스가드", "nexgard"], "prevent_external"),
     (["구충", "내부기생충", "deworming", "드론탈", "펜벤다졸"], "prevent_deworming"),
     # ── 처방약 ──
     (["항생제", "antibiotic", "아목시실린", "세팔렉신", "바이트릴", "엔로플록사신", "클라목실"], "medicine_antibiotic"),
@@ -1986,9 +1995,25 @@ def process_receipt(
     ocr_buf = io.BytesIO()
     img_ocr.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
-    # ✅ Gemini용 이미지: 원본 컬러 고해상도
+    # ✅ Gemini용 이미지: 컬러 유지 + 그림자/어두운 영수증 밝기 보정
     gemini_max_w = max(int(receipt_max_width or 0), 3072)
     img_gemini = _resize_to_width(img.copy(), gemini_max_w)
+    try:
+        from PIL import ImageEnhance, ImageStat
+        # 평균 밝기 측정 (0~255)
+        stat = ImageStat.Stat(img_gemini.convert("L"))
+        mean_brightness = stat.mean[0]
+        _log = logging.getLogger("ocr_policy")
+        _log.info(f"[GEMINI-IMG] mean_brightness={mean_brightness:.1f}")
+        if mean_brightness < 140:
+            # 어두운 이미지: 밝기 + 대비 보정 (컬러 유지)
+            boost = min(1.6, 140 / max(mean_brightness, 30))
+            img_gemini = ImageEnhance.Brightness(img_gemini).enhance(boost)
+            img_gemini = ImageEnhance.Contrast(img_gemini).enhance(1.3)
+            img_gemini = ImageEnhance.Sharpness(img_gemini).enhance(1.5)
+            _log.info(f"[GEMINI-IMG] dark image corrected: brightness_boost={boost:.2f}")
+    except Exception:
+        pass
     gemini_buf = io.BytesIO()
     img_gemini.save(gemini_buf, format="PNG")
     gemini_image_bytes = gemini_buf.getvalue()
