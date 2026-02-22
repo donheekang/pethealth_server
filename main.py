@@ -3142,6 +3142,21 @@ def api_claim_upsert(req: InsuranceClaimUpsertRequest, user: Dict[str, Any] = De
         )
         if not row:
             raise HTTPException(status_code=409, detail="claim not found or not editable")
+
+        # ✅ claim_count 갱신: insurance_claims 테이블에서 실제 건수를 세서 반영
+        try:
+            cnt = db_fetchone(
+                "SELECT COUNT(*) AS c FROM public.insurance_claims WHERE user_uid=%s AND deleted_at IS NULL",
+                (uid,),
+            )
+            if cnt:
+                db_execute(
+                    "UPDATE public.users SET claim_count = %s WHERE firebase_uid = %s",
+                    (int(cnt["c"]), uid),
+                )
+        except Exception as _cnt_err:
+            logger.warning("[claim-upsert] claim_count update failed (ignored): %s", _cnt_err)
+
         return jsonable_encoder(row)
     except HTTPException:
         raise
