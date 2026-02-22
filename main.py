@@ -1312,6 +1312,20 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
     pu = premium_until_raw
     premium_until = pu.isoformat() if hasattr(pu, "isoformat") and pu is not None else None
 
+    # ✅ claim_count 실시간 동기화: 실제 건수를 세서 반환 + DB 업데이트
+    actual_claim_count = 0
+    try:
+        cnt_row = db_fetchone(
+            "SELECT COUNT(*) AS c FROM public.insurance_claims WHERE user_uid=%s AND deleted_at IS NULL",
+            (uid,),
+        )
+        actual_claim_count = int(cnt_row["c"]) if cnt_row else 0
+        stored_claim_count = int(row.get("claim_count") or 0)
+        if actual_claim_count != stored_claim_count:
+            db_execute("UPDATE public.users SET claim_count = %s WHERE firebase_uid = %s", (actual_claim_count, uid))
+    except Exception:
+        actual_claim_count = int(row.get("claim_count") or 0)
+
     return {
         "uid": uid,
         "membership_tier": membership_tier,
@@ -1323,7 +1337,7 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
         "pet_count": int(row.get("pet_count") or 0),
         "record_count": int(row.get("record_count") or 0),
         "doc_count": int(row.get("doc_count") or 0),
-        "claim_count": int(row.get("claim_count") or 0),
+        "claim_count": actual_claim_count,
         "schedule_count": int(row.get("schedule_count") or 0),
         "ai_usage_count": int(row.get("ai_usage_count") or 0),
         "ai_usage_limit": None if effective_tier == "premium" else 3,
