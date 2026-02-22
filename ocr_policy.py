@@ -2239,6 +2239,17 @@ def process_receipt(
                             f"discount ≈ {_disc_diff}, trusting Gemini total"
                         )
                         _use_ocr_total = False
+                    # ✅ OCR total이 Gemini total보다 훨씬 작으면 → OCR이 중간 소계를 잡은 것
+                    # Gemini sum이 OCR total보다 크면 → Gemini가 더 많은 항목을 봤으므로 Gemini 신뢰
+                    elif (ocr_total_amount < gemini_total * 0.7
+                          and gemini_sum > ocr_total_amount):
+                        _log.warning(
+                            f"[TOTAL] OCR total={ocr_total_amount} << Gemini total={gemini_total} "
+                            f"(OCR is {ocr_total_amount/gemini_total*100:.0f}% of Gemini), "
+                            f"Gemini sum={gemini_sum} > OCR total, "
+                            f"trusting Gemini total (OCR likely grabbed subtotal)"
+                        )
+                        _use_ocr_total = False
                 if _use_ocr_total:
                     total_amt = ocr_total_amount
                     ai_parsed["totalAmount"] = ocr_total_amount
