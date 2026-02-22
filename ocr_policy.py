@@ -200,6 +200,9 @@ def _preprocess_for_ocr(img):
     1단계: 그림자 제거 (배경 조명 추정 → 나누기 기법)
     2단계: 대비/선명도 강화
     """
+    import logging
+    _plog = logging.getLogger("ocr_policy")
+    _plog.warning(f"[PREPROCESS] v2.7.0 shadow removal STARTED, img_size={img.size}")
     try:
         from PIL import ImageEnhance, ImageFilter, ImageOps
         # 1) 그레이스케일 변환
@@ -213,15 +216,16 @@ def _preprocess_for_ocr(img):
             bg = gray.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             # numpy로 빠르게 나누기: result = (gray / bg) * 255
             import numpy as np
+            _plog.warning(f"[PREPROCESS] numpy available, doing divide shadow removal")
             g_arr = np.array(gray, dtype=np.float32)
             b_arr = np.maximum(np.array(bg, dtype=np.float32), 1.0)
             divided = np.clip(g_arr / b_arr * 255.0, 0, 255).astype(np.uint8)
             from PIL import Image as _PILImage
             gray = _PILImage.fromarray(divided, mode="L")
-            # 히스토그램 정규화 (밝기 범위 늘리기)
             gray = ImageOps.autocontrast(gray, cutoff=1)
+            _plog.warning(f"[PREPROCESS] shadow removal SUCCESS (numpy)")
         except ImportError:
-            # numpy 없으면 PIL ImageMath fallback
+            _plog.warning(f"[PREPROCESS] numpy not available, trying ImageMath fallback")
             try:
                 from PIL import ImageMath
                 gray = ImageMath.eval(
@@ -229,10 +233,11 @@ def _preprocess_for_ocr(img):
                     a=gray, b=bg
                 )
                 gray = ImageOps.autocontrast(gray, cutoff=1)
-            except Exception:
-                pass
-        except Exception:
-            pass  # 그림자 제거 실패 시 원본 그레이스케일 유지
+                _plog.warning(f"[PREPROCESS] shadow removal SUCCESS (ImageMath)")
+            except Exception as e2:
+                _plog.warning(f"[PREPROCESS] ImageMath fallback FAILED: {e2}")
+        except Exception as e1:
+            _plog.warning(f"[PREPROCESS] shadow removal FAILED: {e1}")
         # 3) 대비 강화 (감열지는 대비가 낮음 → 6과 8 구분에 중요)
         enhancer = ImageEnhance.Contrast(gray)
         gray = enhancer.enhance(1.8)  # 그림자 제거 후이므로 2.2→1.8로 줄임
