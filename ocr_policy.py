@@ -480,8 +480,11 @@ def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
             continue
         if _is_noise_line(ln):
             continue
-        # ✅ 카테고리 소계/헤더 라인 필터 (3가지 패턴):
-        # 패턴1: "진료 (1,964,600)" — 괄호 안에 큰 숫자
+        # ✅ 카테고리 소계/헤더 라인 필터 (5가지 패턴):
+        # 전처리: 원숫자(①②③…) 제거 → 패턴 매칭 정확도 향상
+        _ln_clean = re.sub(r'[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]', '', ln).strip()
+        # 패턴1: "진료 (1,964,600)", "입원 (93,500)" — 괄호 안에 숫자 + 괄호 밖 숫자 없음
+        # → 카테고리 소계 라인 (실제 항목이면 괄호 밖에 가격 숫자가 있어야 함)
         _paren_num_m = re.search(r'\(\s*([\d,]+)\s*\)', ln)
         if _paren_num_m:
             try:
@@ -489,7 +492,7 @@ def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
                 _outside = re.sub(r'\([^)]*\)', '', ln)
                 _outside_nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(_outside)]
                 _outside_nums = [n for n in _outside_nums if n >= 100]
-                if _pn >= 100_000 and not _outside_nums:
+                if _pn >= 1_000 and not _outside_nums:
                     continue
             except ValueError:
                 pass
@@ -499,9 +502,10 @@ def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
         if _garbled_paren:
             continue
         # 패턴3: 이름이 한글 1~3글자 + 괄호 → 카테고리 헤더 (예: "진료 (...)", "용품 (...)")
-        _short_header = re.match(r'^[가-힣]{1,3}\s*\(', ln.strip())
+        # 원숫자 제거 후 매칭하여 "① 입원 (...)" 같은 경우도 잡음
+        _short_header = re.match(r'^[가-힣]{1,3}\s*\(', _ln_clean)
         if _short_header:
-            _paren_content = re.search(r'\([^)]*\)', ln)
+            _paren_content = re.search(r'\([^)]*\)', _ln_clean)
             if _paren_content:
                 _inner = _paren_content.group(0)
                 # 괄호 안에 한글이 없으면 (= 숫자/기호만) → 카테고리 헤더
@@ -509,8 +513,16 @@ def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
                     continue
         # 패턴4: 한글 1~3글자 + 여는 괄호만 (닫는 괄호 없음)
         # OCR이 카테고리 헤더를 잘못 읽어 "진료 (583.4301" 같이 깨진 경우
-        if re.match(r'^[가-힣]{1,3}\s*\(', ln.strip()) and ')' not in ln:
+        if re.match(r'^[가-힣]{1,3}\s*\(', _ln_clean) and ')' not in ln:
             continue
+        # 패턴5: 원숫자(①②③)로 시작하는 짧은 카테고리 라인
+        # "① 입원" 같은 카테고리 헤더 (원숫자 = 카테고리 번호)
+        if re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩]', ln.strip()):
+            # 원숫자 뒤 한글이 3글자 이하면 카테고리 헤더
+            _after_circle = re.sub(r'^[①②③④⑤⑥⑦⑧⑨⑩]\s*', '', ln.strip())
+            _kor_part = re.match(r'^[가-힣]{1,3}(?:\s|$|\()', _after_circle)
+            if _kor_part:
+                continue
         nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(ln)]
         nums = [n for n in nums if n >= 100]
         if not nums:
