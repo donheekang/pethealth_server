@@ -1451,8 +1451,8 @@ def _cross_validate_prices(
     # ✅ v2.9.1: 소계/합계/비과세 등 숫자를 XVAL 후보에서 제외
     # 이런 숫자는 항목 가격이 아니라 소계/세금/할인 합계이므로 매칭하면 안 됨
     _xval_exclude: set = set()
-    if total_amount and total_amount > 0:
-        _xval_exclude.add(total_amount)
+    if ocr_total and ocr_total > 0:
+        _xval_exclude.add(ocr_total)
     # OCR에서 소계 키워드 줄의 숫자 제외
     _subtotal_kws = {"비과세", "부가세", "과세", "소계", "합계", "총액", "청구", "결제", "부가세액", "공급가액"}
     for ln in ocr_text.splitlines():
