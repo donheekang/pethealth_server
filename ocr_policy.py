@@ -507,6 +507,10 @@ def _extract_items_from_text(text: str) -> List[Dict[str, Any]]:
                 # 괄호 안에 한글이 없으면 (= 숫자/기호만) → 카테고리 헤더
                 if not re.search(r'[가-힣]', _inner):
                     continue
+        # 패턴4: 한글 1~3글자 + 여는 괄호만 (닫는 괄호 없음)
+        # OCR이 카테고리 헤더를 잘못 읽어 "진료 (583.4301" 같이 깨진 경우
+        if re.match(r'^[가-힣]{1,3}\s*\(', ln.strip()) and ')' not in ln:
+            continue
         nums = [int(x.replace(",", "")) for x in _AMOUNT_RE.findall(ln)]
         nums = [n for n in nums if n >= 100]
         if not nums:
@@ -1376,6 +1380,10 @@ def _fix_prices_by_ocr_name_match(
                 continue
             if len(_ocr_nm_clean) < 2:
                 continue
+            # 🔒 OCR 이름에 깨진 괄호/기호가 포함되면 신뢰 불가
+            # (카테고리 헤더가 깨져서 항목으로 파싱된 경우)
+            if re.search(r'[(\[]\s*[.\s,]*$', ocr_name.strip()):
+                continue
             sim = _name_similarity(ai_name, ocr_name)
             ocr_nlen = len(_ocr_nm_clean)
             # 유사도가 더 높거나, 같으면 이름이 더 긴(구체적인) 쪽 우선
@@ -1393,10 +1401,10 @@ def _fix_prices_by_ocr_name_match(
                 continue
             # 가격이 다를 때
             # ✅ 안전장치: 가격 차이가 너무 크면 교체하지 않음
-            # 정상적 OCR 보정은 2배 이내 (예: 66000↔68000=1.03배, 80000↔88000=1.1배)
-            # 3배 이상 차이 = OCR이 엉뚱한 숫자를 읽은 것
+            # 정상적 OCR 보정은 50% 이내 (예: 66000↔68000=1.03배, 80000↔88000=1.1배)
+            # 2배 이상 차이 = OCR이 엉뚱한 숫자를 읽은 것 (예: 9900→4301 = 2.3배)
             ratio = max(ocr_pr, abs_ai_pr) / max(min(ocr_pr, abs_ai_pr), 1)
-            if ratio >= 3:
+            if ratio >= 2:
                 _mlog.warning(
                     f"[NAME_MATCH] SKIP '{ai_name}' {abs_ai_pr} → {ocr_pr} "
                     f"(ratio {ratio:.1f}x too large)"
