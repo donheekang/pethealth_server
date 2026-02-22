@@ -786,6 +786,12 @@ RULE 2: itemName = EXACT COPY FROM RECEIPT
   · "노비박 Puppy DP" → "노비박 Puppy DP" (NOT "종합백신")
   · "브라벡토" → "브라벡토" (NOT "외부기생충")
   · "하트가드" → "하트가드" (NOT "심장사상충")
+- ⚠️ PARTIAL NAME RECOGNITION: If only part of a product name is visible, reconstruct the FULL name:
+  · "Spectra 7.5~15kg" or "Spectra" alone → "Nexgard Spectra" (this is Nexgard Spectra, NOT Rabies!)
+  · "Nexgard" alone (without Spectra) → "Nexgard"
+  · Weight like "7.5~15kg" after product → include it: "Nexgard Spectra 7.5~15kg"
+- ⚠️ CRITICAL: "Spectra" = Nexgard Spectra (구충제). NEVER confuse with Rabies (광견병)!
+  Rabies vaccine is labeled "광견병", "Rabies", or "레비스" on Korean receipts.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE 3: PRICE = EXACT NUMBER FROM RECEIPT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2311,6 +2317,43 @@ def process_receipt(
                             ai_it["itemName"] = ocr_name
                             used_ocr_names.add(ocr_name)
                             break
+            # Step E: ✅ OCR 텍스트에서 키워드로 Gemini 항목명 교정
+            # Gemini가 "Spectra 7.5~15kg"를 "Rabies"로 잘못 인식하는 등의 문제 대응
+            _KNOWN_PRODUCT_KEYWORDS = {
+                # (OCR에서 발견될 키워드, Gemini가 잘못 붙일 수 있는 이름들) → 올바른 이름
+                "spectra": {"wrong_names": {"rabies", "광견병", "레비스"}, "correct": "Nexgard Spectra"},
+                "nexgard": {"wrong_names": {"rabies", "광견병", "레비스", "구충"}, "correct": "Nexgard"},
+                "브라벡토": {"wrong_names": {"외부기생충", "구충제"}, "correct": "브라벡토"},
+                "bravecto": {"wrong_names": {"외부기생충", "구충제"}, "correct": "브라벡토"},
+                "하트가드": {"wrong_names": {"심장사상충", "심장"}, "correct": "하트가드"},
+                "heartgard": {"wrong_names": {"심장사상충", "심장"}, "correct": "하트가드"},
+            }
+            _ocr_lower = (ocr_text or "").lower()
+            if ai_parsed.get("items"):
+                for ai_it in ai_parsed["items"]:
+                    ai_name = (ai_it.get("itemName") or "").strip()
+                    ai_low = ai_name.lower()
+                    for kw, rule in _KNOWN_PRODUCT_KEYWORDS.items():
+                        if kw in _ocr_lower:
+                            # OCR 텍스트에 키워드가 있는데, Gemini가 잘못된 이름을 붙였으면 교정
+                            matched_wrong = False
+                            for wrong in rule["wrong_names"]:
+                                if wrong in ai_low:
+                                    matched_wrong = True
+                                    break
+                            if matched_wrong:
+                                # 추가 확인: OCR에서 해당 키워드 주변에 체중 정보가 있으면 포함
+                                weight_match = re.search(
+                                    rf'{kw}\s*([\d.]+\s*[~\-]\s*[\d.]+\s*kg)',
+                                    _ocr_lower
+                                )
+                                new_name = rule["correct"]
+                                if weight_match:
+                                    new_name = f"{new_name} {weight_match.group(1).strip()}"
+                                _log.warning(f"[NAME-FIX-KW] '{ai_name}' → '{new_name}' (keyword='{kw}' found in OCR)")
+                                ai_it["itemName"] = new_name
+                                break  # 하나의 규칙만 적용
+
             # 🔒 최종 세금/합계 항목 필터 (Gemini가 비과세/부가세를 항목으로 넣는 경우 제거)
             _TAX_KEYWORDS = {"비과세", "부가세", "과세", "공급가액", "과세공급가액", "부가세액",
                              "소계", "합계", "총액", "총금액", "청구금액", "결제요청", "결제금액"}
