@@ -192,23 +192,50 @@ def _to_webp_bytes(img, quality: int = 85) -> bytes:
     img.save(buf, format="WEBP", quality=int(max(30, min(int(quality or 85), 95))), method=6)
     return buf.getvalue()
 # -----------------------------
-# ✅ v2.6.0: 영수증 이미지 전처리 (OCR 인식률 향상)
+# ✅ v2.7.0: 영수증 이미지 전처리 (그림자 제거 + OCR 인식률 향상)
 # -----------------------------
 def _preprocess_for_ocr(img):
     """
-    감열지 영수증 대비 강화 + 선명도 + 노이즈 제거.
-    Pillow의 ImageEnhance/ImageFilter만 사용 (추가 의존성 없음).
+    그림자 제거 + 감열지 영수증 대비 강화 + 선명도 + 노이즈 제거.
+    1단계: 그림자 제거 (배경 조명 추정 → 나누기 기법)
+    2단계: 대비/선명도 강화
     """
     try:
-        from PIL import ImageEnhance, ImageFilter
-        # 1) 그레이스케일 변환 → 색상 노이즈 제거
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+        # 1) 그레이스케일 변환
         gray = img.convert("L")
-        # 2) 대비 강화 (감열지는 대비가 낮음 → 6과 8 구분에 중요)
+        # 2) ✅ 그림자 제거: 배경 조명 추정 후 나누기 (divide) 기법 — 순수 PIL
+        #    - 큰 블러로 배경(조명 패턴) 추정 → 원본을 배경으로 나눔 → 균일한 조명
+        #    - 그림자 = 조명이 불균일한 영역이므로, 조명을 평탄화하면 그림자 사라짐
+        try:
+            blur_radius = max(gray.width, gray.height) // 15
+            blur_radius = max(blur_radius, 25)  # 최소 25px
+            bg = gray.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            # numpy로 빠르게 나누기: result = (gray / bg) * 255
+            import numpy as np
+            g_arr = np.array(gray, dtype=np.float32)
+            b_arr = np.maximum(np.array(bg, dtype=np.float32), 1.0)
+            divided = np.clip(g_arr / b_arr * 255.0, 0, 255).astype(np.uint8)
+            from PIL import Image as _PILImage
+            gray = _PILImage.fromarray(divided, mode="L")
+            # 히스토그램 정규화 (밝기 범위 늘리기)
+            gray = ImageOps.autocontrast(gray, cutoff=1)
+        except ImportError:
+            # numpy 없으면 PIL ImageMath fallback
+            try:
+                from PIL import ImageMath
+                gray = ImageMath.eval(
+                    "convert(min((a * 255) / (b + 1), 255), 'L')",
+                    a=gray, b=bg
+                )
+                gray = ImageOps.autocontrast(gray, cutoff=1)
+            except Exception:
+                pass
+        except Exception:
+            pass  # 그림자 제거 실패 시 원본 그레이스케일 유지
+        # 3) 대비 강화 (감열지는 대비가 낮음 → 6과 8 구분에 중요)
         enhancer = ImageEnhance.Contrast(gray)
-        gray = enhancer.enhance(2.2)  # 2.2배 대비 강화 (6↔8 구분 개선)
-        # 3) 밝기 살짝 올림 (어두운 영수증 보정)
-        enhancer = ImageEnhance.Brightness(gray)
-        gray = enhancer.enhance(1.1)
+        gray = enhancer.enhance(1.8)  # 그림자 제거 후이므로 2.2→1.8로 줄임
         # 4) 선명도 강화 (흐릿한 글씨 대응 → 숫자 윤곽 선명하게)
         enhancer = ImageEnhance.Sharpness(gray)
         gray = enhancer.enhance(2.5)  # 2.5배 선명도 (6의 열린 부분 강조)
@@ -890,16 +917,13 @@ def _gemini_parse_receipt_full(
     parts = [
         {"text": _GEMINI_RECEIPT_PROMPT},
     ]
-    # ✅ 전처리 이미지 (흑백+대비강화)를 먼저 보여줌: 글자/숫자가 가장 선명
+    # ✅ 전처리 흑백 이미지만 전달: 글자가 선명하고, AI가 "해석"하지 않고 그대로 읽음
     if preprocessed_image_bytes:
         pp_b64 = base64.b64encode(preprocessed_image_bytes).decode("ascii")
         pp_mime = "image/png"
         if preprocessed_image_bytes[:4] == b"RIFF":
             pp_mime = "image/webp"
-        parts.append({"text": "[IMAGE 1: High-contrast preprocessed — item names and prices are clearest here. Read ALL item names and prices from this image FIRST.]"})
         parts.append({"inline_data": {"mime_type": pp_mime, "data": pp_b64}})
-        parts.append({"text": "[IMAGE 2: Original color photo — use to verify and supplement any details unclear in IMAGE 1]"})
-        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
     else:
         parts.append({"inline_data": {"mime_type": mime, "data": b64}})
     # ✅ Google Vision OCR 텍스트: 가격(숫자) 검증용으로만 사용
@@ -2214,6 +2238,37 @@ def process_receipt(
             if recovered_count > 0:
                 _log.warning(f"[RECOVER] {recovered_count} items recovered from Vision OCR")
                 hints["recovered_items"] = recovered_count
+            # Step D: ✅ OCR 텍스트 기반 항목명 교정 (Gemini가 이름을 카테고리명으로 바꿔버리는 문제 대응)
+            ocr_extracted_items = _extract_items_from_text(ocr_text or "")
+            if ocr_extracted_items and ai_parsed.get("items"):
+                _log.info(f"[NAME-FIX] OCR items: {[(it['itemName'], it['price']) for it in ocr_extracted_items]}")
+                _log.info(f"[NAME-FIX] AI  items: {[(it['itemName'], it['price']) for it in ai_parsed['items']]}")
+                # 가격 기반으로 OCR 항목 ↔ AI 항목 매칭 후 이름 교정
+                ocr_by_price: Dict[int, List[str]] = {}
+                for oi in ocr_extracted_items:
+                    p = oi.get("price") or 0
+                    if p >= 100:
+                        ocr_by_price.setdefault(p, []).append(oi.get("itemName") or "")
+                used_ocr_names: set = set()
+                for ai_it in ai_parsed["items"]:
+                    ai_price = ai_it.get("price") or 0
+                    ai_name = (ai_it.get("itemName") or "").strip()
+                    # 같은 가격의 OCR 항목이 있으면 이름 교정
+                    if ai_price in ocr_by_price:
+                        for ocr_name in ocr_by_price[ai_price]:
+                            if ocr_name in used_ocr_names:
+                                continue
+                            ocr_low = ocr_name.lower()
+                            ai_low = ai_name.lower()
+                            # 이미 같으면 스킵
+                            if ocr_low == ai_low:
+                                used_ocr_names.add(ocr_name)
+                                break
+                            # AI가 카테고리명으로 바꿨으면 OCR 원본명으로 교정
+                            _log.warning(f"[NAME-FIX] '{ai_name}' → '{ocr_name}' (price={ai_price})")
+                            ai_it["itemName"] = ocr_name
+                            used_ocr_names.add(ocr_name)
+                            break
             # 🔒 최종 세금/합계 항목 필터 (Gemini가 비과세/부가세를 항목으로 넣는 경우 제거)
             _TAX_KEYWORDS = {"비과세", "부가세", "과세", "공급가액", "과세공급가액", "부가세액",
                              "소계", "합계", "총액", "총금액", "청구금액", "결제요청", "결제금액"}
