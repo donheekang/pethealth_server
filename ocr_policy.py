@@ -889,17 +889,19 @@ def _gemini_parse_receipt_full(
         mime = "image/png"
     parts = [
         {"text": _GEMINI_RECEIPT_PROMPT},
-        {"text": "[IMAGE 1: Original color photo]"},
-        {"inline_data": {"mime_type": mime, "data": b64}},
     ]
-    # ✅ 전처리 이미지 (흑백+대비강화): 그림자/어두운 영수증에서 숫자·글자 보조 판독용
+    # ✅ 전처리 이미지 (흑백+대비강화)를 먼저 보여줌: 글자/숫자가 가장 선명
     if preprocessed_image_bytes:
         pp_b64 = base64.b64encode(preprocessed_image_bytes).decode("ascii")
         pp_mime = "image/png"
         if preprocessed_image_bytes[:4] == b"RIFF":
             pp_mime = "image/webp"
-        parts.append({"text": "[IMAGE 2: Preprocessed high-contrast grayscale — use this to verify item names and prices if IMAGE 1 is dark or has shadows]"})
+        parts.append({"text": "[IMAGE 1: High-contrast preprocessed — item names and prices are clearest here. Read ALL item names and prices from this image FIRST.]"})
         parts.append({"inline_data": {"mime_type": pp_mime, "data": pp_b64}})
+        parts.append({"text": "[IMAGE 2: Original color photo — use to verify and supplement any details unclear in IMAGE 1]"})
+        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+    else:
+        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
     # ✅ Google Vision OCR 텍스트: 가격(숫자) 검증용으로만 사용
     if (ocr_text or "").strip():
         # OCR 텍스트에서 금액 목록 추출하여 Gemini에게 힌트로 제공
