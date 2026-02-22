@@ -2243,6 +2243,38 @@ def process_receipt(
             _log.info(f"[OCR-hint] item_count={ocr_item_count}, total={ocr_total_amount}")
         except Exception:
             pass
+    # ✅ Step 1.6: OCR fallback — B&W 이미지에서 항목 0개면 컬러 이미지로 재시도
+    # 어두운 배경/저품질 영수증에서 이진화가 텍스트를 파괴하는 경우 대비
+    if ocr_item_count == 0 and gemini_image_bytes and acquired:
+        _log.warning("[OCR-FALLBACK] binary OCR yielded 0 items, retrying with color image")
+        _fb_sema = _get_sema(int(ocr_max_concurrency or 4))
+        _fb_acquired = _fb_sema.acquire(timeout=float(ocr_sema_acquire_timeout_seconds or 1.0))
+        if _fb_acquired:
+            try:
+                _fb_text, _ = _vision_ocr(
+                    gemini_image_bytes,
+                    google_credentials=google_credentials,
+                    timeout_seconds=int(ocr_timeout_seconds or 12),
+                )
+                if _fb_text:
+                    _fb_items = _extract_items_from_text(_fb_text)
+                    _fb_count = len(_fb_items)
+                    _log.warning(f"[OCR-FALLBACK] color OCR: text_len={len(_fb_text)}, items={_fb_count}")
+                    if _fb_count > ocr_item_count:
+                        ocr_text = _fb_text
+                        ocr_item_count = _fb_count
+                        ocr_total_amount = _extract_total_amount(_fb_text)
+                        _log.warning(
+                            f"[OCR-FALLBACK] UPGRADED: items={_fb_count}, total={ocr_total_amount}"
+                        )
+                        hints["ocrFallback"] = "color_image"
+            except Exception as e:
+                _log.warning(f"[OCR-FALLBACK] failed: {e}")
+            finally:
+                try:
+                    _fb_sema.release()
+                except Exception:
+                    pass
     # ✅ Step 2: Gemini AI 영수증 분석
     ai_result_json = None
     if g_enabled and g_key.strip():
