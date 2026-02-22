@@ -873,6 +873,7 @@ def _gemini_parse_receipt_full(
     model: str,
     timeout_seconds: int = 15,
     ocr_text: str = "",
+    preprocessed_image_bytes: bytes = b"",
 ) -> Optional[Dict[str, Any]]:
     api_key = (api_key or "").strip()
     model = (model or "gemini-3-flash-preview").strip()
@@ -888,8 +889,17 @@ def _gemini_parse_receipt_full(
         mime = "image/png"
     parts = [
         {"text": _GEMINI_RECEIPT_PROMPT},
+        {"text": "[IMAGE 1: Original color photo]"},
         {"inline_data": {"mime_type": mime, "data": b64}},
     ]
+    # ✅ 전처리 이미지 (흑백+대비강화): 그림자/어두운 영수증에서 숫자·글자 보조 판독용
+    if preprocessed_image_bytes:
+        pp_b64 = base64.b64encode(preprocessed_image_bytes).decode("ascii")
+        pp_mime = "image/png"
+        if preprocessed_image_bytes[:4] == b"RIFF":
+            pp_mime = "image/webp"
+        parts.append({"text": "[IMAGE 2: Preprocessed high-contrast grayscale — use this to verify item names and prices if IMAGE 1 is dark or has shadows]"})
+        parts.append({"inline_data": {"mime_type": pp_mime, "data": pp_b64}})
     # ✅ Google Vision OCR 텍스트: 가격(숫자) 검증용으로만 사용
     if (ocr_text or "").strip():
         # OCR 텍스트에서 금액 목록 추출하여 Gemini에게 힌트로 제공
@@ -2081,6 +2091,7 @@ def process_receipt(
                 model=g_model,
                 timeout_seconds=g_timeout,
                 ocr_text=ocr_text,
+                preprocessed_image_bytes=ocr_image_bytes,
             )
             if isinstance(gj, dict):
                 ai_result_json = gj
