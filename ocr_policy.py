@@ -2352,6 +2352,12 @@ def process_receipt(
                                     new_name = f"{new_name} {weight_match.group(1).strip()}"
                                 _log.warning(f"[NAME-FIX-KW] '{ai_name}' → '{new_name}' (keyword='{kw}' found in OCR)")
                                 ai_it["itemName"] = new_name
+                                # ✅ 태그도 새 이름 기준으로 재할당
+                                new_tag = _infer_tag_by_keyword(new_name)
+                                old_tag = ai_it.get("categoryTag")
+                                if new_tag and new_tag != old_tag:
+                                    _log.warning(f"[TAG-FIX-KW] '{old_tag}' → '{new_tag}' for '{new_name}'")
+                                    ai_it["categoryTag"] = new_tag
                                 break  # 하나의 규칙만 적용
 
             # 🔒 최종 세금/합계 항목 필터 (Gemini가 비과세/부가세를 항목으로 넣는 경우 제거)
