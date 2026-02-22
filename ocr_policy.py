@@ -196,55 +196,92 @@ def _to_webp_bytes(img, quality: int = 85) -> bytes:
 # -----------------------------
 def _preprocess_for_ocr(img):
     """
-    그림자 제거 + 감열지 영수증 대비 강화 + 선명도 + 노이즈 제거.
-    1단계: 그림자 제거 (배경 조명 추정 → 나누기 기법)
-    2단계: 대비/선명도 강화
+    v2.8.0: 강화된 그림자 제거 + 적응형 이진화 + OCR 최적화.
+    1단계: 그림자 제거 (배경 조명 추정 → 나누기 기법) — 2-pass
+    2단계: 적응형 이진화 (adaptive threshold) — 글씨/배경 분리
+    3단계: 대비/선명도 강화
     """
     import logging
     _plog = logging.getLogger("ocr_policy")
-    _plog.warning(f"[PREPROCESS] v2.7.0 shadow removal STARTED, img_size={img.size}")
+    _plog.warning(f"[PREPROCESS] v2.8.0 shadow removal STARTED, img_size={img.size}")
     try:
         from PIL import ImageEnhance, ImageFilter, ImageOps
         # 1) 그레이스케일 변환
         gray = img.convert("L")
-        # 2) ✅ 그림자 제거: 배경 조명 추정 후 나누기 (divide) 기법 — 순수 PIL
-        #    - 큰 블러로 배경(조명 패턴) 추정 → 원본을 배경으로 나눔 → 균일한 조명
-        #    - 그림자 = 조명이 불균일한 영역이므로, 조명을 평탄화하면 그림자 사라짐
+        # 2) ✅ 그림자 제거: 2-pass divide 기법
+        #    Pass 1: 큰 블러로 넓은 그림자 제거
+        #    Pass 2: 작은 블러로 잔여 그림자/불균일 조명 제거
         try:
-            blur_radius = max(gray.width, gray.height) // 15
-            blur_radius = max(blur_radius, 25)  # 최소 25px
-            bg = gray.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            # numpy로 빠르게 나누기: result = (gray / bg) * 255
             import numpy as np
-            _plog.warning(f"[PREPROCESS] numpy available, doing divide shadow removal")
+            _plog.warning(f"[PREPROCESS] numpy available, doing 2-pass divide shadow removal")
             g_arr = np.array(gray, dtype=np.float32)
-            b_arr = np.maximum(np.array(bg, dtype=np.float32), 1.0)
-            divided = np.clip(g_arr / b_arr * 255.0, 0, 255).astype(np.uint8)
+
+            # Pass 1: 큰 블러 (넓은 그림자 제거)
+            blur_r1 = max(gray.width, gray.height) // 10  # 더 넓은 블러
+            blur_r1 = max(blur_r1, 40)
+            bg1 = gray.filter(ImageFilter.GaussianBlur(radius=blur_r1))
+            b1_arr = np.maximum(np.array(bg1, dtype=np.float32), 1.0)
+            pass1 = np.clip(g_arr / b1_arr * 255.0, 0, 255).astype(np.uint8)
+            _plog.warning(f"[PREPROCESS] pass1 done, blur_r={blur_r1}")
+
+            # Pass 2: 작은 블러 (잔여 불균일 조명 제거)
             from PIL import Image as _PILImage
-            gray = _PILImage.fromarray(divided, mode="L")
-            gray = ImageOps.autocontrast(gray, cutoff=1)
-            _plog.warning(f"[PREPROCESS] shadow removal SUCCESS (numpy)")
+            pass1_img = _PILImage.fromarray(pass1, mode="L")
+            blur_r2 = max(gray.width, gray.height) // 30
+            blur_r2 = max(blur_r2, 15)
+            bg2 = pass1_img.filter(ImageFilter.GaussianBlur(radius=blur_r2))
+            p1_arr = np.array(pass1_img, dtype=np.float32)
+            b2_arr = np.maximum(np.array(bg2, dtype=np.float32), 1.0)
+            pass2 = np.clip(p1_arr / b2_arr * 255.0, 0, 255).astype(np.uint8)
+            _plog.warning(f"[PREPROCESS] pass2 done, blur_r={blur_r2}")
+
+            gray = _PILImage.fromarray(pass2, mode="L")
+            gray = ImageOps.autocontrast(gray, cutoff=2)
+
+            # 3) 적응형 이진화 (adaptive threshold) — 글씨/배경 완전 분리
+            #    로컬 블록별로 임계값 계산 → 그림자 영역도 글씨 살림
+            try:
+                block_size = max(gray.width, gray.height) // 20
+                block_size = max(block_size, 15)
+                if block_size % 2 == 0:
+                    block_size += 1  # 홀수로
+                local_blur = gray.filter(ImageFilter.GaussianBlur(radius=block_size))
+                g_final = np.array(gray, dtype=np.float32)
+                l_arr = np.array(local_blur, dtype=np.float32)
+                # 로컬 평균보다 C만큼 어두우면 글씨(검정), 아니면 배경(흰색)
+                C = 10  # 임계값 오프셋
+                binary = np.where(g_final < (l_arr - C), 0, 255).astype(np.uint8)
+                gray = _PILImage.fromarray(binary, mode="L")
+                _plog.warning(f"[PREPROCESS] adaptive threshold done, block={block_size}, C={C}")
+            except Exception as e_at:
+                _plog.warning(f"[PREPROCESS] adaptive threshold skipped: {e_at}")
+                # 이진화 실패 시 autocontrast만 적용된 상태로 계속
+
+            _plog.warning(f"[PREPROCESS] shadow removal SUCCESS (numpy 2-pass)")
         except ImportError:
             _plog.warning(f"[PREPROCESS] numpy not available, trying ImageMath fallback")
             try:
+                blur_radius = max(gray.width, gray.height) // 10
+                blur_radius = max(blur_radius, 40)
+                bg = gray.filter(ImageFilter.GaussianBlur(radius=blur_radius))
                 from PIL import ImageMath
                 gray = ImageMath.eval(
                     "convert(min((a * 255) / (b + 1), 255), 'L')",
                     a=gray, b=bg
                 )
-                gray = ImageOps.autocontrast(gray, cutoff=1)
+                gray = ImageOps.autocontrast(gray, cutoff=2)
                 _plog.warning(f"[PREPROCESS] shadow removal SUCCESS (ImageMath)")
             except Exception as e2:
                 _plog.warning(f"[PREPROCESS] ImageMath fallback FAILED: {e2}")
         except Exception as e1:
             _plog.warning(f"[PREPROCESS] shadow removal FAILED: {e1}")
-        # 3) 대비 강화 (감열지는 대비가 낮음 → 6과 8 구분에 중요)
+        # 4) 대비 강화
         enhancer = ImageEnhance.Contrast(gray)
-        gray = enhancer.enhance(1.8)  # 그림자 제거 후이므로 2.2→1.8로 줄임
-        # 4) 선명도 강화 (흐릿한 글씨 대응 → 숫자 윤곽 선명하게)
+        gray = enhancer.enhance(1.5)  # 이진화 후이므로 1.8→1.5로 줄임
+        # 5) 선명도 강화
         enhancer = ImageEnhance.Sharpness(gray)
-        gray = enhancer.enhance(2.5)  # 2.5배 선명도 (6의 열린 부분 강조)
-        # 5) 가벼운 노이즈 제거
+        gray = enhancer.enhance(2.0)
+        # 6) 가벼운 노이즈 제거
         gray = gray.filter(ImageFilter.MedianFilter(size=3))
         # 다시 RGB로 (OCR API 호환)
         return gray.convert("RGB")
