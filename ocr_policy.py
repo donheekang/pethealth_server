@@ -287,6 +287,64 @@ def _preprocess_for_ocr(img):
         return gray.convert("RGB")
     except Exception:
         return img
+
+# -----------------------------
+# ✅ v2.9.0: Gemini 전용 전처리 (컬러 유지 + 그림자만 제거)
+# OCR용은 이진화(흑백)까지 하지만, Gemini는 디테일이 필요하므로
+# 컬러를 유지하면서 그림자만 제거 + 밝기/대비 보정만 수행
+# -----------------------------
+def _preprocess_for_gemini(img):
+    """
+    Gemini 전용: 컬러 유지 + 그림자 제거 + 밝기/대비 강화.
+    이진화(adaptive threshold)는 하지 않음 → 디테일 보존.
+    """
+    import logging
+    _plog = logging.getLogger("ocr_policy")
+    _plog.warning(f"[GEMINI-PREPROCESS] v2.9.0 color shadow removal STARTED, img_size={img.size}")
+    try:
+        from PIL import ImageEnhance, ImageFilter, ImageOps
+        import numpy as np
+
+        # RGB 채널별로 그림자 제거 (divide 기법)
+        channels = img.split()  # R, G, B
+        result_channels = []
+        for i, ch in enumerate(channels):
+            ch_arr = np.array(ch, dtype=np.float32)
+            blur_r = max(ch.width, ch.height) // 10
+            blur_r = max(blur_r, 40)
+            bg = ch.filter(ImageFilter.GaussianBlur(radius=blur_r))
+            bg_arr = np.maximum(np.array(bg, dtype=np.float32), 1.0)
+            divided = np.clip(ch_arr / bg_arr * 255.0, 0, 255).astype(np.uint8)
+            from PIL import Image as _PILImage
+            result_channels.append(_PILImage.fromarray(divided, mode="L"))
+
+        img_out = _PILImage.merge("RGB", result_channels)
+        img_out = ImageOps.autocontrast(img_out, cutoff=1)
+
+        # 밝기/대비/선명도 보정
+        img_out = ImageEnhance.Contrast(img_out).enhance(1.3)
+        img_out = ImageEnhance.Sharpness(img_out).enhance(1.5)
+
+        _plog.warning(f"[GEMINI-PREPROCESS] color shadow removal SUCCESS")
+        return img_out
+    except ImportError:
+        _plog.warning(f"[GEMINI-PREPROCESS] numpy not available, using brightness fallback")
+        try:
+            from PIL import ImageEnhance, ImageStat
+            stat = ImageStat.Stat(img.convert("L"))
+            mean_brightness = stat.mean[0]
+            if mean_brightness < 140:
+                boost = min(1.6, 140 / max(mean_brightness, 30))
+                img = ImageEnhance.Brightness(img).enhance(boost)
+                img = ImageEnhance.Contrast(img).enhance(1.3)
+                img = ImageEnhance.Sharpness(img).enhance(1.5)
+            return img
+        except Exception:
+            return img
+    except Exception as e:
+        _plog.warning(f"[GEMINI-PREPROCESS] FAILED: {e}")
+        return img
+
 # -----------------------------
 # Google Vision OCR (optional)
 # -----------------------------
@@ -948,7 +1006,7 @@ def _gemini_parse_receipt_full(
     model: str,
     timeout_seconds: int = 15,
     ocr_text: str = "",
-    preprocessed_image_bytes: bytes = b"",
+    gemini_image_bytes: bytes = b"",
 ) -> Optional[Dict[str, Any]]:
     api_key = (api_key or "").strip()
     model = (model or "gemini-3-flash-preview").strip()
@@ -965,15 +1023,18 @@ def _gemini_parse_receipt_full(
     parts = [
         {"text": _GEMINI_RECEIPT_PROMPT},
     ]
-    # ✅ 전처리 흑백 이미지만 전달: 글자가 선명하고, AI가 "해석"하지 않고 그대로 읽음
-    if preprocessed_image_bytes:
-        pp_b64 = base64.b64encode(preprocessed_image_bytes).decode("ascii")
-        pp_mime = "image/png"
-        if preprocessed_image_bytes[:4] == b"RIFF":
-            pp_mime = "image/webp"
-        parts.append({"inline_data": {"mime_type": pp_mime, "data": pp_b64}})
-    else:
-        parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+    # ✅ v2.9.0: Gemini 전용 전처리 이미지 (컬러 유지 + 그림자만 제거)
+    # 이진화(흑백)는 OCR용이고, Gemini는 디테일이 필요하므로 컬러 shadow-removed 이미지 사용
+    _gem_bytes = gemini_image_bytes if gemini_image_bytes else image_bytes
+    _gem_b64 = base64.b64encode(_gem_bytes).decode("ascii")
+    _gem_mime = "image/png"
+    if _gem_bytes[:4] == b"RIFF":
+        _gem_mime = "image/webp"
+    elif _gem_bytes[:3] == b"\xff\xd8\xff":
+        _gem_mime = "image/jpeg"
+    elif _gem_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        _gem_mime = "image/png"
+    parts.append({"inline_data": {"mime_type": _gem_mime, "data": _gem_b64}})
     # ✅ Google Vision OCR 텍스트: 가격(숫자) 검증용으로만 사용
     if (ocr_text or "").strip():
         # OCR 텍스트에서 금액 목록 추출하여 Gemini에게 힌트로 제공
@@ -2079,25 +2140,10 @@ def process_receipt(
     ocr_buf = io.BytesIO()
     img_ocr.save(ocr_buf, format="PNG")
     ocr_image_bytes = ocr_buf.getvalue()
-    # ✅ Gemini용 이미지: 컬러 유지 + 그림자/어두운 영수증 밝기 보정
+    # ✅ v2.9.0: Gemini용 이미지 — 컬러 유지 + 그림자 제거 (이진화 안 함)
     gemini_max_w = max(int(receipt_max_width or 0), 3072)
     img_gemini = _resize_to_width(img.copy(), gemini_max_w)
-    try:
-        from PIL import ImageEnhance, ImageStat
-        # 평균 밝기 측정 (0~255)
-        stat = ImageStat.Stat(img_gemini.convert("L"))
-        mean_brightness = stat.mean[0]
-        _log = logging.getLogger("ocr_policy")
-        _log.info(f"[GEMINI-IMG] mean_brightness={mean_brightness:.1f}")
-        if mean_brightness < 140:
-            # 어두운 이미지: 밝기 + 대비 보정 (컬러 유지)
-            boost = min(1.6, 140 / max(mean_brightness, 30))
-            img_gemini = ImageEnhance.Brightness(img_gemini).enhance(boost)
-            img_gemini = ImageEnhance.Contrast(img_gemini).enhance(1.3)
-            img_gemini = ImageEnhance.Sharpness(img_gemini).enhance(1.5)
-            _log.info(f"[GEMINI-IMG] dark image corrected: brightness_boost={boost:.2f}")
-    except Exception:
-        pass
+    img_gemini = _preprocess_for_gemini(img_gemini)  # 컬러 shadow removal
     gemini_buf = io.BytesIO()
     img_gemini.save(gemini_buf, format="PNG")
     gemini_image_bytes = gemini_buf.getvalue()
@@ -2165,7 +2211,7 @@ def process_receipt(
                 model=g_model,
                 timeout_seconds=g_timeout,
                 ocr_text=ocr_text,
-                preprocessed_image_bytes=ocr_image_bytes,
+                gemini_image_bytes=gemini_image_bytes,
             )
             if isinstance(gj, dict):
                 ai_result_json = gj
