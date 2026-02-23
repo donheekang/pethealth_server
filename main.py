@@ -2388,7 +2388,7 @@ def commit_receipt(
             record_uuid = uuid.UUID(req.recordId)
             # 기존 레코드가 실제로 존재하는지 확인
             _existing = db_fetchone(
-                "SELECT id FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id "
+                "SELECT r.id FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id "
                 "WHERE r.id=%s AND p.user_uid=%s AND r.deleted_at IS NULL",
                 (record_uuid, uid)
             )
@@ -2458,6 +2458,10 @@ def commit_receipt(
                 rec_row = cur.fetchone()
                 if not rec_row:
                     raise HTTPException(status_code=500, detail=_internal_detail("commit record insert failed", kind="DB error"))
+
+                # ✅ 기존 레코드면 기존 items 삭제 후 재삽입
+                if existing_record and req.replaceItems:
+                    cur.execute("DELETE FROM public.health_items WHERE record_id=%s", (record_uuid,))
 
                 # items 저장
                 for it in req.items:
