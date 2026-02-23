@@ -810,6 +810,7 @@ class HealthRecordUpsertRequest(BaseModel):
     hospital_mgmt_no: Optional[str] = Field(default=None, alias="hospitalMgmtNo")
     total_amount: Optional[int] = Field(default=None, alias="totalAmount")
     pet_weight_at_visit: Optional[float] = Field(default=None, alias="petWeightAtVisit")
+    receipt_image_path: Optional[str] = Field(default=None, alias="receiptImagePath")
     tags: List[str] = Field(default_factory=list)
     items: Optional[List[HealthItemInput]] = None
 
@@ -1638,6 +1639,8 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                 has_any_price = True
                 items_sum += p
     tags = _clean_tags(req.tags)
+    # ✅ receipt_image_path: 편집 시 이미지 경로 저장 지원
+    receipt_image_path_in = req.receipt_image_path.strip() if isinstance(req.receipt_image_path, str) and req.receipt_image_path.strip() else None
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1658,23 +1661,43 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                         total_amount = items_sum
                     else:
                         total_amount = 0
-                cur.execute(
-                    """
-                    INSERT INTO public.health_records
-                        (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        pet_id = EXCLUDED.pet_id, hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
-                        hospital_name = EXCLUDED.hospital_name, visit_date = EXCLUDED.visit_date,
-                        total_amount = EXCLUDED.total_amount, pet_weight_at_visit = EXCLUDED.pet_weight_at_visit,
-                        tags = EXCLUDED.tags
-                    WHERE public.health_records.deleted_at IS NULL
-                        AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = public.health_records.pet_id AND p.user_uid = %s)
-                    RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
-                        receipt_image_path, file_size_bytes, created_at, updated_at
-                    """,
-                    (record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, uid),
-                )
+                # ✅ receipt_image_path가 있으면 INSERT/UPDATE에 포함
+                if receipt_image_path_in:
+                    cur.execute(
+                        """
+                        INSERT INTO public.health_records
+                            (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            pet_id = EXCLUDED.pet_id, hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
+                            hospital_name = EXCLUDED.hospital_name, visit_date = EXCLUDED.visit_date,
+                            total_amount = EXCLUDED.total_amount, pet_weight_at_visit = EXCLUDED.pet_weight_at_visit,
+                            tags = EXCLUDED.tags, receipt_image_path = EXCLUDED.receipt_image_path
+                        WHERE public.health_records.deleted_at IS NULL
+                            AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = public.health_records.pet_id AND p.user_uid = %s)
+                        RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                            receipt_image_path, file_size_bytes, created_at, updated_at
+                        """,
+                        (record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path_in, uid),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO public.health_records
+                            (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            pet_id = EXCLUDED.pet_id, hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
+                            hospital_name = EXCLUDED.hospital_name, visit_date = EXCLUDED.visit_date,
+                            total_amount = EXCLUDED.total_amount, pet_weight_at_visit = EXCLUDED.pet_weight_at_visit,
+                            tags = EXCLUDED.tags
+                        WHERE public.health_records.deleted_at IS NULL
+                            AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = public.health_records.pet_id AND p.user_uid = %s)
+                        RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                            receipt_image_path, file_size_bytes, created_at, updated_at
+                        """,
+                        (record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, uid),
+                    )
                 row = cur.fetchone()
                 if not row:
                     exists = db_fetchone("SELECT id FROM public.health_records WHERE id=%s", (record_uuid,))
