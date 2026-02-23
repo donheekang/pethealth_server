@@ -2760,6 +2760,9 @@ def _validate_storage_path(path: str, uid: str) -> str:
 def _assert_path_owned(uid: str, path: str) -> Dict[str, Any]:
     if path.startswith(f"users/{uid}/backups/") and path.endswith(".json"):
         return {"kind": "backup"}
+    # ✅ draft_receipts는 아직 DB에 저장 전이므로 경로 소유권만 확인
+    if "/draft_receipts/" in path and path.startswith(f"users/{uid}/"):
+        return {"kind": "draft_receipt"}
     # Check exact match first
     rec = db_fetchone("SELECT 1 FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id WHERE p.user_uid=%s AND r.deleted_at IS NULL AND r.receipt_image_path=%s LIMIT 1", (uid, path))
     if rec:
