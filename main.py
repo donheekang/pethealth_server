@@ -2316,6 +2316,7 @@ class ReceiptCommitRequestDTO(BaseModel):
     hospitalMgmtNo: Optional[str] = None
     totalAmount: Optional[int] = None
     petWeightAtVisit: Optional[float] = None
+    recordId: Optional[str] = None  # ✅ 기존 레코드 업데이트 시 사용
     tags: List[str] = []
     items: List[ReceiptCommitItemDTO] = []
     replaceItems: bool = True
@@ -2380,8 +2381,23 @@ def commit_receipt(
 
     tags = _clean_tags(req.tags)
 
-    # 새 record UUID 생성
-    record_uuid = uuid.uuid4()
+    # ✅ 기존 recordId가 있으면 업데이트, 없으면 새 UUID 생성
+    existing_record = False
+    if req.recordId:
+        try:
+            record_uuid = uuid.UUID(req.recordId)
+            # 기존 레코드가 실제로 존재하는지 확인
+            _existing = db_fetchone(
+                "SELECT id FROM public.health_records r JOIN public.pets p ON p.id = r.pet_id "
+                "WHERE r.id=%s AND p.user_uid=%s AND r.deleted_at IS NULL",
+                (record_uuid, uid)
+            )
+            if _existing:
+                existing_record = True
+        except (ValueError, AttributeError):
+            record_uuid = uuid.uuid4()
+    else:
+        record_uuid = uuid.uuid4()
 
     # 드래프트 이미지를 최종 경로로 복사(이동)
     final_path = _receipt_path(uid, str(pet_uuid), str(record_uuid))
@@ -2414,16 +2430,31 @@ def commit_receipt(
     try:
         with db_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    INSERT INTO public.health_records
-                        (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path, file_size_bytes)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
-                        receipt_image_path, file_size_bytes, created_at, updated_at
-                    """,
-                    (record_uuid, pet_uuid, hosp_mgmt, hosp_name, vd, total_amount, pet_weight, tags, final_path, file_size),
-                )
+                if existing_record:
+                    # ✅ 기존 레코드 업데이트 (편집 중 이미지 추가)
+                    cur.execute(
+                        """
+                        UPDATE public.health_records SET
+                            hospital_mgmt_no=%s, hospital_name=%s, visit_date=%s,
+                            total_amount=%s, pet_weight_at_visit=%s, tags=%s,
+                            receipt_image_path=%s, file_size_bytes=%s
+                        WHERE id=%s AND deleted_at IS NULL
+                        RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                            receipt_image_path, file_size_bytes, created_at, updated_at
+                        """,
+                        (hosp_mgmt, hosp_name, vd, total_amount, pet_weight, tags, final_path, file_size, record_uuid),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO public.health_records
+                            (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path, file_size_bytes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
+                            receipt_image_path, file_size_bytes, created_at, updated_at
+                        """,
+                        (record_uuid, pet_uuid, hosp_mgmt, hosp_name, vd, total_amount, pet_weight, tags, final_path, file_size),
+                    )
                 rec_row = cur.fetchone()
                 if not rec_row:
                     raise HTTPException(status_code=500, detail=_internal_detail("commit record insert failed", kind="DB error"))
