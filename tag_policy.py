@@ -246,7 +246,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "medicine_anti_inflammatory", "group": "medicine", "aliases": [
         "nsaid","anti-inflammatory","meloxicam","metacam","carprofen","rimadyl",
         "onsior","galliprant","소염","소염제","멜록시캄","카프로펜","온시올","갈리프란트",
-        "소염진통","소염진통제","firocoxib","피록시캄","로베나콕시브","robenacoxib",
+        "소염진통","소염진통제","firocoxib","피로콕시브","로베나콕시브","robenacoxib",
     ]},
     {"code": "medicine_painkiller", "group": "medicine", "aliases": [
         "analgesic","tramadol","gabapentin","buprenorphine","진통","진통제",
@@ -285,8 +285,112 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     {"code": "medicine_allergy", "group": "medicine", "aliases": [
         "apoquel","cytopoint","cetirizine","zyrtec","benadryl","알러지","알레르기","가려움",
         "아포퀠","사이토포인트","세티리진","항히스타민","antihistamine",
-        "아토피치료","아토피약","오클라시티닙","oclacitinib",
+        "아토피치료","아토피약","오클라시티닙","oclacitinib","atopica","아토피카",
     ]},
+    # === 심장약 ===
+    {"code": "medicine_cardiac", "group": "medicine", "aliases": [
+        "심장약","심장치료","심장치료제","cardiac drug","cardiac medication","heart medication",
+        "피모벤단","pimobendan","베트메딘","vetmedin","심부전","심부전약","심부전치료",
+        "실데나필","sildenafil","폐고혈압","폐동맥고혈압",
+        "암로디핀","amlodipine","노바스크","norvasc",
+        "베나제프릴","benazepril","포르테코르","fortekor",
+        "에날라프릴","enalapril","에나카드","enacard",
+        "텔미사르탄","telmisartan","세미트라","semintra",
+        "라미프릴","ramipril","ace inhibitor","ace억제제","ace 억제제",
+        "스피로노락톤","spironolactone","이뇨제","furosemide","푸로세미드","라식스","lasix",
+        "디곡신","digoxin","아테놀롤","atenolol","딜티아젬","diltiazem",
+        "라프로스","rapros","베라프로스트","beraprost",
+        "혈압약","항고혈압","혈관확장","심장보호","심장관리",
+    ]},
+    # === 신장약 ===
+    {"code": "medicine_renal", "group": "medicine", "aliases": [
+        "신장약","신부전약","ckd약","신장치료","신장치료제","renal drug","kidney medication",
+        "레나메진","renamezin","크레메진","kremezin","ast-120","ast120",
+        "인산결합제","세벨라머","sevelamer","수산화알루미늄","인흡착제",
+        "에포에틴","epoetin","다르베포에틴","darbepoetin","epo","조혈제",
+        "칼시트리올","calcitriol","비타민d","활성비타민d",
+        "신장보호","신장관리","만성신부전","급성신부전","arf","crf","ckd",
+        "투석","dialysis","복막투석","혈액투석",
+    ]},
+    # === 간장약 ===
+    {"code": "medicine_hepatic", "group": "medicine", "aliases": [
+        "간장약","간치료","간치료제","간보호","간보호제","liver medication","hepatic drug",
+        "우르소","ursodiol","우르소데옥시콜산","ursodeoxycholic","우르소데옥시","udca",
+        "사밀","samil","실리마린","silymarin","밀크시슬","milk thistle",
+        "데나마린","denamarin","헤파틱","hepatic","간관리","간질환",
+        "메티오닌","methionine","간해독","간기능개선",
+    ]},
+    # === 갑상선약 ===
+    {"code": "medicine_thyroid", "group": "medicine", "aliases": [
+        "갑상선약","갑상선치료","갑상선치료제","thyroid medication","thyroid drug",
+        "레보티록신","levothyroxine","솔록신","soloxine","갑상선호르몬제",
+        "메티마졸","methimazole","페리마졸","felimazole","항갑상선제",
+        "갑상선기능저하","갑상선기능항진","hypothyroid","hyperthyroid",
+        "갑상선관리","갑상선보충","t4보충",
+    ]},
+    # === 항경련제/신경약 ===
+    {"code": "medicine_seizure", "group": "medicine", "aliases": [
+        "항경련제","항경련","경련약","간질약","발작약","anticonvulsant","antiepileptic","seizure",
+        "조니사마이드","zonisamide","페노바르비탈","phenobarbital","루미날","luminal",
+        "레비티라세탐","levetiracetam","케프라","keppra",
+        "브롬화칼륨","potassium bromide","kbr","디아제팜","diazepam",
+        "뇌전증","간질","epilepsy","발작","경련","경련치료",
+        "가바펜틴","gabapentin","프레가발린","pregabalin",
+    ]},
+    # === 항암제 ===
+    {"code": "medicine_oncology", "group": "medicine", "aliases": [
+        "항암제","항암","항암치료","항암약","chemotherapy","chemo","oncology",
+        "클로람부실","chlorambucil","류케란","leukeran",
+        "빈크리스틴","vincristine","온코빈","oncovin",
+        "독소루비신","doxorubicin","아드리아마이신","adriamycin",
+        "토세라닙","toceranib","팔라디아","palladia","팔리디아",
+        "사이클로포스파미드","cyclophosphamide","엔독산","endoxan",
+        "로무스틴","lomustine","ccnu",
+        "미톡산트론","mitoxantrone",
+        "카보플라틴","carboplatin","시스플라틴","cisplatin",
+        "종양치료","종양약","암치료","암약",
+    ]},
+    # === 면역억제제 ===
+    {"code": "medicine_immunosuppressant", "group": "medicine", "aliases": [
+        "면역억제제","면역억제","immunosuppressant","immunosuppressive",
+        "마이코페놀레이트","mycophenolate","셀셉트","cellcept","mmf",
+        "사이클로스포린","cyclosporine","atopica","아토피카","싸이클로스포린",
+        "레플루노마이드","leflunomide","아라바","arava",
+        "아자티오프린","azathioprine","이무란","imuran",
+        "타크로리무스","tacrolimus","프로그라프","prograf",
+        "면역조절","면역치료","면역관리",
+    ]},
+    # === 당뇨/내분비약 ===
+    {"code": "medicine_endocrine", "group": "medicine", "aliases": [
+        "당뇨약","당뇨치료","당뇨치료제","diabetes medication","diabetic drug",
+        "인슐린","insulin","란투스","lantus","레베미르","levemir","프로징크","prozinc",
+        "카닌슐린","caninsulin","인슐린주사","인슐린펜","혈당조절",
+        "당뇨","당뇨병","diabetes","dm",
+        "트릴로스탄","trilostane","베토릴","vetoryl","쿠싱","cushing","쿠싱증후군",
+        "부신피질기능항진","hyperadrenocorticism","부신기능항진",
+        "미토탄","mitotane","리소드렌","lysodren",
+        "내분비약","내분비치료","내분비",
+    ]},
+    # === 비뇨기약 ===
+    {"code": "medicine_urinary", "group": "medicine", "aliases": [
+        "비뇨기약","비뇨기치료","방광약","방광치료","urinary medication",
+        "프라조신","prazosin","페녹시벤자민","phenoxybenzamine",
+        "베타네콜","bethanechol","방광이완제","방광수축제",
+        "비뇨기","요로","방광염","방광","요도","요로감염","uti",
+        "요실금","요실금약","프로파린","propalin","페닐프로판올아민","ppa",
+        "비뇨기관리","비뇨기질환",
+    ]},
+    # === 호흡기약 ===
+    {"code": "medicine_respiratory", "group": "medicine", "aliases": [
+        "호흡기약","호흡기치료","respiratory medication","bronchodilator",
+        "기관지확장제","테오필린","theophylline","아미노필린","aminophylline",
+        "기관지","기관허탈","tracheal collapse","기침약","기침","antitussive",
+        "하이드로코돈","hydrocodone","부토르파놀","butorphanol","기침억제",
+        "호흡기","호흡기질환","폐렴","pneumonia","기관지염","bronchitis",
+        "테르부탈린","terbutaline","살부타몰","salbutamol","알부테롤","albuterol",
+        "호흡기관리","흡입기","inhaler",
+    ]},
+    # === 내복약 / 처방료 / 조제료 (일반 비용 항목) ===
     {"code": "medicine_oral", "group": "medicine", "aliases": [
         "내복약","경구약","먹는약","oral","oral med","oral medication","po","per os",
         "처방약","약값","처방료","조제료","약제비","약제","투약","투약료","복약",
@@ -294,24 +398,6 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "복용","경구투여",
         "고가약물","고가약","약물","캡슐조제","캡슐조제료","내복약조제","내복약조제료",
         "조제비","약제료","처방조제","조제약",
-        "zonisamide","leflunomide","gabapentin","phenobarbital","prednisolone",
-        "cyclosporine","oclacitinib","apoquel","atopica","metronidazole",
-        "amoxicillin","cephalexin","enrofloxacin","doxycycline","clindamycin",
-        "mycophenolate","마이코페놀레이트","tacrolimus","타크로리무스",
-        "chlorambucil","클로람부실","vincristine","빈크리스틴",
-        "piroxicam","피록시캄","토세라닙","toceranib","palladia","팔라디아","팔리디아",
-        "실데나필","sildenafil","피모벤단","pimobendan","베트메딘","vetmedin",
-        "암로디핀","amlodipine","베나제프릴","benazepril","포르테코르","fortekor",
-        "에날라프릴","enalapril","텔미사르탄","telmisartan","세미트라","semintra",
-        "레보티록신","levothyroxine","솔록신","soloxine","갑상선약",
-        "레나메진","renamezin","크레메진","kremezin","ast-120","ast120",
-        "신장약","신부전약","ckd약","인산결합제","세벨라머","sevelamer",
-        "에포에틴","epoetin","다르베포에틴","darbepoetin","epo",
-        "칼시트리올","calcitriol","수산화알루미늄","인흡착제",
-        "라프로스","rapros","베라프로스트","beraprost",
-        "우르소","ursodiol","우르소데옥시콜산","ursodeoxycholic","간장약",
-        "메틸프레드니솔론","methylprednisolone","덱사메타손","dexamethasone",
-        "트리암시놀론","triamcinolone","부데소니드","budesonide",
     ]},
     # === 처치/수액/응급/수혈 ===
     {"code": "care_injection", "group": "checkup", "aliases": [
@@ -338,7 +424,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
     ]},
     {"code": "care_emergency", "group": "checkup", "aliases": [
         "응급","응급처치","응급진료","emergency","ER","응급비","응급진료비",
-        "야간진료","야간응급","심폐소생","CPR","cpr","야간","야간비",
+        "야간진료","야간응급","심폐소생","cpr","야간","야간비",
         "야간진료비","공휴일진료","휴일진료","특수시간",
     ]},
     {"code": "care_catheter", "group": "checkup", "aliases": [
@@ -377,6 +463,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "흡입마취","전신마취","국소마취","수술비","수술료","수술재료","수술재료비","봉합사",
         "수술준비","수술세트","수술전처치","수술후관리","마취관리","마취감시",
         "마취모니터링","마취유지","삽관","기관삽관","수술후처치","수술처치",
+        "모니터링","모니터링료","monitoring","마취모니터링료","수술모니터링",
     ]},
     {"code": "surgery_spay_neuter", "group": "surgery", "aliases": [
         "중성화","spay","neuter","castration","ovariohysterectomy","ohe",
@@ -488,14 +575,13 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "오메가3","omega","유산균","프로바이오틱","프리바이오틱","관절영양제",
         "관절보조","피부영양제","면역보조","영양보조","건강보조식품","건강보조",
         "종합영양제","멀티비타민","눈영양제","간영양제","신장영양제",
-        "뉴트리플러스","nutri","뉴트리","헤파틱","hepatic support","데나마린","denamarin",
-        "사밀","samil","실리마린","silymarin","밀크시슬","간보호제",
+        "뉴트리플러스","nutri","뉴트리",
         "레날어드밴스","renal advance","아조딜","azodyl","이파키틴","ipakitine",
         "프로네프라","pronefra","키드니쉴드","kidney shield","레날케어","renal care",
         "코세퀸","cosequin","다스퀸","dasuquin","항산화제","antioxidant",
         "글루코사민","glucosamine","콘드로이틴","chondroitin","msm",
         "엘카르니틴","l-carnitine","카르니틴","carnitine",
-        "쏜리서치","thorne","뉴트리베스트","프로네프라","프로바이오틱스","probiotics",
+        "쏜리서치","thorne","뉴트리베스트","프로바이오틱스","probiotics",
     ]},
     {"code": "supply_goods", "group": "etc", "aliases": [
         "용품","pet supply","pet supplies","펫용품","반려동물용품",
@@ -507,7 +593,7 @@ TAG_CATALOG: List[Dict[str, Any]] = [
         "checkup","consult","opd","진료","상담","초진","재진","진찰",
         "진료비","초진료","재진료","진찰료","상담료","진료비용","진찰비",
         "consultation","진료료","외래","진료상담","내원","방문",
-        "일반진료","기본진료","진료비","외래진료","통원",
+        "일반진료","기본진료","외래진료","통원",
     ]},
     {"code": "grooming_basic", "group": "grooming", "aliases": [
         "grooming","bath","trim","미용","목욕","클리핑","발톱","발톱깎기",
