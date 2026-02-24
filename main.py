@@ -1662,23 +1662,31 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
                     else:
                         total_amount = 0
                 # ✅ receipt_image_path가 있으면 INSERT/UPDATE에 포함
+                #    file_size_bytes도 함께 포함해야 health_records_file_presence_check 제약 조건 통과
                 if receipt_image_path_in:
+                    # 기존 레코드에서 file_size_bytes 조회 (upsert 시 보존)
+                    existing_fsb = db_fetchone(
+                        "SELECT file_size_bytes FROM public.health_records WHERE id=%s",
+                        (record_uuid,),
+                    )
+                    file_size_val = existing_fsb["file_size_bytes"] if existing_fsb and existing_fsb.get("file_size_bytes") else 0
                     cur.execute(
                         """
                         INSERT INTO public.health_records
-                            (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            (id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path, file_size_bytes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO UPDATE SET
                             pet_id = EXCLUDED.pet_id, hospital_mgmt_no = EXCLUDED.hospital_mgmt_no,
                             hospital_name = EXCLUDED.hospital_name, visit_date = EXCLUDED.visit_date,
                             total_amount = EXCLUDED.total_amount, pet_weight_at_visit = EXCLUDED.pet_weight_at_visit,
-                            tags = EXCLUDED.tags, receipt_image_path = EXCLUDED.receipt_image_path
+                            tags = EXCLUDED.tags, receipt_image_path = EXCLUDED.receipt_image_path,
+                            file_size_bytes = EXCLUDED.file_size_bytes
                         WHERE public.health_records.deleted_at IS NULL
                             AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = public.health_records.pet_id AND p.user_uid = %s)
                         RETURNING id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags,
                             receipt_image_path, file_size_bytes, created_at, updated_at
                         """,
-                        (record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path_in, uid),
+                        (record_uuid, pet_uuid, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, receipt_image_path_in, file_size_val, uid),
                     )
                 else:
                     cur.execute(
@@ -1729,6 +1737,14 @@ def api_record_upsert(req: HealthRecordUpsertRequest, user: Dict[str, Any] = Dep
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(
+            "[UPSERT-ERROR] record_id=%s, pet_id=%s, hospital=%s, total=%s, "
+            "receipt_path=%s, items_count=%s, error=%s: %s",
+            str(record_uuid), str(pet_uuid), hospital_name, total_amount_in,
+            (req.receipt_image_path or "")[:80],
+            len(req.items) if req.items else 0,
+            type(e).__name__, _sanitize_for_log(str(e)),
+        )
         _raise_mapped_db_error(e)
         raise
 
@@ -2526,6 +2542,12 @@ def commit_receipt(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(
+            "[COMMIT-ERROR] record_id=%s, pet_id=%s, draft_path=%s, "
+            "existing=%s, error=%s: %s",
+            str(record_uuid), str(pet_uuid), (draft_path or "")[:80],
+            existing_record, type(e).__name__, _sanitize_for_log(str(e)),
+        )
         _raise_mapped_db_error(e)
         raise
 
