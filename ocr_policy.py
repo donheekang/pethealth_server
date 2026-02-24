@@ -770,17 +770,24 @@ def _normalize_gemini_parsed(j: Dict[str, Any]) -> Dict[str, Any]:
             if not nm or _is_noise_line(nm):
                 continue
             pr = _coerce_int_amount(it.get("price"))
-            if pr is not None and pr < 0:
-                continue  # ✅ 할인 라인(음수 가격) 제외
             disc = _coerce_int_amount(it.get("discount"))
-            # ✅ 항목별 할인 적용
-            if disc is not None and disc > 0 and pr is not None:
-                net_price = pr - disc
-                if net_price <= 0:
-                    continue  # 100% 할인 → 무료 항목 제외
-                pr = net_price
-            ct_raw = (it.get("categoryTag") or "").strip() or None
-            ct_val = _migrate_tag(ct_raw) if ct_raw else None
+            # ✅ 할인 항목: 음수 가격으로 포함
+            _DISC_KW_V = ("할인", "할증", "감면", "절사", "쿠폰", "discount")
+            nm_low = nm.lower()
+            is_disc = (pr is not None and pr < 0) or (
+                any(kw in nm_low for kw in _DISC_KW_V) and (pr is None or pr <= 0)
+            )
+            if is_disc:
+                if pr is None or pr == 0:
+                    continue
+                ct_raw = "etc_discount"
+            elif disc is not None and disc > 0 and pr is not None:
+                # 항목별 할인 → 별도 음수 항목 추가
+                cleaned.append({"itemName": f"{nm} 할인", "price": -disc, "categoryTag": "etc_discount"})
+            else:
+                pass  # 일반 항목
+            ct_raw_v = (it.get("categoryTag") or "").strip() or ct_raw if is_disc else (it.get("categoryTag") or "").strip() or None
+            ct_val = _migrate_tag(ct_raw_v) if ct_raw_v else None
             cleaned.append({"itemName": nm, "price": pr, "categoryTag": ct_val})
         out["items"] = cleaned
     return out
@@ -1600,9 +1607,9 @@ def _fix_prices_by_total(
     import logging
     _flog = logging.getLogger("ocr_policy.fix_total")
 
-    # ✅ 할인 항목(음수 가격)은 합계 계산에서 제외
-    #    totalAmount는 이미 할인 적용된 최종 결제액이므로,
-    #    양수 항목만 합산해서 비교해야 정확한 보정 가능
+    # ✅ 할인 항목(음수 가격) 포함하여 전체 합산
+    #    totalAmount = 결제요청금액(할인 후)이므로
+    #    양수 항목 + 음수 할인 항목을 모두 합산해서 비교
     _DISCOUNT_KW = ("할인", "할증", "감면", "절사", "쿠폰", "discount")
     def _is_discount_item(it: Dict[str, Any]) -> bool:
         nm = (it.get("itemName") or "").lower()
@@ -1610,12 +1617,12 @@ def _fix_prices_by_total(
         return pr < 0 or any(kw in nm for kw in _DISCOUNT_KW)
 
     current_sum = sum(
-        it.get("price") or 0 for it in ai_items if not _is_discount_item(it)
+        it.get("price") or 0 for it in ai_items
     )
     diff = current_sum - total_amount
     if abs(diff) < 100:
         return ai_items  # 이미 맞음
-    _flog.info(f"[FIX_TOTAL] sum={current_sum}, total={total_amount}, diff={diff} (discount items excluded)")
+    _flog.info(f"[FIX_TOTAL] sum={current_sum}, total={total_amount}, diff={diff}")
     # 각 항목별 가능한 보정 후보 생성
     candidates: List[tuple] = []
     for idx, item in enumerate(ai_items):
@@ -2114,21 +2121,33 @@ def _normalize_gemini_full_result(
             ct = (it.get("categoryTag") or "").strip() or None
             sn = (it.get("standardName") or "").strip() or None
 
-            # ✅ 할인/할증 항목 필터링: 음수 가격이거나 할인 키워드 포함 시 제외
-            #    할인은 totalAmount에 이미 반영되어 있으므로 별도 아이템으로 불필요
+            # ✅ 할인/할증 항목: 음수 가격으로 포함 (iOS에서 할인 표시용)
             _DISC_KW = ("할인", "할증", "감면", "절사", "쿠폰", "discount")
             nm_lower = nm.lower()
-            if pr is not None and pr < 0:
-                continue  # 음수 가격 항목 제외
-            if any(kw in nm_lower for kw in _DISC_KW) and (pr is None or pr <= 0):
-                continue  # 할인 키워드 + 가격 0 이하 항목 제외
+            is_discount_line = (pr is not None and pr < 0) or (
+                any(kw in nm_lower for kw in _DISC_KW) and (pr is None or pr <= 0)
+            )
+            if is_discount_line:
+                # 할인 항목은 음수 가격으로 유지하여 포함
+                if pr is None or pr == 0:
+                    continue  # 가격 없는 할인 라벨만 있는 경우 제외
+                if not ct:
+                    ct = "etc_discount"
+                # pr은 이미 음수이므로 그대로 진행
 
-            # ✅ 항목별 할인 적용: discount가 있으면 실결제 가격으로 조정
-            if disc is not None and disc > 0 and pr is not None:
-                net_price = pr - disc
-                if net_price <= 0:
-                    continue  # 100% 할인 항목 → 무료이므로 제외
-                pr = net_price  # 할인 적용된 실결제 가격으로 교체
+            # ✅ 항목별 할인 적용: discount가 있으면 할인 항목을 별도로 생성
+            elif disc is not None and disc > 0 and pr is not None:
+                # 원래 항목은 원가 그대로 유지
+                # 할인 금액을 별도 음수 항목으로 추가
+                disc_name = f"{nm} 할인"
+                disc_ct = "etc_discount"
+                cleaned.append({
+                    "itemName": disc_name,
+                    "price": -disc,
+                    "categoryTag": disc_ct,
+                    "standardName": None,
+                })
+                tags_set.add(disc_ct)
 
             if ct:
                 ct = _migrate_tag(ct)
