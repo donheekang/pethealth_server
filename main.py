@@ -1287,61 +1287,59 @@ def me_delete(user: Dict[str, Any] = Depends(get_current_user)):
 
     summary = {}
     try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            # 1) 스케줄 soft delete
-            cur.execute(
-                "UPDATE public.prevent_schedules SET deleted_at = now() WHERE user_uid=%s AND deleted_at IS NULL",
-                (uid,),
-            )
-            summary["schedules_deleted"] = cur.rowcount
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                # 1) 스케줄 soft delete
+                cur.execute(
+                    "UPDATE public.prevent_schedules SET deleted_at = now() WHERE user_uid=%s AND deleted_at IS NULL",
+                    (uid,),
+                )
+                summary["schedules_deleted"] = cur.rowcount
 
-            # 2) 보험청구 soft delete
-            cur.execute(
-                "UPDATE public.insurance_claims SET deleted_at = now() WHERE user_uid=%s AND deleted_at IS NULL",
-                (uid,),
-            )
-            summary["claims_deleted"] = cur.rowcount
+                # 2) 보험청구 soft delete
+                cur.execute(
+                    "UPDATE public.insurance_claims SET deleted_at = now() WHERE user_uid=%s AND deleted_at IS NULL",
+                    (uid,),
+                )
+                summary["claims_deleted"] = cur.rowcount
 
-            # 3) 문서 soft delete
-            cur.execute(
-                """UPDATE public.pet_documents d SET deleted_at = now()
-                   WHERE d.deleted_at IS NULL
-                     AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = d.pet_id AND p.user_uid = %s)""",
-                (uid,),
-            )
-            summary["documents_deleted"] = cur.rowcount
+                # 3) 문서 soft delete
+                cur.execute(
+                    """UPDATE public.pet_documents d SET deleted_at = now()
+                       WHERE d.deleted_at IS NULL
+                         AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = d.pet_id AND p.user_uid = %s)""",
+                    (uid,),
+                )
+                summary["documents_deleted"] = cur.rowcount
 
-            # 4) health_items hard delete (record 종속)
-            cur.execute(
-                """DELETE FROM public.health_items
-                   WHERE record_id IN (
-                       SELECT r.id FROM public.health_records r
-                       JOIN public.pets p ON p.id = r.pet_id
-                       WHERE p.user_uid = %s
-                   )""",
-                (uid,),
-            )
-            summary["health_items_deleted"] = cur.rowcount
+                # 4) health_items hard delete (record 종속)
+                cur.execute(
+                    """DELETE FROM public.health_items
+                       WHERE record_id IN (
+                           SELECT r.id FROM public.health_records r
+                           JOIN public.pets p ON p.id = r.pet_id
+                           WHERE p.user_uid = %s
+                       )""",
+                    (uid,),
+                )
+                summary["health_items_deleted"] = cur.rowcount
 
-            # 5) 진료기록 soft delete
-            cur.execute(
-                """UPDATE public.health_records r SET deleted_at = now()
-                   WHERE r.deleted_at IS NULL
-                     AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = r.pet_id AND p.user_uid = %s)""",
-                (uid,),
-            )
-            summary["records_deleted"] = cur.rowcount
+                # 5) 진료기록 soft delete
+                cur.execute(
+                    """UPDATE public.health_records r SET deleted_at = now()
+                       WHERE r.deleted_at IS NULL
+                         AND EXISTS (SELECT 1 FROM public.pets p WHERE p.id = r.pet_id AND p.user_uid = %s)""",
+                    (uid,),
+                )
+                summary["records_deleted"] = cur.rowcount
 
-            # 6) 펫 삭제
-            cur.execute("DELETE FROM public.pets WHERE user_uid=%s", (uid,))
-            summary["pets_deleted"] = cur.rowcount
+                # 6) 펫 삭제
+                cur.execute("DELETE FROM public.pets WHERE user_uid=%s", (uid,))
+                summary["pets_deleted"] = cur.rowcount
 
-            # 7) 유저 삭제
-            cur.execute("DELETE FROM public.users WHERE firebase_uid=%s", (uid,))
-            summary["user_deleted"] = cur.rowcount
-
-        conn.commit()
+                # 7) 유저 삭제
+                cur.execute("DELETE FROM public.users WHERE firebase_uid=%s", (uid,))
+                summary["user_deleted"] = cur.rowcount
     except Exception as e:
         logger.error("[me/delete] DB error: %s", repr(e))
         raise HTTPException(status_code=500, detail="account deletion failed")
