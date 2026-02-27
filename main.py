@@ -1333,23 +1333,13 @@ def me_delete(user: Dict[str, Any] = Depends(get_current_user)):
                 )
                 summary["records_deleted"] = cur.rowcount
 
-                # 6) 펫 soft delete
-                cur.execute(
-                    "UPDATE public.pets SET deleted_at = now() WHERE user_uid=%s AND deleted_at IS NULL",
-                    (uid,),
-                )
+                # 6) 펫 삭제 (종속 레코드 모두 soft delete 완료 후 hard delete 가능)
+                cur.execute("DELETE FROM public.pets WHERE user_uid=%s", (uid,))
                 summary["pets_deleted"] = cur.rowcount
 
-                # 7) 유저 soft delete (deleted_at 컬럼 없으면 무시)
-                try:
-                    cur.execute(
-                        "UPDATE public.users SET deleted_at = now() WHERE firebase_uid=%s AND deleted_at IS NULL",
-                        (uid,),
-                    )
-                    summary["user_deleted"] = cur.rowcount
-                except Exception:
-                    # users 테이블에 deleted_at 없으면 그냥 넘어감
-                    summary["user_deleted"] = 0
+                # 7) 유저 삭제
+                cur.execute("DELETE FROM public.users WHERE firebase_uid=%s", (uid,))
+                summary["user_deleted"] = cur.rowcount
     except Exception as e:
         logger.error("[me/delete] DB error: %s", repr(e))
         raise HTTPException(status_code=500, detail="account deletion failed")
