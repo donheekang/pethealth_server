@@ -3904,3 +3904,29 @@ def api_update_tier(
 
     return {"ok": True, "tier": tier}
 
+
+# ── 계정 삭제 (Firebase 인증만 삭제, DB 데이터 유지) ────────────────────
+@app.delete("/api/me/delete-account")
+def api_delete_account(user: Dict[str, Any] = Depends(get_current_user)):
+    """Firebase Authentication 사용자만 삭제합니다. DB 데이터는 그대로 유지됩니다."""
+    uid = (user.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="missing uid")
+
+    try:
+        init_firebase_admin(require_init=True)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=_internal_detail(str(e), kind="Firebase init error"))
+
+    try:
+        fb_auth.delete_user(uid)
+        logger.info("[DeleteAccount] Firebase user deleted: %s", uid)
+    except fb_auth.UserNotFoundError:
+        logger.warning("[DeleteAccount] Firebase user not found (already deleted?): %s", uid)
+    except Exception as e:
+        logger.error("[DeleteAccount] Failed to delete Firebase user %s: %s", uid, repr(e))
+        raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Firebase delete error"))
+
+    return {"ok": True, "uid": uid, "firebaseDeleted": True, "dbDeleted": False}
+
+
