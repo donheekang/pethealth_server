@@ -2438,7 +2438,31 @@ def commit_receipt(
                 src_orig.delete()
                 logger.info("[commit] moved draft original %s → %s", draft_orig, final_orig)
         else:
-            logger.warning("[commit] draft blob not found: %s — proceeding without image", draft_path)
+            logger.warning("[commit] draft blob not found: %s — checking if already committed", draft_path)
+            # ✅ 중복 커밋 방어: draft가 이미 이동된 경우 기존 레코드 반환
+            if existing_record:
+                logger.info("[commit] duplicate commit detected — returning existing record for %s", str(record_uuid))
+                with db_conn() as conn2:
+                    with conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+                        cur2.execute(
+                            "SELECT id, pet_id, hospital_mgmt_no, hospital_name, visit_date, total_amount, pet_weight_at_visit, tags, "
+                            "receipt_image_path, file_size_bytes, created_at, updated_at FROM public.health_records WHERE id=%s AND deleted_at IS NULL",
+                            (record_uuid,),
+                        )
+                        existing_row = cur2.fetchone()
+                        if existing_row:
+                            cur2.execute(
+                                "SELECT id, record_id, item_name, price, category_tag, created_at, updated_at "
+                                "FROM public.health_items WHERE record_id=%s ORDER BY created_at ASC",
+                                (record_uuid,),
+                            )
+                            existing_items = cur2.fetchall() or []
+                            payload = dict(existing_row)
+                            payload["items"] = [dict(x) for x in existing_items]
+                            payload["pet_name"] = pet.get("name")
+                            payload["pet_species"] = pet.get("species")
+                            return jsonable_encoder(payload)
+            # draft도 없고 기존 레코드도 없으면 이미지 없이 진행
     except Exception as e:
         logger.error("[commit] storage move failed: %s", _sanitize_for_log(repr(e)))
         # 이미지 이동 실패해도 레코드는 저장 진행
@@ -3928,5 +3952,6 @@ def api_delete_account(user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Firebase delete error"))
 
     return {"ok": True, "uid": uid, "firebaseDeleted": True, "dbDeleted": False}
+
 
 
