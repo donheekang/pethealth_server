@@ -4019,23 +4019,42 @@ def _create_firebase_custom_token_for_kakao(kakao_user: Dict[str, Any]) -> str:
 
     init_firebase_admin(require_init=True)
 
-    # Firebase에 해당 유저가 있는지 확인, 없으면 생성
+    # Firebase에 해당 유저가 있는지 확인
+    # 1) kakao_{id}로 이미 있으면 → 그대로 사용
+    # 2) 없으면 → 이메일로 기존 계정 찾기 (Google/Apple 계정 연동)
+    # 3) 이메일 계정도 없으면 → 새로 생성
+    target_uid = firebase_uid
+
     try:
         fb_auth.get_user(firebase_uid)
-        logger.info("[KakaoAuth] 기존 Firebase 사용자: %s", firebase_uid)
+        logger.info("[KakaoAuth] 기존 카카오 Firebase 사용자: %s", firebase_uid)
     except fb_auth.UserNotFoundError:
-        # 새 사용자 생성
-        create_kwargs: Dict[str, Any] = {"uid": firebase_uid}
+        # 이메일로 기존 계정이 있는지 확인 (Google/Apple로 가입한 계정)
+        existing_user = None
         if email:
-            create_kwargs["email"] = email
-        if nickname:
-            create_kwargs["display_name"] = nickname
-        if profile_image:
-            create_kwargs["photo_url"] = profile_image
-        fb_auth.create_user(**create_kwargs)
-        logger.info("[KakaoAuth] 새 Firebase 사용자 생성: %s (email=%s, nickname=%s)", firebase_uid, email, nickname)
+            try:
+                existing_user = fb_auth.get_user_by_email(email)
+                logger.info("[KakaoAuth] 이메일(%s)로 기존 계정 발견: %s", email, existing_user.uid)
+            except fb_auth.UserNotFoundError:
+                pass
 
-    # Custom Token 발급 (추가 클레임에 카카오 정보 포함)
+        if existing_user:
+            # 기존 계정(Google/Apple)의 uid로 Custom Token 발급 → 같은 계정으로 로그인
+            target_uid = existing_user.uid
+            logger.info("[KakaoAuth] 기존 계정에 카카오 연동: %s (kakao_id=%s)", target_uid, kakao_id)
+        else:
+            # 완전 새 사용자 생성
+            create_kwargs: Dict[str, Any] = {"uid": firebase_uid}
+            if email:
+                create_kwargs["email"] = email
+            if nickname:
+                create_kwargs["display_name"] = nickname
+            if profile_image:
+                create_kwargs["photo_url"] = profile_image
+            fb_auth.create_user(**create_kwargs)
+            logger.info("[KakaoAuth] 새 Firebase 사용자 생성: %s (email=%s, nickname=%s)", firebase_uid, email, nickname)
+
+    # Custom Token 발급
     additional_claims = {
         "provider": "kakao",
         "kakao_id": kakao_id,
@@ -4045,7 +4064,14 @@ def _create_firebase_custom_token_for_kakao(kakao_user: Dict[str, Any]) -> str:
     if nickname:
         additional_claims["kakao_nickname"] = nickname
 
-    custom_token = fb_auth.create_custom_token(firebase_uid, additional_claims)
+    try:
+        custom_token = fb_auth.create_custom_token(target_uid, additional_claims)
+    except Exception as e:
+        logger.error("[KakaoAuth] create_custom_token 실패: %s", repr(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Firebase Custom Token 생성 실패: {type(e).__name__}: {e}"
+        )
 
     # bytes → str 변환
     if isinstance(custom_token, bytes):
