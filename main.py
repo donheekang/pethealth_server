@@ -54,6 +54,11 @@ from psycopg2.pool import ThreadedConnectionPool, PoolError
 from psycopg2.extras import RealDictCursor
 import psycopg2.extras
 
+# HTTP client (카카오 OAuth — 표준 라이브러리만 사용)
+import urllib.request
+import urllib.parse
+import urllib.error
+
 
 # =========================================================
 # Logging
@@ -119,6 +124,11 @@ class Settings(BaseSettings):
     CORS_ALLOW_CREDENTIALS: bool = False
 
     ADMIN_UIDS: str = ""
+
+    # Kakao OAuth
+    KAKAO_REST_API_KEY: str = ""
+    KAKAO_CLIENT_SECRET: str = ""
+    KAKAO_REDIRECT_URI: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -3952,6 +3962,180 @@ def api_delete_account(user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=_internal_detail(str(e), kind="Firebase delete error"))
 
     return {"ok": True, "uid": uid, "firebaseDeleted": True, "dbDeleted": False}
+
+
+# =========================================================
+# 카카오 로그인 → Firebase Custom Token
+# =========================================================
+# 앱(네이티브): 카카오 SDK로 access_token 획득 → POST /auth/kakao/token
+# 웹(REST):    카카오 인가코드 → POST /auth/kakao/code → 서버가 토큰 교환 후 처리
+#
+# 두 경우 모두 최종적으로 Firebase Custom Token을 발급하여
+# 클라이언트가 signInWithCustomToken()으로 Firebase 로그인함.
+# =========================================================
+
+class KakaoTokenRequest(BaseModel):
+    access_token: str
+
+class KakaoCodeRequest(BaseModel):
+    code: str
+    redirect_uri: Optional[str] = None
+
+
+def _get_kakao_user(access_token: str) -> Dict[str, Any]:
+    """카카오 access_token으로 사용자 정보를 조회합니다."""
+    req = urllib.request.Request(
+        "https://kapi.kakao.com/v2/user/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:200]
+        logger.error("[KakaoAuth] 사용자 정보 조회 실패: %s %s", e.code, body)
+        raise HTTPException(status_code=401, detail="카카오 사용자 정보를 가져올 수 없습니다.")
+    except Exception as e:
+        logger.error("[KakaoAuth] 사용자 정보 조회 오류: %s", repr(e))
+        raise HTTPException(status_code=502, detail="카카오 API 연결에 실패했습니다.")
+
+
+def _create_firebase_custom_token_for_kakao(kakao_user: Dict[str, Any]) -> str:
+    """카카오 사용자 정보로 Firebase Custom Token을 생성합니다."""
+    kakao_id = str(kakao_user.get("id", ""))
+    if not kakao_id:
+        raise HTTPException(status_code=400, detail="카카오 사용자 ID가 없습니다.")
+
+    # Firebase uid: kakao_{kakao_id} 형태로 생성
+    firebase_uid = f"kakao_{kakao_id}"
+
+    # 카카오 프로필 정보 추출
+    kakao_account = kakao_user.get("kakao_account", {})
+    profile = kakao_account.get("profile", {})
+    email = kakao_account.get("email", "")
+    nickname = profile.get("nickname", "")
+    profile_image = profile.get("profile_image_url", "")
+
+    init_firebase_admin(require_init=True)
+
+    # Firebase에 해당 유저가 있는지 확인, 없으면 생성
+    try:
+        fb_auth.get_user(firebase_uid)
+        logger.info("[KakaoAuth] 기존 Firebase 사용자: %s", firebase_uid)
+    except fb_auth.UserNotFoundError:
+        # 새 사용자 생성
+        create_kwargs: Dict[str, Any] = {"uid": firebase_uid}
+        if email:
+            create_kwargs["email"] = email
+        if nickname:
+            create_kwargs["display_name"] = nickname
+        if profile_image:
+            create_kwargs["photo_url"] = profile_image
+        fb_auth.create_user(**create_kwargs)
+        logger.info("[KakaoAuth] 새 Firebase 사용자 생성: %s (email=%s, nickname=%s)", firebase_uid, email, nickname)
+
+    # Custom Token 발급 (추가 클레임에 카카오 정보 포함)
+    additional_claims = {
+        "provider": "kakao",
+        "kakao_id": kakao_id,
+    }
+    if email:
+        additional_claims["email"] = email
+    if nickname:
+        additional_claims["kakao_nickname"] = nickname
+
+    custom_token = fb_auth.create_custom_token(firebase_uid, additional_claims)
+
+    # bytes → str 변환
+    if isinstance(custom_token, bytes):
+        custom_token = custom_token.decode("utf-8")
+
+    return custom_token
+
+
+@app.post("/auth/kakao/token")
+def auth_kakao_with_token(body: KakaoTokenRequest):
+    """
+    앱(네이티브) 전용: 카카오 SDK에서 받은 access_token으로 Firebase Custom Token 발급.
+    """
+    kakao_user = _get_kakao_user(body.access_token)
+    custom_token = _create_firebase_custom_token_for_kakao(kakao_user)
+
+    kakao_account = kakao_user.get("kakao_account", {})
+    profile = kakao_account.get("profile", {})
+
+    return {
+        "firebaseCustomToken": custom_token,
+        "kakaoId": str(kakao_user.get("id", "")),
+        "email": kakao_account.get("email", ""),
+        "nickname": profile.get("nickname", ""),
+        "profileImage": profile.get("profile_image_url", ""),
+    }
+
+
+@app.post("/auth/kakao/code")
+def auth_kakao_with_code(body: KakaoCodeRequest):
+    """
+    웹 전용: 카카오 인가코드(code)로 access_token 교환 후 Firebase Custom Token 발급.
+    """
+    rest_api_key = (settings.KAKAO_REST_API_KEY or "").strip()
+    if not rest_api_key:
+        raise HTTPException(status_code=503, detail="KAKAO_REST_API_KEY is not configured")
+
+    redirect_uri = (body.redirect_uri or settings.KAKAO_REDIRECT_URI or "").strip()
+    if not redirect_uri:
+        raise HTTPException(status_code=400, detail="redirect_uri가 필요합니다.")
+
+    # 1) 인가코드 → access_token 교환
+    token_params = {
+        "grant_type": "authorization_code",
+        "client_id": rest_api_key,
+        "redirect_uri": redirect_uri,
+        "code": body.code,
+    }
+    client_secret = (settings.KAKAO_CLIENT_SECRET or "").strip()
+    if client_secret:
+        token_params["client_secret"] = client_secret
+
+    encoded_data = urllib.parse.urlencode(token_params).encode("utf-8")
+    token_req = urllib.request.Request(
+        "https://kauth.kakao.com/oauth/token",
+        data=encoded_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(token_req, timeout=10) as resp:
+            token_json = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")[:300]
+        logger.error("[KakaoAuth] 토큰 교환 실패: %s %s", e.code, body_text)
+        raise HTTPException(status_code=401, detail="카카오 인가코드로 토큰 교환에 실패했습니다.")
+    except Exception as e:
+        logger.error("[KakaoAuth] 토큰 교환 오류: %s", repr(e))
+        raise HTTPException(status_code=502, detail="카카오 인증 서버 연결에 실패했습니다.")
+
+    access_token = token_json.get("access_token", "")
+    if not access_token:
+        raise HTTPException(status_code=401, detail="카카오 access_token을 받지 못했습니다.")
+
+    # 2) access_token으로 사용자 정보 조회 + Firebase Custom Token 발급
+    kakao_user = _get_kakao_user(access_token)
+    custom_token = _create_firebase_custom_token_for_kakao(kakao_user)
+
+    kakao_account = kakao_user.get("kakao_account", {})
+    profile = kakao_account.get("profile", {})
+
+    return {
+        "firebaseCustomToken": custom_token,
+        "kakaoId": str(kakao_user.get("id", "")),
+        "email": kakao_account.get("email", ""),
+        "nickname": profile.get("nickname", ""),
+        "profileImage": profile.get("profile_image_url", ""),
+    }
+
 
 
 
