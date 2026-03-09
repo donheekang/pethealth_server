@@ -3929,17 +3929,10 @@ def api_update_tier(
         raise HTTPException(status_code=400, detail=f"invalid tier: {tier}")
 
     try:
-        if tier == "premium":
-            db_execute(
-                "UPDATE public.users SET membership_tier=%s, updated_at=now() WHERE firebase_uid=%s",
-                (tier, uid),
-            )
-        else:
-            # 다운그레이드(환불/취소): premium_until도 함께 초기화
-            db_execute(
-                "UPDATE public.users SET membership_tier=%s, premium_until=NULL, updated_at=now() WHERE firebase_uid=%s",
-                (tier, uid),
-            )
+        db_execute(
+            "UPDATE public.users SET membership_tier=%s, updated_at=now() WHERE firebase_uid=%s",
+            (tier, uid),
+        )
     except Exception as e:
         _raise_mapped_db_error(e)
 
