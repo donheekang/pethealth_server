@@ -1351,7 +1351,7 @@ def me_summary(user: Dict[str, Any] = Depends(get_current_user)):
         "claim_count": actual_claim_count,
         "schedule_count": int(row.get("schedule_count") or 0),
         "ai_usage_count": int(row.get("ai_usage_count") or 0),
-        "ai_usage_limit": None if effective_tier == "premium" else 10,
+        "ai_usage_limit": None if effective_tier == "premium" else 5,
     }
 
 
@@ -3511,7 +3511,7 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
         try:
             urow = db_fetchone("SELECT COALESCE(ai_usage_count,0) AS cnt, membership_tier, premium_until FROM public.users WHERE firebase_uid=%s", (uid,))
             etier = _effective_tier_from_row((urow or {}).get("membership_tier"), (urow or {}).get("premium_until")) if urow else "member"
-            limit = None if etier == "premium" else 3
+            limit = None if etier == "premium" else 5
             cached["ai_usage_count"] = int((urow or {}).get("cnt") or 0)
             cached["ai_usage_limit"] = limit
         except Exception:
@@ -3543,12 +3543,12 @@ def api_ai_analyze(req: AICareAnalyzeRequest, user: Dict[str, Any] = Depends(get
             etier = _effective_tier_from_row(urow.get("membership_tier"), urow.get("premium_until"))
             ai_count = int(urow.get("cnt") or 0)
             if etier != "premium":
-                ai_limit = 10
+                ai_limit = 5
                 if ai_count >= ai_limit:
                     return JSONResponse(
                         status_code=429,
                         content={
-                            "detail": "A무료 횟수(10회)를 모두 사용했어요",
+                            "detail": "무료 횟수(5회)를 모두 사용했어요",
                             "code": "AI_QUOTA_EXCEEDED",
                             "ai_usage_count": ai_count,
                             "ai_usage_limit": ai_limit,
@@ -4161,6 +4161,7 @@ def auth_kakao_with_code(body: KakaoCodeRequest):
         "nickname": profile.get("nickname", ""),
         "profileImage": profile.get("profile_image_url", ""),
     }
+
 
 
 
